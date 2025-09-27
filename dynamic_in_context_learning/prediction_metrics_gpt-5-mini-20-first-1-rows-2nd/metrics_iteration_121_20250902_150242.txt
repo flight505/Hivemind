@@ -1,0 +1,211 @@
+PREDICTIVE METRICS - ITERATION 121
+============================================================
+
+EXECUTIVE SUMMARY — immediate takeaways & top priorities (0–72h)
+- What happened (short): Another brittle single-record failure surfaced: Passenger 0160_01 (Gory Atkinney). RoomService = 4,119 (other channels ≈ 0, VRDeck = 61) → extreme single-channel concentration (top1_share ≈ 0.985). Model predicted Transported (false positive) but actual = Not-transported. This is the same brittle slice class we flagged earlier (feature_dom / top1_dom) and joins past brittle modes (all_zero + CryoSleep). Single-record, high-concentration novelty is being given overconfident predictions.
+- Immediate root causes (short): permissive n==1 auto-decision logic + pooled priors not stratified by dominant-channel concentration + calibrator under-estimating uncertainty for high-concentration novelty + per-feature contributions unbounded (one feature dominated the logit) + probable provenance/transform mismatch potential across scorer↔calibrator↔gate + no batch-level gating for concentration-based fragiles.
+- Immediate stopgap (0–6h): Block any n==1 auto-decision that meets fragile_flag (top1_share ≥ 0.60 OR top1_spend ≥ 400 OR cryo_all_zero_flag OR all_zero_flag OR missingness_count ≥ 2). Route those records to priority_audit. Add 0160_01, 0152_01 and previous canaries to canary list and block auto-decisions. Persist necessary provenance fields so gate/calibrator see identical values.
+
+CONCISE ANSWERS TO THE SIX QUESTIONS (focused on 0160_01 + batch accuracy)
+
+1) What specific patterns caused this error?
+- Pattern: extreme single-channel concentration (RoomService dominates sum_spend → feature_dom). The scorer's raw logit was dominated by the RoomService term; calibrator did not inflate uncertainty for this novel concentration, and pooled priors were not stratified by dominant-channel interactions — so a single anomalous value produced a high-confidence prediction.
+
+2) How should decision rules be modified to prevent recurrence?
+- Treat high-concentration single-records as fragile. For n==1 & fragile_flag: require stricter gating — N_slice ≥ 50, slice_context_score ≥ 0.85, GLM_fallback agrees, ensemble_agreement ≥ 0.995, se_combined ≤ SE_accept_for_slice (very tight). Otherwise route to priority_audit. If batch_frac_fragile ≥ 5% then pause auto-decisions for the whole batch.
+
+3) What new insights about transport patterns?
+- Very large absolute spend concentrated in one channel (RoomService, VRDeck, Spa) is not uniformly predictive of transported status; it is context-dependent and often appears as label contradictions or data anomalies. These "feature_dom" cases should be treated as high-novelty/weak-context.
+
+4) How should confidence levels be recalibrated?
+- Calibrator must output p10/p50/p90 and sd; add a var_dom_high/top1_var term that inflates uncertainty when a single feature dominates. Use dynamic SE floors: 0.25–0.35 for weak-context fragiles (dom_high, cryo_all_zero), 0.06–0.10 for strong-context slices. Gate auto-decisions on se_combined and p90−p10, not only point probability.
+
+5) What adjustments are needed for batch consistency?
+- Standardize transforms & persist provenance. Stratify pooled priors by top1_channel × top1_share_bucket × CryoSleep. Add per-feature logit caps and bounded logit offsets to prevent single features from overwhelming the logit. Add batch-level checks (batch_frac_fragile, batch_provenance_consistency) and hold batch auto-decisions if thresholds breached.
+
+6) How can metrics be improved to handle edge cases?
+- Add dominant-channel-specific pooled priors, var_dom_high to inflate uncertainty for single-channel concentration, upweight contradiction examples in retraining, and increase monitoring/canaries for dom_high_by_ctx slices.
+
+COMPLETE UPDATED PREDICTIVE METRICS REPORT — actionable components (optimized for batch prediction accuracy)
+
+A. Feature engineering updates (v→v+1)
+- Aggregates:
+  - sum_spend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck (raw & log1p).
+  - sum_spend_bucket = [0,50,200,400,600,800,2000+].
+- Dominance & novelty flags:
+  - top1_channel, top1_spend, top1_share = top1_spend / sum_spend (guard sum_spend>0).
+  - top1_share_bucket = [0-0.3, 0.3-0.5, 0.5-0.7, 0.7-0.9, 0.9+].
+  - top1_dom_flag = (top1_share ≥ TOP1_DOM_THRESHOLD) — initial threshold 0.60.
+  - top1_spend_bucket and top1_spend_high_flag (>= TOP1_SPEND_HIGH, initial 400).
+  - spend_entropy_norm = normalized Shannon entropy across channels.
+  - feature_dom_fraction = fraction of final logit contributed by top1 feature (logit provenance).
+  - novelty_score = distance to nearest historical centroid for slice (kNN or Mahalanobis).
+- Interactions (explicitly included):
+  - top1_channel × top1_share, top1_channel × sum_spend_bucket, top1_share × sum_spend, top1_channel × Age_bucket, top1_channel × HomePlanet, CryoSleep × all_zero.
+
+B. Pooled priors (channel-aware + dom-aware + cryo-aware)
+- Compute stratified priors:
+  - μ_dom_channel_demo = P(transported | top1_channel=c AND top1_share_bucket=b AND context dims).
+  - μ_all_zero_cryo_demo as before.
+- Blend with slice weight:
+  - τ_slice = N_slice / (N_slice + N0_slice)
+  - Use larger N0 for fragile slices to tilt toward conservative prior:
+    - N0_dom_channel = 75 (initial; sweep 50–200)
+    - N0_all_zero_cryo = 100
+
+C. Direction-aware bounded logit offsets & per-feature caps
+- Per-feature logit caps:
+  - CAP_PER_FEATURE_LOGIT = 3.0 (default); no single feature contribution > cap.
+- Bounded total-feature dominance scaling:
+  - If feature_dom_fraction > 0.60, scale top1 contribution by factor f = max(0.5, 1 − (feature_dom_fraction − 0.6)). (Adjust scale formula in sweep.)
+- Contextual offsets:
+  - offset = clamp(base_shift + w_ctx*(context_score − 0.5)*2, −0.5, 0.5) * τ_slice
+
+D. Variance / SE model (explicit; add dom term)
+- New variance components:
+  - var_dom_high = κ_dom * top1_share * novelty_scale * (1 + sqrt(num_imputed_features))
+  - var_all_zero_cryo = κ_zero_cryo * indicator(cryo_all_zero_flag) * novelty_scale
+  - var_missingness, var_dispersion, var_sumspend, etc.
+- Combine:
+  - var_combined = var_base + var_dispersion + var_dom_high*(top1_dom_flag) + var_all_zero + var_all_zero_cryo*(cryo_all_zero_flag) + ...
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Example κ defaults (start; sweepable):
+  - κ_dom = 0.10; κ_zero = 0.08; κ_zero_cryo = 0.12; κ_conc_chan = 0.06; κ_miss = 0.05; κ_scale = 0.02
+- Dynamic SE floors:
+  - fragiles (dom_high, cryo_all_zero): se_floor = 0.25–0.35
+  - strong-context slices: se_floor = 0.06–0.10
+  - For n==1 & top1_dom_flag: enforce se_floor ≥ 0.20 until N_slice ≥ N_min
+
+E. Decision-gating (pattern-aware, concrete)
+- Fragile_flag (v3): top1_dom_flag OR top1_spend_high OR all_zero_flag OR cryo_all_zero_flag OR missingness_count ≥ 2 OR feature_dom_fraction ≥ 0.60.
+- Gating pseudocode:
+  - if n == 1 and fragile_flag:
+      allow_auto_decision = (
+        slice_context_score >= Z_high AND
+        N_slice >= N_min_slice_for_slice_type AND
+        GLM_fallback_agrees AND
+        ensemble_agreement >= A_high AND
+        se_combined <= SE_accept_for_slice_type AND
+        quantile_width (p90−p10) <= QW_accept_for_slice_type
+      )
+      if not allow_auto_decision:
+         route -> priority_audit
+- Special-for-dom_high:
+  - N_min_slice = 50; Z_high = 0.85; A_high = 0.995; SE_accept ≤ 0.06; QW_accept ≤ 0.12; require GLM_fallback_agrees
+  - Because var_dom_high inflates se_combined, dom_high will normally fail SE_accept and be audited until N_slice grows.
+- Batch-level rule:
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (5%) then hold auto-decisions for entire batch and require human in the loop.
+- Initial constants (sweepable):
+  - TOP1_DOM_THRESHOLD = 0.60, TOP1_SPEND_HIGH = 400, BATCH_FRAGILE_THRESHOLD = 0.05, N_min_slice = 50 (dom_high), A_high = 0.995, SE_accept = 0.06 general.
+
+F. Calibrator & GLM_fallback retrain plan (dominant-channel interactions)
+- Calibrator outputs: p10, p50, p90, sd (quantile regression + uncertainty decomposition).
+- Calibrator inputs: raw_logit, top1_channel, top1_share, top1_dom_flag, cryo_all_zero_flag, ensemble_agreement, spend_entropy_norm, feature_dom_fraction, missingness_count, context dims.
+- Loss: quantile (pinball) + ECE penalty + Brier weight; upweight dom_high & cryo_all_zero contradictions ×5 initially.
+- GLM_fallback:
+  - Include top1_channel × top1_share, top1_share × sum_spend, CryoSleep × top1_channel interactions.
+  - Regularize and enforce per-feature logit contribution caps.
+- Training & validation:
+  - Window: last 18–36 months; preserve small-slice examples with stratified CV; hold out last 14–28 days for shadow-run.
+  - Shadow-run: 14–28 days, no auto-accepts for canaries.
+- Acceptance criteria:
+  - dom_high contradictions ↓ ≥ 40–60%
+  - cryo_all_zero contradictions ↓ ≥ 40–60%
+  - No canary auto-accepts in shadow-run
+  - Global per-slice ECE not worsened by >0.5–1.0% absolute
+
+G. Monitoring, metrics & alerts (batch-focused)
+- Dashboards per-slice & global: ECE, Brier, FP, FN, contradiction_count, n==1_auto_accept_rate, batch_frac_fragile, canary_auto_accepts.
+- New batch KPIs: Batch_auto_decision_rate, Batch_frac_fragile, Batch_provenance_consistency_rate.
+- Alerts:
+  - slice FP or FN >20% deviance from baseline (24h) → hold auto-accepts + page ML/Ops
+  - any canary auto-accepted → immediate hold + page
+  - jump in n==1_auto_accept_rate (>5% absolute in 24h) → notify
+  - batch_frac_fragile ≥ 5% → hold batch auto-decisions
+- Canaries: add 0160_01 (Gory Atkinney), 0152_01 (Andan Estron), 0151_01 (Shanie Simson), 0144_01, 0148_01, 0149_01.
+
+H. CI unit tests & validation (must include dom_high & cryo_all_zero)
+- Tests to implement:
+  - top1_dom_flag computed consistently across scorer/calibrator/gate (same provenance).
+  - se_combined increases when top1_dom_flag True.
+  - calibrator widens quantile spreads for dom_high & cryo_all_zero.
+  - pooled-prior blending respects N0_dom_channel.
+  - per-feature logit cap enforcement (no single feature contribution exceeds cap).
+  - batch-level test: if batch_frac_fragile ≥ threshold, auto-decisions disabled for batch.
+  - canary test: canaries must not be auto-accepted in unit test harness.
+- Shadow-run acceptance:
+  - dom_high contradictions reduced ≥40–60%
+  - cryo_all_zero contradictions reduced ≥40–60%
+  - no canary auto-accepted
+
+I. Operational actions (0–72 hours) — precise timeline
+1) Immediate (0–6h)
+   - Deploy n==1 gating patch: block auto-decisions for top1_share ≥ 0.60 OR top1_spend ≥ 400 OR cryo_all_zero_flag OR all_zero_flag OR missingness_count ≥ 2. Route to priority_audit.
+   - Add 0160_01 & prior canaries to canary list and block auto-decisions.
+   - Persist provenance fields (top1/top2/flags/var_terms/CryoSleep/ensemble_agreement) in scoring logs so gate/calibrator see identical values.
+   - Add a simple data validation check: if any spend > 99.9 percentile (or > cap), mark as anomalous and flag for audit (do not auto-accept).
+2) Short-term (6–24h)
+   - Expose var_dom_high, var_all_zero_cryo, var_all_zero, var_dual_high, var_feature_dom in provenance and compute se_combined in scoring.
+   - Implement temporary per-feature logit caps (3.0 logits) in scoring to prevent single-feature flips.
+   - Implement batch-level check to pause auto-decisions if batch_frac_fragile ≥ 5%.
+   - Instrument dashboards for dom_high_by_ctx and cryo_all_zero_by_ctx slices and set alerts.
+3) Mid-term (24–72h)
+   - Retrain calibrator & GLM_fallback with top1_channel×top1_share and CryoSleep interactions, upweight contradictions; start ≥14 day shadow-run.
+   - Publish updated pooled-prior snapshots (μ_dom_channel_demo, μ_all_zero_cryo).
+   - Launch dashboards & alerts for targeted slices and canaries.
+   - Seed active-label queue with dom_high and cryo_all_zero contradictions for rapid labeling.
+
+J. Per-record provenance to log (required & extended)
+- Raw channels: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck
+- sum_spend (raw & log1p), sum_spend_bucket
+- top1_channel, top1_spend, top1_share, top1_share_bucket, top2_channel, top2_spend, top2_share
+- all_zero_flag, cryo_all_zero_flag, top1_dom_flag, concentration_by_channel_flag
+- spend_entropy_norm, num_nonzero_channels, missingness_count, missingness_profile
+- feature_dom_fraction, novelty_score
+- top1_channel_context_score, dom_channel_context_score, all_zero_context_score, N_slice
+- var_dom_high, var_all_zero, var_all_zero_cryo, var_feature_dom, var_dispersion, se_combined
+- μ_dom_channel_demo, μ_all_zero_demo, τ_slice_blend, pooled_prior_snapshot_id
+- GLM_fallback_probs, GLM_fallback_agreement_flag
+- ensemble_probs, ensemble_agreement
+- p10/p50/p90, p_final_sd, quantile_width
+- gating_reasons, routing_decision (auto/priority_audit)
+- scorer_version, calibrator_version, provenance_hash
+
+K. Initial hyperparameters (start values; sweepable)
+- TOP1_DOM_THRESHOLD = 0.60
+- TOP1_SPEND_HIGH = 400
+- BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+- N_min_slice = 50 (dom_high), 25 (other fragiles)
+- Z_high = 0.85 (dom_high/cryo_all_zero), 0.80 (others)
+- A_high = 0.995 (ensemble agreement)
+- SE_accept = 0.06 general (dom_high/cryo_all_zero require strong consensus)
+- QW_accept (p90−p10) = 0.12 (dom_high/cryo_all_zero) – 0.18 (others)
+- κ_dom = 0.10; κ_zero = 0.08; κ_zero_cryo = 0.12; κ_conc_chan = 0.06; κ_miss = 0.05
+- N0_dom_channel = 75; N0_all_zero_cryo = 100
+- CAP_PER_FEATURE_LOGIT = 3.0 logits
+
+L. CI canaries & expected behavior (update)
+- 0160_01 (Gory Atkinney; RoomService = 4119, top1_dom_flag True):
+  - Expected gating_reason: 'dom_high_stopgap' -> route to priority_audit unless slice_context_score ≥ Z_high AND GLM & ensemble consensus AND se_combined ≤ SE_accept.
+- 0152_01 (Andan Estron; VRDeck = 607): same handling.
+- 0151_01, 0144_01, 0148_01, 0149_01: maintained from prior canary set.
+
+WHY THIS WILL REDUCE BATCH ERRORS (short)
+- Fragile gating prevents overconfident auto-decisions for single-record novel slices (dom_high, all_zero+CryoSleep).
+- Dominant-channel-aware pooled priors and larger N0 for dom_high prevent a single record from overturning stable priors.
+- var_dom_high increases calibrated uncertainty for brittle slices; gates require consensus before auto-deciding.
+- Per-feature logit caps and dominance-scaling stop single features from flipping predictions.
+- Standardized transforms + persisted provenance remove mismatch bugs across scorer/calibrator/gate.
+- Retraining with upweighted contradictions corrects directionality and reduces future brittle errors.
+
+IMMEDIATE ONE-LINE CORRECTIVE ACTION
+- Deploy n==1 gating: route any record with top1_share ≥ 0.60 OR top1_spend ≥ 400 OR cryo_all_zero_flag OR all_zero_flag OR missingness_count ≥ 2 to priority_audit unless context_score ≥ 0.85 AND GLM_fallback & ensemble consensus AND se_combined ≤ 0.06 — add 0160_01, 0152_01, 0151_01, 0144_01, 0148_01, 0149_01 to canaries.
+
+NEXT STEPS / OFFER
+I can deliver:
+1) Minimal gating patch: pseudocode + CI unit tests + deploy checklist to block fragile n==1 auto-decisions and add canaries (ready in 2–12 hours); or
+2) Full retrain & deployment plan: dataset selection, upweighting schedule, CV folds, hyperparameter sweeps, acceptance criteria, dashboards + 14–28 day shadow-run plan (ready in 24–48 hours).
+
+Which would you like me to produce first?
+
+============================================================

@@ -1,0 +1,269 @@
+PREDICTIVE METRICS - ITERATION 14
+============================================================
+
+Executive summary — immediate takeaway and top priorities
+- What happened (0026_01 analysis earlier + new failure 0031_01): the pipeline’s treatment of multi‑channel spending is the operating point of failure in both directions. For 0026_01 it produced an over‑confident false positive; for 0031_01 it under‑weighted combined spend (or over-penalized small‑n support) and produced a false negative. In short: (a) the pipeline treated spending channels as nearly independent and applied strong small‑n neutralization per channel, which under‑counted coherent multi‑channel signals; (b) covariance and aggregated reliability were not properly computed, so extreme multi‑channel spenders either appeared over‑confident (when summed) or under‑trusted (when shrinkage/neutralization dominated).
+- Top priorities (deploy in order):
+  1. Treat spending channels as a grouped feature (SpendingGroup) for dominance, reliability estimation and variance propagation (winsorize + log1p + TotalSpend_log1p + per-channel diagnostics).
+  2. Compute and use group-level reliability (n_effective = Σ n_channel) when scaling spending-group weight so multi-channel small‑n evidence is recognized as collective support.
+  3. Propagate covariance across spend channels (use empirical Corr_ij else conservative default) into se_logit_final; use these se values to decide whether to Accept / Abstain (prefer abstain to forced False) in group-dominant cases.
+  4. Replace forced negative fallbacks for spending-dominant predictions with Abstain unless very high one-sided CI (p_lower ≥ 0.70–0.75), and allow a secondary path to accept if group_n_eff ≥ moderate support (≥ 8–10) and p_lower ≥ 0.62.
+  5. Add transparency fields and batch guards (spending_group_dominant fraction, multi_spend_extreme_count) and an immediate audit trigger when spending dominance > 1% of batch.
+
+Root cause analysis — 0031_01 (case specifics)
+- Data: HomePlanet=Mars, CryoSleep=False, Cabin=F/9/P (Deck F), Destination=TRAPPIST-1e, Age=47, VIP=False, RoomService=214, FoodCourt=0, ShoppingMall=1411, Spa=0, VRDeck=1229.
+- Failure pattern:
+  - Multiple spending channels are high (ShoppingMall and VRDeck particularly). Per‑channel Laplace + shrinkage + small‑n neutralization likely reduced each channel’s delta to a modest signal. Summing independent small deltas without proper group reliability boosting (n_effective) left SpendingGroup with insufficient influence, or covariance in se inflated uncertainty and p_lower was below the positive threshold → model predicted False.
+  - The original “fix for FPs” (aggressively neutralize small per-channel bins and/or default to Abstain/False when spending group dominates) can flip to harmful when a true positive exists and combined small signals are coherent.
+- Net effect: pipeline missed a legitimate multi‑channel spending profile (false negative) because group evidence was either under‑aggregated or over‑penalized.
+
+What this reveals about passenger patterns and feature behavior
+- Multi-channel spenders form a coherent behavioural profile (TotalSpend and pattern across channels matter). The statistical independence assumption between channels fails in tails.
+- Per-channel small‑n neutralization must be complemented by a group-level reliability measure so that multiple small supporting signals can combine into a stable group-level signal.
+- Decision guard rails that are asymmetric (only focus on preventing FP by forcing False) will reduce recall; prefer Abstain for ambiguous, group-dominated cases, and accept only under stricter CI rules.
+
+Complete updated deterministic scoring pipeline (production‑ready)
+This is deterministic and intended as a drop‑in replacement/patch. All parameters below are concrete defaults to deploy; tune via validation experiments.
+
+Snapshot inputs required
+- Global: N, T (labeled), p0 snapshot
+- For categorical / bins: n_bin, t_bin
+- Pairwise Corr_ij for spending channels (and other features when available)
+- Base_weights and version id
+- Spending bin boundaries and maps
+
+0) Baseline prior
+- p0 = (T + 1) / (N + 2); logit0 = ln(p0 / (1 − p0))
+
+1) Spending pre-processing (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck)
+- Winsorize at spending_winsor_pct = 0.995 (per-channel snapshot percentile).
+- s_i = log1p(x_winsorized).
+- Build per-channel quantile bins: num_bins = 20; merge adjacent bins until each n_bin ≥ min_bin_count = 10. If n_bin = 0 in production → mark new_category_low_support.
+- Compute TotalSpend_log1p = Σ_i s_i (after winsorize). Quantile-bin TotalSpend_log1p (num_bins_total = 20; same min_bin_count merging).
+- Compute multi_spend_extreme_count = count_i(s_i ≥ top_quantile_cut_i), where top_quantile_cut_i = 98th pctile snapshot for s_i. multi_spend_extreme_threshold = 2.
+- Compute ratio_top_channel = max_i s_i / TotalSpend_log1p and multi_channel_profile_flag = (ratio_top_channel ≤ 0.6) — captures distributed spending.
+
+2) Per-bin Laplace smoothing (alpha = 1)
+- For categorical / spending bin b:
+  - If n_b > 0: p_b_smoothed = (t_b + 1) / (n_b + 2)
+  - If n_b = 0: p_b_smoothed = p0 (mark low_support)
+
+3) Reliability shrinkage (k = 5)
+- p_b_shrunk = (n_b / (n_b + k)) * p_b_smoothed + (k / (n_b + k)) * p0
+
+4) Log-odds deltas and small-n neutralization
+- raw_delta_b = ln(p_b_shrunk / (1 − p_b_shrunk)) − logit0
+- Small-n neutralization:
+  - If n_b ≤ n_small (n_small = 3) → raw_delta_b := raw_delta_b * small_n_factor (0.5)
+  - If n_b < min_bin_count (10) → for spending bins apply spending_small_bin_factor = 0.35 (stronger shrink)
+- delta_b := clip(raw_delta_b, −max_delta, +max_delta) with max_delta = 0.8
+
+5) Extra-variance for spending extremes
+- For per-channel or TotalSpend bins flagged in top 2–5% or for multi_spend_extreme cases:
+  - se_delta_b := max(se_delta_b * extra_variance_mult, min_se_for_extreme)
+  - Use extra_variance_mult ∈ [1.5, 2.0], min_se_for_extreme = 1.0 (inflates uncertainty for rare bins)
+
+6) Base weights (relative, then normalized after reliability)
+- Base weights (defaults):
+  - CryoSleep = 0.27
+  - Deck/Cabin = 0.22
+  - HomePlanet = 0.10
+  - SpendingGroup = 0.13
+  - Destination = 0.10
+  - Age = 0.07
+  - Side = 0.06
+  - VIP = 0.05
+- Rationale: slightly increase spending_group weight (vs a too-low 0.08) so legitimate combined spenders register; weights are later reliability-scaled.
+
+7) Age-conditioned multipliers (unchanged)
+- Apply any business multipliers already in pipeline (example: CryoSleep multiplier by Age buckets)
+
+8) Reliability-scaling of weights (k2 = 5; group k2_group = 7)
+- For single features: r_b = n_b / (n_b + k2)
+- For spending channels we still compute r_channel similarly for internal use.
+- Define spending group n_effective = Σ_{spend channels} n_channel (sum of per‑bin counts for the bins the passenger maps to).
+- r_group = n_effective / (n_effective + k2_group) ; k2_group = 7 (this lets multiple small channels combine into higher group reliability)
+- raw_w_b = base_w_feature * age_multiplier * r_b
+- For spending group: raw_w_group = spending_group_base_w * age_multiplier * r_group
+
+9) Group clustering & redundancy correction
+- Compute Corr_ij across features; cluster features with abs(Corr_ij) ≥ corr_group_threshold = 0.25.
+- For ordinary clusters: scale raw_w_i ← raw_w_i / sqrt(m) where m = cluster size.
+- For spending cluster: do not divide weights per feature; use explicit SpendingGroup aggregator (next).
+
+10) SpendingGroup aggregation (single contributor for dominance & uncertainty)
+- Per-channel signed contributions: signed_contrib_channel_i = raw_w_channel_i * delta_channel_i
+- SpendingGroup_signed = Σ_i signed_contrib_channel_i
+- SpendingGroup_signed_abs = Σ_i |signed_contrib_channel_i|
+- group_weight_wg = Σ_i raw_w_channel_i
+- group_delta_agg = SpendingGroup_signed / group_weight_wg (weighted average delta)
+- Variance propagation:
+  - per-channel var_delta_i = se_delta_i^2
+  - Estimate cov_delta_ij = Corr_delta_ij * se_delta_i * se_delta_j
+    - Use snapshot Corr_feature_ij if available; else use conservative Corr_spend = 0.6
+  - se_group_contrib^2 = Σ_i Σ_j raw_w_channel_i * raw_w_channel_j * cov_delta_ij
+  - se_group_delta = se_group_contrib / group_weight_wg
+- Treat SpendingGroup as one synthetic feature with delta = group_delta_agg and se_delta = se_group_delta.
+- Persist per-channel diagnostics for audit.
+
+11) Final weight normalization
+- Include SpendingGroup as a single feature among others. Normalized weights:
+  - w_i_norm = raw_w_i / Σ_j raw_w_j (ensure sum = 1)
+
+12) Dominance guard (group-aware, symmetric and safer)
+- Compute signed_contrib_i = w_i_norm * delta_i (includes SpendingGroup)
+- total_signed_abs = Σ_j |signed_contrib_j| + ε
+- top_contrib_share = max_i |signed_contrib_i| / total_signed_abs
+- dominance_top_share_threshold = 0.45
+- If top_contrib_share > dominance_top_share_threshold and top feature = SpendingGroup:
+  - Evaluate group support:
+    - n_effective_group = Σ n_channel (as above)
+    - If multi_spend_extreme_count ≥ multi_spend_extreme_threshold (2) OR n_effective_group < dominance_group_n_min (20):
+      - Path A (strong evidence): if p_lower ≥ p_lower_group_strong (0.70) → Predict True
+      - Path B (moderate evidence + some support): else if (p_lower ≥ p_lower_group_secondary (0.62) AND n_effective_group ≥ dominance_group_secondary_n_min (8)) → Predict True
+      - Else → Abstain (preferred). If abstain not available → fallback False (policy controlled).
+    - Else (group has good support and not extreme multi-outlier): apply normal decision rules (see step 15).
+- If top feature ≠ SpendingGroup: apply non-spend dominance rule (top_contrib_share > 0.45 requires at least one other reliable supporting feature or elevated p_lower ≥ 0.65 else Abstain)
+
+13) Combine into logit and include covariance in se propagation
+- logit_final = logit0 + Σ_i signed_contrib_i (i includes SpendingGroup)
+- For uncertainty propagation:
+  - cov_delta_ii = se_delta_i^2
+  - cov_delta_ij = Corr_ij * se_delta_i * se_delta_j (Corr from snapshot; default Corr_spend = 0.6 for spending group)
+  - se_logit_final^2 = Σ_i Σ_j w_i_norm * w_j_norm * cov_delta_ij
+  - se_logit_final = sqrt(se_logit_final^2)
+- One-sided CI: z = 1.28 (90%). p_lower = sigmoid(logit_final − z * se_logit_final). Optionally use z = 1.64 (95%) in high-safety regimes.
+
+14) Evidence & support diagnostics (persist)
+- support_i_signed = (p_i_shrunk − p0) * r_i
+- support_pos = Σ_i base_w_i * max(0, support_i_signed)
+- support_neg = Σ_i base_w_i * max(0, −support_i_signed)
+- support_abs_total = support_pos + support_neg
+- reliable_pos_count = count features with r_i ≥ 0.6 and (p_i_shrunk − p0) ≥ 0.05 (exclude spending channels unless channel r_i ≥ 0.6)
+- Persist: p_final, p_lower, p_upper, se_logit_final, support_pos, support_neg, support_abs_total, reliable_pos_count, reliable_neg_count, top-3 contributors (feature, delta, w_norm, n, t), top_contrib_share, spending_group_signed_contrib, spending_group_se, multi_spend_extreme_count, spending_bin_ids, snapshot_id.
+
+15) Decision / Abstain / Fallback (revised & symmetric)
+- If support_abs_total < T_low (T_low = 0.035) AND max(reliable_pos_count, reliable_neg_count) < 2 → Abstain.
+- Group-dominance logic (top_contrib_share > 0.45 & top = SpendingGroup):
+  - Use the guard described in step 12: prefer Abstain unless p_lower strong (≥0.70) or secondary rule (p_lower ≥0.62 and n_eff ≥ 8)
+- Non-group-dominant logic:
+  - Predict True if:
+    - support_pos > support_neg AND
+    - (support_pos ≥ support_pos_min (0.06) OR reliable_pos_count ≥ 2) AND
+    - p_lower ≥ p_lower_pos_threshold (0.55)
+  - Predict False symmetrically:
+    - support_neg > support_pos AND
+    - (support_neg ≥ support_neg_min (0.05) OR reliable_neg_count ≥ 2) AND
+    - p_upper ≤ p_upper_neg_threshold (0.45)
+  - Else → Abstain
+
+16) Auto-fallback policy (if abstain unavailable)
+- For SpendingGroup dominated positives with weak group support or multi_spend_extreme_count ≥ 2 → default to Abstain preferred; if system requires binary fallback, default to False (Not Transported) but log conspicuously and route for rapid human review.
+
+17) Batch pre-commit checks and alerts
+- Compute batch_abstain_rate and batch_mean_se_logit.
+- Compute fraction of predictions with SpendingGroup top_contrib_share > dominance_top_share_threshold. If > batch_dominance_alert_rate (0.01) → pause auto-commit and randomly sample K (e.g., 100) for human audit.
+- Alert if mean new spending bins encountered > batch_new_spend_bin_threshold (1% of batch).
+
+Concrete parameter recommendations (deployable defaults)
+- Laplace alpha = 1
+- Shrinkage k = 5
+- Reliability weight k2 = 5; group k2_group = 7
+- max_delta = ±0.8
+- small_n_threshold = 3; small_n_factor = 0.5
+- spending_small_bin_factor = 0.35
+- spending_winsor_pct = 0.995
+- spending_bins = 20; min_bin_count = 10 (merge until satisfied)
+- dominance_top_share_threshold = 0.45
+- dominance_group_n_min = 20 (strong support); dominance_group_secondary_n_min = 8 (moderate)
+- multi_spend_extreme_threshold = 2
+- group_cov_default = 0.6
+- p_lower_pos_threshold = 0.55
+- p_lower_group_strong = 0.70
+- p_lower_group_secondary = 0.62
+- T_low = 0.035
+- support_pos_min = 0.06; support_neg_min = 0.05
+- z = 1.28 (90%); consider 1.64 if policy prefers higher-confidence acceptance
+- batch_dominance_alert_rate = 0.01
+
+Updated confidence mapping
+- High confidence (auto-accept True/False):
+  - p_lower ≥ 0.65 AND support_abs_total ≥ 0.08 AND reliable_count_in_direction ≥ 2 AND top_contrib_share ≤ 0.35
+- Medium confidence:
+  - p_lower ≥ 0.55 AND support_abs_total ≥ 0.05 AND top_contrib_share ≤ 0.45
+- Low confidence (Abstain preferred):
+  - p_lower < 0.55 OR support_abs_total < 0.05 OR top_contrib_share > 0.45 OR multi_spend_extreme_count ≥ 2
+
+Monitoring & alerts — what to compute and thresholds
+- Per-prediction persisted fields: p_final, p_lower, p_upper, se_logit_final, support_pos, support_neg, support_abs_total, reliable_pos/neg_count, top contributors, top_contrib_share, spending_group_signed_contrib, spending_group_se, multi_spend_extreme_count, spending_bin_id(s), snapshot_id.
+- Dashboards / daily metrics:
+  - Abstain rate, auto-fallback rate, distribution of top_contrib_share, p_lower, se_logit_final.
+  - Spending-group health: per-spend-bin n_bin, t_bin, FPR/FNR, trend; highlight bins with n_bin < min_bin_count used in predictions.
+  - Batch health: fraction of SpendingGroup-dominant (>0.45), if > 1% trigger audit.
+- Triggers:
+  - Pause commits and sample if spending_group_dominant fraction > 1% of batch.
+  - Alert if mean new spend bins encountered > 1% of batch.
+  - Re-fit base_weights after +50 new labeled instances or if bin-level FPR/FNR exceed control limits.
+
+Validation experiments to run immediately
+- LOO evaluation on current labeled set (N small) with revised scoring logic (no refit of base_weights). Report Brier, accuracy, recall, precision, abstain fraction, and which prior errors are corrected (including 0031_01 and previously flagged 0026_01).
+- Threshold sweep:
+  - p_lower_pos_threshold ∈ {0.50, 0.55, 0.60}
+  - p_lower_group_strong ∈ {0.68, 0.70, 0.75}
+  - dominance_top_share_threshold ∈ {0.35, 0.45, 0.55}
+- Min_bin_count sweep: {5, 10, 20}; spending_bins ∈ {10, 20, 30}
+- Compare variance propagation methods: independence, empirical covariance, conservative inflation (Corr_spend = 0.6) using bootstrap to check CI coverage and calibration (coverage of true y in CI).
+- Targeted stratified cross-tabs: Transported rate conditional on (TotalSpend_bin, Destination, Deck) to see segment heterogeneity. If spending predicts differently by Destination/Deck, incorporate interaction terms.
+
+Rollout checklist (prioritized)
+Immediate (24–48 h)
+  1. Implement spending winsorize/log1p + quantile binning + min_bin_count=10 merging + TotalSpend_log1p and multi_spend_extreme_count.
+  2. Implement group-level reliability (sum n across channels) and compute r_group with k2_group=7.
+  3. Implement SpendingGroup aggregator with covariance-based se (fallback Corr_spend = 0.6).
+  4. Implement revised dominance guard: prefer Abstain for ambiguous group-dominant cases; allow Predict True only under p_lower strong paths described above.
+  5. Add per-prediction diagnostics and batch alerts (spending_group_dominant > 1%).
+Near-term (1–2 weeks)
+  1. Run validation experiments, pick operating thresholds, and set production confidence tiers.
+  2. Add sample review workflow for Abstain outcomes (especially spending-dominant ones).
+  3. Tune base_weights using available labels (regularized) only after >50 labels.
+Medium-term (after +50 labels)
+  1. Move to hierarchical pooling for spending bins; share strength across bins and channels.
+  2. Consider adding explicit interaction features (TotalSpend × Destination, TotalSpend × Deck).
+Long-term (100+ labels)
+  1. Replace heuristic aggregator with a small calibrated model (GLM / regularized logistic) that preserves uncertainty propagation; use Bayesian hierarchical model for tails.
+
+Case-level diagnosis and expected outcome for 0031_01 under revised pipeline
+- Preprocessing: RoomService, ShoppingMall, VRDeck will be winsorized and log1p-transformed; TotalSpend_log1p will be high; multi_spend_extreme_count = 2 (ShoppingMall & VRDeck).
+- Reliability: per-channel bins may be small, but n_effective = sum(n_channels) increases group reliability; r_group will be > per-channel r_i and raw_w_group will reflect combined evidence.
+- Aggregation: SpendingGroup_signed will be strongly positive; se_group will include covariance (Corr_spend = 0.6 if empirical missing) which inflates uncertainty but not enough to erase a strong aggregated delta.
+- Dominance guard: SpendingGroup will likely be the top contributor with top_contrib_share > 0.45. Because multi_spend_extreme_count ≥ 2, the group-dominant decision rule applies:
+  - If p_lower ≥ p_lower_group_strong (0.70) → Predict True.
+  - Else if (p_lower ≥ p_lower_group_secondary (0.62) AND n_effective ≥ 8) → Predict True.
+  - Else → Abstain.
+- Expected practical outcome: given the magnitude of ShoppingMall and VRDeck spend, the aggregate delta will be large and (even after conservative se inflation) p_lower will likely meet the secondary threshold — so the revised pipeline is expected to correct the previous false negative and Predict True (or at worst Abstain if snapshot counts are extremely small). The case will be logged with: high spending_group_signed_contrib, spending_group_se, multi_spend_extreme_count=2, n_effective and top contributors.
+
+Expected short-term tradeoffs
+- False positives from naive multi-spend summation should decrease; false negatives (like 0031_01) should be corrected because group reliability now lets multiple small signals combine.
+- Abstain rate will increase initially (we prefer safe abstains over incorrect auto-labels). Track abstain fraction and tune p_lower thresholds to recover throughput once labels grow.
+- Some marginal true positives may be Abstained; use audit + label feedback to re-fit and restore.
+
+Short actionable checklist (deploy these first)
+1. Add winsorize/log1p + TotalSpend_log1p and multi_spend_extreme_count; compute ratio_top_channel.
+2. Replace per-channel spending-only dominance with SpendingGroup aggregator; compute n_effective and r_group.
+3. Propagate covariance across spending channels (default Corr_spend = 0.6); use these in se_logit_final.
+4. Update dominance guard to prefer Abstain for ambiguous spending-dominated cases; allow Predict True only via strict p_lower paths defined above.
+5. Add per-prediction diagnostics and batch alert when spending_group_dominant fraction > 1%.
+
+How we’ll measure success
+- Primary target: correct cases like 0026_01 (past FP) and 0031_01 (current FN) while keeping abstain rate manageable.
+- Key KPIs: per-bin FPR/FNR for top spend bins, net change in FP and FN counts on historical errors, batch spending_group_dominant fraction, LOO Brier and accuracy, and abstain rate.
+- Refit base_weights only after +50 labels or when batch-level FPR/FNR drift beyond control limits.
+
+Would you like:
+- A) A concrete Python scoring function implementing this revised pipeline (deterministic, including spending-group aggregation and covariance propagation), or
+- B) A LOO evaluation of the revised scoring logic on your current labeled set (reports: Brier, accuracy, abstain stats and which prior errors are corrected), or
+- C) Both?
+
+Recommendation: run option B first (LOO) to measure benefit and calibrate p_lower_group thresholds; I can prepare the scoring function (A) concurrently so you can deploy the patch quickly.
+
+============================================================

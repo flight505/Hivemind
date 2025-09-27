@@ -1,0 +1,240 @@
+PREDICTIVE METRICS - ITERATION 172
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+
+- What happened (short)
+  - Batch-of-one FP (Passenger 0212_02): model predicted transport=True driven by a large VRDeck spend (387) even though total spend was moderate (≈732) and actual=False. Sum‑threshold (IMPLAUSIBLE_SPEND_THRESHOLD) did not trigger. Calibrator and gating treated this n==1 as confidently predicted → overconfident FP.
+  - This is the same small‑batch failure class as prior cases (0210_01, 0211_03, 0212_01): single-record batches + single-channel outlier behavior + insufficient channel-aware detection + under‑estimated uncertainty for n==1.
+
+- Top immediate priorities
+  1. Emergency gating: treat channel‑specific top1 outliers (by percentile / z‑score) as fragile for n==1; route to priority_audit unless strict concordance tests pass.
+  2. Add channel‑aware outlier detection (percentile / zscore / per‑channel caps) — do not rely only on sum thresholds.
+  3. Increase heteroskedastic uncertainty for n==1 and for any top1_channel_high signatures; require GLM fallback + ensemble agreement to auto‑decide.
+  4. Persist raw inputs + imputation provenance for canaries (include 0212_02) to enable analysis and retraining.
+
+Concise answers to the six operational questions (batch accuracy focus)
+
+1) Which specific patterns caused the error?
+   - A relatively large VRDeck spend (387) produced a positive per‑feature logit that pushed the model over decision boundary. Sum-based implausible detection (threshold 1000) missed it. The calibrator did not model channel‑level heteroskedasticity (top1_channel, top1_value) and returned over‑narrow quantiles for n==1 → FP.
+
+2) How should decision rules be modified?
+   - Add channel‑aware top1 flags: top1_abs (existing), top1_channel_percentile (e.g., ≥ 99th/99.5th per‑channel), top1_zscore_per_channel (≥ 3).
+   - For n==1 records with any fragile flag (including top1_channel_pctile or zscore): block auto decisions by default, OR require all of: pooled_prior_tau high, N_slice ≥ N_min, GLM_fallback_agreement, ensemble_agreement, se_combined ≤ accept_threshold, and narrow p90−p10.
+   - Downweight or dampen per‑feature contributions for flagged channels (channel‑specific α_dom) before computing logits.
+
+3) New transport‑pattern insights?
+   - Channels have distinct semantics: moderate total spend can mask a channel‑specific extreme (VRDeck in this case) that the model overweights. Channel distributions are skewed; absolute thresholds will miss channel‑specific outliers unless percentiles or zscores are used.
+   - n==1 with unusual spend pattern + missing demographic signals is high‑uncertainty territory.
+
+4) How should confidence be recalibrated?
+   - Make calibrator heteroskedastic: include top1_channel, top1_value_raw, per_channel_implausible_flags, top1_channel_percentile, per_feature_logit_caps_triggered, and missingness_signature as inputs. Apply SE floors and add channel‑specific variance components for top1_high contexts. Widen p10/p90 for n==1 and flagged top1_channel cases.
+
+5) What adjustments are needed for batch consistency?
+   - Compute batch_frac_fragile (records with fragile flags). If above a small threshold (start 5%), hold the whole batch for review.
+   - Enforce stricter gating for n==1; require concordance checks before auto decisions.
+
+6) How can metrics be improved for edge cases like this?
+   - Preserve pre‑imputation NaNs and imputation provenance so missingness signatures are not collapsed to zeros.
+   - Add per‑channel implausible thresholds and top1_channel_percentile/zscore detection to capture cases like 0212_02.
+   - Add per_feature logit caps and channel‑aware dominance dampening; heteroskedastic calibrator and GLM fallback for concordance.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Immediate emergency actions (0–6h)
+- Emergency gating hotfix:
+  - If n_batch == 1 AND (cryo_allzero_flag OR all_zero_infant_flag OR missing_homeplanet_flag OR missing_destination_flag OR single_channel_dominant_flag OR per_channel_implausible_flag OR high_top1_abs_flag OR top1_channel_pctile_flag OR top1_channel_zscore_flag OR novelty_high_flag OR imputed_count ≥ 1) → block auto decision, route to priority_audit.
+  - Add 0212_02 (and earlier canaries 0210_01, 0211_03, 0212_01, etc.) to canary block.
+  - For records with any per_channel_implausible_flag or top1 flags: downweight logits (×0.5–0.7) and inflate variance.
+- Persist provenance: store raw per‑channel spends with NaNs preserved + imputation provenance for all canaries and fragiles.
+- SE floors (emergency): n==1 & any fragile_top1 OR implausible_spend → se_floor = 0.65.
+
+B. Flag & feature definitions (compute pre‑imputation where applicable)
+- top1_channel, top1_value_raw, top1_share_raw = top1_value_raw / (sum_raw + ε).
+- high_top1_abs_flag: top1_value_raw ≥ TOP1_SUSPICIOUS_ABS (start 700).
+- top1_channel_pctile_flag: top1_value_raw ≥ channel_pctile(channel, PCTILE_TOP1_FLAG) e.g., ≥ 99.0 or 99.5 percentile (recommended).
+- top1_channel_zscore_flag: (top1_value_raw − channel_mean)/channel_std ≥ Z_TOP1_FLAG (start 3.0).
+- per_channel_implausible_flag[channel]: channel_raw ≥ channel_implausible_threshold[channel] OR channel_raw > 3×channel_99.9pct.
+- Keep existing flags: all_zero_flag (pre‑imputation), missing_homeplanet_flag, missing_destination_flag, missing_channel_count, cryo_allzero_flag, single_channel_dominant_flag.
+- missingness_signature: bitmask/hash of missing demographics/channels.
+
+C. Feature engineering updates (v→v+1)
+- Persist raw inputs and imputation provenance; compute flags pre‑imputation.
+- New features: top1_channel_pctile, top1_channel_zscore, top1_value_zscore_per_channel, top1_channel_onehot, channel_entropy, channel_median_ratio (top1_value / channel_median), winsorized_spend[channel] at channel_specific_caps (99.5th percentile).
+- Keep raw channels in provenance for debugging and cluster detection.
+
+D. Channel‑aware thresholds & caps
+- Use empirical per‑channel percentiles to define implausible caps rather than only global sums.
+- Example starting policies (sweepable):
+  - PCTILE_TOP1_FLAG = 99.0 (flag if top1_value_raw ≥ 99th percentile for that channel)
+  - Z_TOP1_FLAG = 3.0
+  - TOP1_SUSPICIOUS_ABS = 700 (global absolute guard)
+  - Channel caps: winsorize at min(channel_99.5pct, absolute_cap[channel])
+- Record 0212_02 would be flagged if VRDeck_387 > VRDeck_99th_pctile (compute from history) or zscore ≥ 3.
+
+E. Per‑feature logit caps & dominance dampening (channel‑aware)
+- Implement per_feature_logit caps before summing into model logit:
+  - CAP_PER_CHANNEL_LOGIT base = 1.0 (scaleable)
+  - Channel specific caps: enforce lower caps for channels known to produce brittle positive logits (e.g., VRDeck_CAP_LOGIT = 0.8).
+- Dominance dampening:
+  - If top1_channel_pctile_flag or high_top1_abs_flag then top1_value := α_dom_channel * top1_value (α_dom_channel start 0.5–0.7; set α_dom_vrdeck = 0.5).
+  - After dampening, recompute per_feature logits.
+- Log and expose which per_feature_caps_triggered for auditing.
+
+F. Variance / SE model enhancements (heteroskedastic)
+- Add variance components κ for top1_high by channel:
+  - κ_top1_high_base = 0.50; κ_vrdeck_high = 0.55.
+- var_combined = var_base + Σ(indicator*κ_component)
+- se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- SE floors for n==1 fragiles:
+  - n==1 & any top1_channel_pctile OR zscore OR per_channel_implausible → se_floor = 0.65–0.70.
+
+G. Decision‑gating (pattern‑aware + batch/cohort aware)
+- fragile_flag_v3 = any of cryo_allzero_flag, missing_homeplanet_flag, missing_destination_flag, single_channel_dominant_flag, per_channel_implausible_flag, high_top1_abs_flag, top1_channel_pctile_flag, top1_channel_zscore_flag, imputed_count ≥ 1, novelty_high_flag.
+- batch_frac_fragile = #fragile_records_in_batch / batch_size.
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 5%) → route entire batch to priority_audit.
+- n==1 fragile gating (must pass ALL to auto accept/reject):
+  - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice,
+  - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice),
+  - ensemble_agreement ≥ A_high,
+  - se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice.
+  - Otherwise route to priority_audit.
+
+H. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Heteroskedastic quantile calibrator (predicts p10/p50/p90 and variance head).
+  - Inputs: raw_model_logit, per_feature_logit_contributions, fragility_flags, top1_channel, top1_value_raw, top1_channel_pctile, channel_entropy, missingness_signature, winsorized_sum_spend.
+  - Loss: quantile pinball (p10/p90) + ECE regularizer + Brier.
+  - Upweight fragile/top1_channel examples ×8–15 during training.
+- GLM_fallback:
+  - ElasticNet logistic on winsorized log1p channel features + interactions: top1_channel×top1_value, top1_channel×cabin_deck, all_zero×CryoSleep.
+  - GLM provides interpretable concordance check and fallback decision in gating.
+- Training & deployment:
+  - Rolling window (18–36 months), CV stratified by fragile slices and top1_channel.
+  - Shadow run 14–28 days before changing gating thresholds.
+
+I. Mixture priors & cluster detection (top1_channel stratified)
+- For brittle slices (high_top1, cryo_allzero, all_zero), cluster on (demographics, raw_spend_vector, missingness_signature, cabin_deck).
+- Compute μ_cluster, N_cluster, blend priors by cluster membership probability.
+- Use those priors to avoid averaging signals from heterogeneous subcohorts.
+
+J. Monitoring, metrics & alerts (batch‑focused)
+- New slice KPIs:
+  - high_top1_FP_rate & FN_rate per top1_channel (VRDeck, RoomService…)
+  - top1_channel_pctile_FP_rate
+  - n==1_auto_accept_rate, n==1_fragile_auto_accept_rate
+  - batch_frac_fragile
+- Alerts:
+  - Any canary auto_accepted/rejected → immediate page.
+  - high_top1_FP rise > baseline + X% over 24h → page.
+  - batch_frac_fragile ≥ threshold → hold batch + page.
+- Dashboards:
+  - Per‑record provenance for canaries and recent fragile auto‑decisions (raw vs winsorized, per_feature_logits, pooled_prior_snapshot, cluster_id, quantiles).
+
+K. CI unit tests & validation (fragile & top1)
+- Unit tests:
+  - Pre‑imputation flags computed correctly.
+  - top1_channel_pctile_flag triggers for synthetic VRDeck values at channel_99th.
+  - se_combined respects se_floor for n==1 & high_top1 cases.
+  - Per_feature logit caps & dominance dampening enforced.
+  - batch_frac_fragile ≥ threshold disables auto_decisions.
+  - Canaries (include 0212_02) must not be auto_accepted/rejected while gating active.
+- Regression tests:
+  - Global ECE / AUC / Brier degrade less than tolerances when gating enabled.
+  - Slice-level FP_rate improvements for top1_channel slices.
+
+L. Operational actions & timeline (0–72h)
+1) Immediate (0–6h)
+   - Deploy emergency gating to block n==1 fragiles (include top1_channel_pctile/zscore flags) and block canaries including 0212_02.
+   - Persist provenance for canaries and fragiles.
+   - Expose per_feature_logits, caps_triggered, and calibrator outputs in logs.
+2) Short‑term (6–24h)
+   - Implement channel_percentile & zscore detectors; lightweight GLM_fallback; compute batch_frac_fragile; instrument dashboards & alerts; collect labels for flagged cases.
+   - Run initial shadow tests to see how many records are flagged and tune thresholds.
+3) Mid‑term (24–72h)
+   - Retrain heteroskedastic quantile calibrator and GLM_fallback with upweighted fragile slices; run 14–28 day shadow run.
+   - Implement channel‑specific caps & dominance dampening; deploy mixture priors for brittle slices.
+   - Tune thresholds to balance throughput vs safety.
+
+M. Per‑record provenance to log (minimum)
+- Raw per_channel spends (NaNs preserved) + per_channel_imputed_flags + imputation_method + source_date.
+- Demographics raw + missing flags: CryoSleep raw, missing_homeplanet_flag, missing_destination_flag, Age, Age_bucket, cabin_deck.
+- Transforms & flags: winsorized_spend[channel], top1_channel, top1_value_raw, top1_share_raw, top1_channel_pctile, top1_channel_zscore, high_top1_abs_flag, per_channel_implausible_flags, single_channel_dominant_flag, missingness_signature, cluster_id.
+- Model internals: per_feature_logit_contributions, per_feature_logit_caps_triggered, pooled_prior_snapshot_id, μ_slice/μ_cluster, τ_slice_blend.
+- Variances: var_components, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, quantile_width, gating_reasons, routing_decision, scorer_version.
+
+N. Initial hyperparameters (start values; sweepable)
+- PCTILE_TOP1_FLAG = 99.0 (flag if top1_value_raw ≥ 99th percentile for that channel)
+- Z_TOP1_FLAG = 3.0
+- TOP1_SUSPICIOUS_ABS = 700
+- IMPLAUSIBLE_SPEND_THRESHOLD (sum) = 1000 (keep, but supplement with per-channel rules)
+- SE floors n==1 fragiles = 0.65
+- α_dom_channel default = 0.6; α_dom_vrdeck = 0.5
+- CAP_PER_CHANNEL_LOGIT = 1.0; CAP_VRDECK_LOGIT = 0.8
+- κ_top1_high_base = 0.50; κ_vrdeck_high = 0.55
+- BATCH_FRAGILE_THRESHOLD = 0.05
+- N_min_slice = 60; τ_high_slice = 0.95
+- δ_slice (GLM disagreement tolerance) = 0.05
+- A_high (ensemble agreement) = 0.995
+- QW_accept_slice (quantile width) = 0.12
+
+O. CI canaries & expected behavior
+- Canary list: include 0212_02 plus prior canaries (0210_01, 0211_03, 0212_01, etc.).
+- Expected route: priority_audit while emergency gating active.
+- CI asserts canaries not auto_accepted/rejected and must have preserved raw provenance.
+
+P. Gating pseudocode (pattern‑aware, batch focused)
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag_v3)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD:
+      route all r in B -> priority_audit; continue
+  - for each record r in B:
+      compute pre‑imputation flags
+      compute top1_channel, top1_value_raw, top1_share_raw
+      compute per_channel_implausible_flags, top1_channel_pctile_flag, top1_channel_zscore_flag
+      fragile_flag_v3 = union of flags above
+      if n_batch == 1 and fragile_flag_v3:
+         if pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice:
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if per_channel_implausible_flag OR top1_channel_pctile_flag OR top1_channel_zscore_flag:
+         downweight per_feature logits; if GLM+ensemble concordant AND se_combined small → allow, else route to priority_audit
+      if missing_homeplanet_flag OR missing_destination_flag:
+         route r -> data_quality_review + priority_audit
+
+Q. Specific diagnosis — Passenger 0212_02 (chain of failure & root cause)
+- Raw spends: RoomService 147, FoodCourt 188, Spa 10, VRDeck 387 → sum ≈ 732 (sum threshold 1000 not triggered).
+- Root causes:
+  1) No per‑channel percentile/zscore detector: VRDeck 387 may be an extreme relative to historical VRDeck distribution but was not flagged because the system only used sum-based implausible detection or absolute TOP1_SUSPICIOUS_ABS (700).
+  2) Per_feature_logit cap/dampening for VRDeck either absent or too loose; VRDeck contribution dominated the logit.
+  3) Calibrator lacked top1_channel/top1_value inputs and produced narrow quantiles for this n==1 record → overconfident decision.
+  4) Gating lacked top1_channel percentile/zscore checks for n==1; GLM_fallback/ensemble agreement not enforced.
+- Immediate mitigation that would have prevented this FP:
+  - top1_channel_pctile_flag or zscore_flag for VRDeck would mark record fragile → n==1 routing to priority_audit OR require GLM+ensemble concordance.
+  - Per_feature caps/dampening would reduce VRDeck's logit, possibly changing decision.
+
+R. How these changes reduce batch errors (short)
+- Channel percentile/zscore detection catches single‑channel outliers that sum thresholds miss (addresses 0212_02).
+- Per‑feature logit caps and dominance dampening limit single features from dominating logits (addresses 0211_03 and similar).
+- Heteroskedastic calibrator + SE floors produce conservative uncertainty estimates for n==1 and top1_high cases and reduce overconfident auto decisions.
+- GLM fallback + ensemble corroboration provide an interpretable concordance check and safety net.
+
+S. Tradeoffs & operational notes
+- Expected increase in priority_audit volume initially (esp. for top1_channel_pctile flagged records). Tune PCTILE_TOP1_FLAG vs business throughput.
+- Slight increase in latency and model complexity (more provenance stored, calibrator inputs, GLM fallback), but large reduction in high‑impact FPs on small batches.
+- Global metrics (AUC, Brier) may temporarily fluctuate; prioritize slice‑level improvements and batch accuracy.
+
+T. Next steps / recommended sequencing
+- Option 1 (Immediate, high priority): Deploy emergency gating with top1_channel_pctile and zscore detection; block canaries (include 0212_02). I can produce runnable gating code + unit tests now.
+- Option 2 (24–72h): Retrain heteroskedastic quantile calibrator + GLM_fallback, implement channel caps & mixture priors, run shadow run, tune thresholds based on throughput/triage capacity.
+
+Would you like me to:
+- Produce the emergency gating implementation now (runnable code + unit tests + CI patch) so canaries and n==1 fragiles (including 0212_02) are immediately blocked, or
+- Produce the full retraining pipeline specification (heteroskedastic quantile calibrator + GLM_fallback + mixture priors), sweep matrix, and shadow‑run dashboard spec for the 24–72h plan?
+
+I recommend: Deploy the hotfix gating immediately (include top1_channel percentile/zscore detection & per‑channel implausible detection), persist provenance for canaries, then retrain calibrator + GLM in shadow. If you want, I will generate the gating code and associated unit tests in my next message.
+
+============================================================

@@ -1,0 +1,217 @@
+PREDICTIVE METRICS - ITERATION 18
+============================================================
+
+Executive summary — immediate takeaway and top priorities
+- Immediate cause: 0035_01 is a classic mirror of the prior zero‑spend failure: the pipeline over‑relied on spending evidence and lacked robust spend‑dominance controls. Here very large spend values (RoomService=784, FoodCourt=964, Spa=951) produced large positive deltas that overrode weaker negative/neutral signals and an under‑estimated uncertainty, producing a confident False‑positive (predicted True, actual False).
+- Top priorities (deploy in order):
+  1. Implement spend‑dominance detection + "high‑spend outlier" guard that either down‑weights spend contributions or routes the case to a conservative fallback (segment prior / GLM / Abstain).
+  2. Rebalance feature weights (reduce SpendingGroup emphasis; increase Age and segment priors) and add per‑channel max_delta clipping (stronger for spend channels).
+  3. Increase uncertainty for correlated spend channels (use higher default correlation or empirical corr), recompute se_logit_final conservatively and raise p_lower thresholds for spend‑dominant predictions.
+  4. Add per‑segment and per‑spend calibration (Platt + spend‑group adjustment) and tiered acceptance thresholds for spend‑dominant vs non‑dominant predictions.
+  5. Strengthen monitoring (spend‑dominant FPR, per‑segment CI coverage) and snapshot bin boundaries; block batch commits if spend distribution shifts materially.
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Spending dominance
+  - Multiple high spend channels contributed large, positive deltas. The model treated those deltas as reliable positive evidence and allowed them to dominate the final logit.
+- Insufficient outlier handling for spend
+  - Winsorization/log1p alone did not eliminate very large influence; no per‑channel or total‑spend outlier guard was applied.
+- Underestimated uncertainty for correlated spend channels
+  - Spend channels are highly correlated (same passenger behavior), but the covariance used was too optimistic → se_logit_final too small → p_lower overly confident.
+- Too‑low safeguards for spend‑driven votes
+  - SpendingGroup dominance thresholds were either too permissive or not enforced. The pipeline allowed spend to decide the outcome without requiring corroborating evidence.
+- Missing negative/contradictory checks
+  - Rules did not sufficiently check for contradictions (e.g., high spend but segment prior low, CryoSleep flag and Age patterns inconsistent with high spend).
+- Potential label/noise check missing
+  - No quick verification for potential labeling errors or improbable spending patterns for that segment (should be routed to audit if suspicious).
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+- Detect spend dominance explicitly
+  - Define top_contrib_share = |signed_contrib_top| / Σ|signed_contrib_i|. If top_contrib_source == SpendingGroup and top_contrib_share ≥ dominance_top_share_threshold (default 0.45) → mark as spend_dominant.
+- High‑spend outlier guard
+  - Compute TotalSpend_log1p and robust zscore against segment median and MAD (segment = Age_bucket × Cabin_deck × Destination). If robust_z > z_outlier_threshold (default 3.0) → spend_outlier=True.
+  - If spend_outlier: reduce SpendWeight by spend_outlier_factor (default 0.5) OR route to GLM fallback or trained segment prior evaluation; do not allow spend alone to decide.
+- Strengthen spend‑dominant acceptance conditions
+  - For spend_dominant predictions require either:
+    a) p_lower ≥ p_lower_spend_strong (default 0.75), OR
+    b) p_lower ≥ p_lower_spend_secondary (default 0.68) AND (n_effective_spend ≥ 8) AND (at least one non‑spend reliable contributor).
+  - Otherwise Abstain or route to audit.
+- Per‑channel delta clipping for spend features
+  - max_delta_spend = ±0.6 (smaller than non‑spend max_delta ±0.8). This prevents any single spend channel from overwhelming the logit.
+- Correlation-aware uncertainty inflation
+  - Use empirical spend covariance where available; otherwise use conservative default Corr_spend = 0.8 (was 0.6). This increases se_logit_final for spend sums and reduces overconfidence.
+- Contradiction guard
+  - If segment_prior_shrunk < p_seg_low (e.g., 0.45) and spending is top positive contributor → require stricter p_lower or mark as conflicting → Abstain.
+- All_spend_zero logic retained and generalized
+  - Keep the all_spend_zero segment prior pathway (as in prior plan) but now also include the spend_outlier pathway. Both should be considered before spending‑dominant automatic acceptance.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- High spend ≠ guaranteed transported: extreme spenders can be either transported or not; spend alone is an unreliable single predictor without context.
+- Spending is highly correlated across channels and can create pseudo‑certainty; correlation structure matters more than previously modeled.
+- Interactions matter: Age_bucket × Cabin_deck × Destination priors can contradict spending signals; these should be consulted first when spend is extreme (high or zero).
+- Both tails (zero and extreme spend) are sensitive: predictive rules must treat both ends explicitly with symmetric but distinct logic.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Two‑stage calibration
+  - (A) Global Platt scaling on raw logit_final → p_calibrated.
+  - (B) Per‑segment (Age bucket × SpendingGroup) calibration adjustments: compute local ECE and apply per‑segment offsets/threshold adjustments.
+- Tiered acceptance thresholds (suggested starting points)
+  - High confidence: p_lower ≥ 0.75, support_abs_total ≥ 0.08, reliable_nonspend_count ≥ 1.
+  - Medium confidence: p_lower ∈ [0.60,0.75) and support_abs_total ≥ 0.05 and non‑spend corroboration present.
+  - Low / Abstain: p_lower < 0.60 or support_abs_total < 0.05 or spending_dominant without corroboration.
+- Spend‑dominant adjustment
+  - For spend_dominant: raise high/medium thresholds by +0.05 (i.e., high = 0.80, medium lower bound = 0.65) unless non‑spend corroboration exists.
+- CI z adjustments
+  - Use z = 1.28 (90%) normally; for spend_dominant or spend_outlier cases use z = 1.64 (95%) to enforce more conservative p_lower.
+- Track per‑segment CI coverage and adjust Platt mapping if spend groups show systematic miscalibration.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persist deterministic snapshots
+  - Save snapshot_id with bin boundaries, pooled merges, per‑bin counts, Corr_ij. Use same snapshot across a batch.
+- Deterministic pooling & merge logs
+  - Record pooling hierarchy and pooled_bin_source for every prediction.
+- Pre‑commit checks
+  - Compare batch spend distribution (median, 95pct, fraction of spend_outlier) vs baseline; block commit if shifts exceed thresholds (e.g., all_spend_high fraction > 2× baseline).
+- Audit queue
+  - Route any spend_outlier, spend_dominant without corroboration, large reductions in p_lower vs previous snapshot, and all_abstain batches to human review.
+- Stable fallback policy
+  - If abstain is not allowed, default rule: prefer segment_prior (Age_bucket × Cabin_deck × Destination) when spending is extreme and no corroboration exists.
+- Regular re‑evaluation cadence
+  - Refit base_weights and calibration after every +50 labels or when per‑segment ECE deviates beyond control limits.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New diagnostics to persist per prediction
+  - total_spend_log1p, spend_robust_z, spend_outlier_flag, top_contrib_source, top_contrib_share, signed_contrib_per_channel, sum_abs_signed_contrib, n_effective_spend, pooled_bin_source, segment_prior, segment_r, calibration_version, snapshot_id.
+- Hierarchical pooling + per‑segment priors
+  - Use Age buckets and (Age_bucket × Cabin_deck × Destination) priors with shrinkage. Both zero and high spend cases should consult those priors before spending dominates.
+- Per‑channel max deltas and spend_outlier down‑weight
+  - Cap spend deltas and down‑weight or route outliers to fallback models.
+- Conservative covariance modeling for spend
+  - Inflate covariance among spending channels (empirical or default high corr) to widen CI and avoid over‑confidence.
+- GLM fallback for low‑support / outlier cases
+  - Train a small regularized logistic (Age_bucket, Cabin_deck, Destination, CryoSleep) to provide robust baseline when spend features are unreliable.
+- Human‑in‑the‑loop auditing
+  - Send spend_dominant mismatches to human review until automated rules stabilize.
+
+Updated deterministic scoring pipeline (v2.2) — production‑ready outline
+1. Baseline priors
+   - p0_global = (T + 1)/(N + 2); logit0_global = ln(p0_global/(1 − p0_global)).
+   - Compute p0_age_bucket and p0_segment (Age_bucket × Cabin_deck × Destination) with Laplace smoothing and shrinkage.
+2. Age bucketing & pooling
+   - Buckets: [0–3, 4–12, 13–24, 25–44, 45–64, 65+]. child_flag = Age ≤ 3. Pool small bins upward deterministically.
+3. Spending preprocessing & outlier detection
+   - Winsorize per‑channel at 0.995; s_i = log1p(x_winsorized); TotalSpend_log1p = Σ s_i.
+   - Compute robust median & MAD per segment; spend_robust_z = (TotalSpend_log1p − median)/MAD.
+   - spend_outlier = (spend_robust_z ≥ 3.0) OR (TotalSpend_log1p ≥ global_99pct_threshold).
+4. Per‑bin smoothing & hierarchical pooling
+   - p_b_smoothed = (t_b + alpha)/(n_b + 2*alpha); p_b_shrunk = r_b * p_b_smoothed + (1 − r_b) * p0_effective where r_b = n_b/(n_b + k).
+5. Age‑conditioned baseline logit
+   - If n_age ≥ min_age_n → logit0_effective = logit0_global + r_age*(logit(p0_age) − logit0_global).
+6. Raw deltas and clipping
+   - raw_delta_b = ln(p_b_shrunk/(1 − p_b_shrunk)) − logit0_effective.
+   - Apply small‑n neutralization and clip:
+     - max_delta_nonspend = ±0.8
+     - max_delta_spend_channel = ±0.6
+7. Grouped spending aggregation & uncertainty
+   - n_effective_spend = Σ pooled n_channel.
+   - Use empirical Corr_ij for channels or default Corr_spend = 0.8; propagate covariance to get se_logit_final.
+   - If spend_outlier True → multiply SpendWeight by spend_outlier_factor (0.5) OR route to fallback.
+8. Base weights (rebalanced; normalized)
+   - CryoSleep = 0.26
+   - Cabin/Deck = 0.21
+   - Age = 0.13
+   - HomePlanet = 0.10
+   - SpendingGroup = 0.10
+   - Destination = 0.09
+   - Side = 0.04
+   - VIP = 0.03
+   - child_multiplier = 1.4 if child_flag and r_age ≥ 0.4
+9. Dominance & contradiction guards
+   - Compute top_contrib_share. If top source = SpendingGroup and top_contrib_share ≥ 0.45 → spend_dominant.
+   - If spend_dominant:
+     - If spend_outlier True → down‑weight spend OR fallback.
+     - Else require (p_lower ≥ 0.75) OR (p_lower ≥ 0.68 AND n_effective_spend ≥ 8 AND at least one non‑spend reliable contributor) else Abstain.
+   - If segment_prior_shrunk < 0.45 and spending positive & dominant → enforce stricter p_lower or Abstain.
+10. Final aggregation, calibration & decision
+   - logit_final = logit0_effective + Σ signed_contrib_i (with adjusted spend weights).
+   - se_logit_final via covariance propagation; for spend_dominant/spend_outlier use z = 1.64 else z = 1.28.
+   - p_raw = sigmoid(logit_final); p_calibrated = Platt_map(p_raw).
+   - p_lower = compute CI using calibrated mapping and se mapping (apply Platt mapping to logit and propagate).
+   - Decision rules (deployable defaults):
+     - If support_abs_total < T_low (0.035) and reliable_nonspend_count < 1 → Abstain.
+     - If all_spend_zero → apply all_spend_zero segment prior path (as earlier).
+     - If spend_dominant → apply spend_dominant acceptance rules above.
+     - Else:
+       - Predict True if support_pos > support_neg AND (support_pos ≥ support_pos_min (0.06) OR reliable_pos_count ≥2) AND p_lower ≥ p_lower_pos_threshold (0.55).
+       - Predict False symmetrically; otherwise Abstain.
+
+Concrete parameter defaults (v2.2)
+- Laplace alpha = 1; shrinkage k = 5; k_age = 10
+- min_bin_count = 10; min_age_n = 30
+- winsor_pct = 0.995; max_delta_spend = ±0.6; max_delta_nonspend = ±0.8
+- Corr_spend default = 0.8; group k2_group = 7
+- spend_outlier_z = 3.0; spend_outlier_factor = 0.5
+- dominance_top_share_threshold = 0.45; n_effective_spend_secondary = 8
+- p_lower_spend_strong = 0.75; p_lower_spend_secondary = 0.68
+- p_lower_pos_threshold = 0.55; T_low = 0.035; support_pos_min = 0.06
+- z_normal = 1.28; z_spend_special = 1.64
+
+Validation & experiments to run immediately
+- LOO evaluation on labeled set using v2.2 (no retrain of base_weights initially). Report Brier, accuracy, recall, precision, abstain fraction, per‑age bucket confusion, per‑spending‑profile confusion. Confirm whether 0035_01 flips to Abstain/False and that previous zero‑spend case (0034_01) is still corrected.
+- Focused spend‑dominant FPR test:
+  - Extract all historical cases where SpendingGroup was top contributor and sweep decision thresholds to find p_lower tradeoffs.
+- Outlier policy experiments:
+  - spend_outlier_z ∈ {2.5, 3.0, 3.5} and spend_outlier_factor ∈ {0.5, 0.6, 0.75}.
+- Covariance sensitivity:
+  - Corr_spend ∈ {0.6, 0.7, 0.8, 0.9} to validate CI coverage.
+- Calibration experiments: Platt vs isotonic and per‑segment Platt adjustments. Compute ECE per segment.
+- Coverage bootstrap: verify nominal CI coverage (90%/95%) across spend_dominant, spend_outlier, zero‑spend, and regular segments.
+
+Monitoring & alerts (fields to compute & thresholds)
+- Persist per prediction: p_calibrated, p_lower, p_upper, se_logit_final, support_pos/neg/abs_total, reliable_nonspend_count, top_contribs & top_contrib_share, spend_robust_z, spend_outlier_flag, spend_outlier_factor_applied, pooled_bin_source, segment_prior, snapshot_id, calibration_version.
+- Dashboards + alerts:
+  - Spend‑dominant FPR & FNR over time (alert if FPR increases by >10%).
+  - Fraction of spend_outlier cases by batch (alert if > baseline*2).
+  - Per‑segment ECE & CI coverage (alert if coverage drops > 5%).
+  - Batch precommit: if spend distribution (median/95pct) shifts by factor >2 → block and require manual review.
+- Audit triggers:
+  - All spend_outlier cases, spend_dominant cases that are predicted True with p_lower < 0.75, and all cases hit by fallback GLM.
+
+Rollout checklist (prioritized)
+Immediate (24–48h)
+1. Implement spend_dominant detection, spend_outlier guard and per‑channel max_delta for spending.
+2. Rebalance base weights (reduce SpendWeight, raise Age).
+3. Inflate spend covariance to Corr_spend = 0.8 by default and recompute p_lower logic.
+4. Add per‑prediction diagnostics (spend_robust_z, top_contrib_share, spend_outlier_flag, snapshot_id).
+5. Run quick LOO test and check 0035_01 and 0034_01 behaviors.
+Near term (1–2 weeks)
+1. Tune thresholds (p_lower_spend_strong, p_lower_spend_secondary, spend_outlier_z) using validation.
+2. Add per‑segment Platt calibrators; build dashboards and audit queue.
+3. Add GLM fallback for spend_outlier and low‑support segments.
+Medium term (after +50 labels)
+1. Implement full hierarchical Bayesian pooling for spend/age/segment.
+2. Refit base_weights with small supervised optimization subject to regularization and fairness constraints.
+3. Add human audits to refine rules for unusual spend patterns.
+Long term
+1. Consider small supervised model trained to encode these decision rules (regularized GLM or tree) that produces calibrated probabilities with bootstrap uncertainty.
+2. Move from ad hoc thresholds to policy learned by optimizing batch objective with abstain costs included.
+
+Case‑level diagnosis — 0035_01 and expected outcomes under v2.2
+- Why it failed originally: multiple huge spend contributions created a strong positive signal; covariance and clipping were insufficient, so p_lower exceeded the acceptance threshold without non‑spend corroboration → predicted True (False positive).
+- v2.2 handling:
+  - Total spend will be flagged as spend_outlier (robust z >> 3) and spend weights will be down‑weighted or routed to GLM fallback.
+  - Spend_dominant detection will require stronger p_lower (0.75) or corroboration from non‑spend features.
+  - Per‑channel max_delta will reduce single‑channel sway.
+  - se_logit_final will be larger due to higher spend correlation → p_lower will be lower.
+- Expected outcome: either Abstain (preferred) or Predict False with correct CI; significantly reduced chance of False‑positive on this pattern.
+
+Expected tradeoffs
+- Short term: decrease in spend‑driven recall (some true positives that were spend‑dominant may move to Abstain); expected reduction in FP rate on spend‑dominant cases.
+- Increase in Abstain and audit volume initially while thresholds are tuned.
+- Longer term: lower FPR with stable or improved overall Brier/ECE after per‑segment calibration and reweighting.
+
+Immediate action I can take for you
+- Produce a deterministic Python scoring function implementing v2.2 (with spend_dominant/outlier guards, deltas clipping, covariance handling, Platt calibration and diagnostics).
+- Run LOO evaluation on your labeled set and produce the validation report (Brier, ECE, accuracy, recall, per‑segment confusion matrices) and confirm the behavior on 0035_01 and 0034_01.
+Tell me which you want first (scorer code, LOO report, or both), and I will deliver the concrete artifacts and a short runbook for deployment.
+
+============================================================

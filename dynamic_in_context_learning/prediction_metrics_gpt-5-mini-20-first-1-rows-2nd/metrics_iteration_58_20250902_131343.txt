@@ -1,0 +1,261 @@
+PREDICTIVE METRICS - ITERATION 58
+============================================================
+
+Updated Predictive Metrics Report — v3.5.2 (post_0083_01)
+
+Version & high‑level goal
+- Version: v3.5.2 (post_0083_01).
+- High‑level goal: preserve v3.5.1 improvements (per‑channel spend bins, conditional concentrated‑spend penalties, trusted‑slice exceptions) and restore/guarantee recall on zero_spend sub‑slices beyond CryoSleep (notably zero_spend × young_age, zero_spend × cabin_deck, and general zero_spend patterns) while keeping concentrated‑spend FP reduction intact. Deliverables focus on:
+  - extending slice_trust coverage and granularity for zero_spend subslices,
+  - rebalancing calibrator/prior weight for zero_spend contexts,
+  - context‑aware small‑batch gating that does NOT blanket‑penalize zero_spend records,
+  - active learning prioritization for zero_spend contradictions.
+
+Executive summary — immediate takeaway and top priorities
+- New failure observed (batch error): 0082_03 — all spends = 0, CryoSleep = False, Age = 8 → predicted False, actual True (FN).
+- Why this matters: we previously focused trust on zero_spend × CryoSleep; this FN shows we under‑modeled other zero_spend patterns (e.g., children, certain cabins/homeplanet) that are also high‑precision positives. Blanket novelty/OOD penalties or over‑broad small‑batch SE inflation suppressed a legitimate slice.
+- Root‑cause (short):
+  - slice_trust_table too coarse (only cryo_zero_spend in trusted list), so zero_spend_noncryo with supporting covariates had insufficient prior weight;
+  - calibrator and GLM lacked dedicated zero_spend sub‑slice covariates/interactions (age_bucket, cabin_deck, homeplanet);
+  - small‑batch gating applied novelty/SE inflation for zero_spend records because zero_spend pattern was treated as under‑supported or novel.
+- Top priorities (deploy order):
+  1. 0–48h: Add zero_spend_subslice generation & trust scoring (divide zero_spend into cryo, age buckets, cabin_deck, homeplanet interactions). Exempt trusted zero_spend subslices from novelty penalties. Adjust small‑batch SE floor logic to be context‑aware.
+  2. 2–14d: Retrain GLM/SRM & calibrator to include zero_spend_flag, zero_spend_subslice_id, zero_spend × age_bucket/cabin interactions, novelty_score, and channel_spend_bin features. Use stratified validation to evaluate zero_spend subslices.
+  3. Weekly: Prioritize active learning & audits for zero_spend contradictions (predicted False, actual True) and concentrated_spend contradictions.
+  4. Monitor: keep concentrated_spend FP rates reduced while restoring recall for zero_spend subslices.
+
+Detailed analysis and recommended updates — answers to the six questions
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Observed pattern for 0082_03:
+  - Features: total_spend = 0, all channel spends = 0, CryoSleep = False, Age = 8 (child), Cabin F/16/P, HomePlanet = Mars.
+  - Model behavior: ensemble and predictors produced a low positive signal (or agreed on negative), calibrator produced a low p_final, small‑batch gating applied increased uncertainty/penalty and lowered p_final further → FN.
+- Root metric patterns that caused the failure:
+  - Slice_trust coverage lacked granularity: only zero_spend × CryoSleep had been marked trusted; zero_spend × child or zero_spend × cabin patterns were not captured.
+  - Calibrator had insufficient covariate representation for zero_spend subslices: zero_spend_flag either absent or underweighted.
+  - Novelty/outlier scoring treated zero_spend as “unsupported” in some contexts, causing undue SE inflation or logit penalty.
+  - Small‑batch (n==1) conservative defaults were applied globally rather than conditional on slice signals — causing recall suppression in known high‑precision zero_spend contexts.
+
+2) How should decision rules be modified to prevent similar errors?
+Principles:
+- Make slice trust hierarchical and granular (allow multiple zero_spend subslices).
+- Only apply novelty/outlier penalties when no trusted slice signal supports the record.
+- Use contextual se floors — lower SE for trusted zero_spend subslices, higher SE for true OOD concentrated spends.
+
+Concrete rule changes:
+- Extend slice_trust_table to include zero_spend_subslices with keys like:
+  - zero_spend × CryoSleep (existing).
+  - zero_spend × Age_bucket (e.g., Age ≤ 12).
+  - zero_spend × Cabin_deck (e.g., deck F).
+  - zero_spend × HomePlanet (Mars/Europa/… when significant).
+  - multi‑key combinations (zero_spend & Age ≤12 & deck F).
+- Trust logic:
+  - If a zero_spend_subslice has sample_count ≥ slice_trust_min_n and TP_rate ≥ TP_threshold (e.g., 0.75), mark trusted and:
+    - reduce base_min_se for the record (trusted floor 0.02–0.03),
+    - do NOT apply logit novelty/outlier penalty,
+    - allow P_prior(s) to have increased weight (bounded).
+- Prior fusion:
+  - Include zero_spend_subslice posterior_mean & posterior_se in P_prior with weight w_slice = min(1.0, N_slice/(N_slice + τ_slice)), where τ_slice (e.g., 100).
+  - If multiple trusted slices match, combine priors by hierarchical weighting (more specific slices get higher weight).
+- Calibrator & gating:
+  - Retrain calibrator with zero_spend covariates; for records with trusted zero_spend flag, apply lower z_adj and lower p_lower threshold for acceptance.
+- Small‑batch n==1 rule:
+  - If n==1 and trusted_slice_flag True → use trusted thresholds (auto‑accept if p_final ≥ slice_prior_mean − κ*se_slice).
+  - Else use novelty‑aware SE inflation.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Zero_spend does not only correlate with CryoSleep; subsets of zero_spend (children, certain decks/homeplanets) also have elevated transport probability.
+- Trust is hierarchical: some zero_spend contexts are highly predictive (cry0, child_zero_spend), others are ambiguous.
+- Absolute absence of spend can be a robust signal when combined with demographic/cabin context; calibrator must reason over these interactions.
+- Concentration vs. absence: previously we mitigated concentrated outliers; now we must avoid over‑penalizing absence patterns that are historically predictive.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Incorporate slice prior variance into combined SE:
+  - var_slice = posterior_mean_slice*(1 − posterior_mean_slice)/(N_slice + 1)
+  - var_bin (for channel spend bins) same as before.
+- Combined variance:
+  - var_combined = (α_prior^2)*var_prior + (α_ens^2)*var_ensemble + var_novelty + var_slice_term
+  - var_slice_term = β_slice * var_slice (β_slice = 1.0 but downweighted when slice sample_count small)
+- SE floor is contextual:
+  - base_min_se(context) mapping:
+    - trusted_slice_flag True → base_min_se = 0.02–0.03 (n==1).
+    - zero_spend but not trusted → base_min_se = 0.04–0.06 (n==1).
+    - novelty_score > 0.6 and not trusted → base_min_se = 0.07–0.10.
+- z_adj (safety margin) scaled by risk factors but NOT increased for trusted slices:
+  - z_adj = base_z * (1 + γ1*combined_FP_risk + γ2*model_disagreement + γ3*novelty_score)
+  - For trusted_slice_flag True → reduce z_adj by λ_trust (e.g., reduce by 30–50%).
+- Calibrator:
+  - Replace single‑dim Platt with a covariate‑aware logistic calibrator (features: p_lower, novelty_score, zero_spend_flag, zero_spend_subslice_id, top_channel_percentile, model_disagreement). This prevents global penalties suppressing valid zero_spend signals.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persistence & snapshotting:
+  - Snapshot channel_spend_bins and slice_trust_table at batch start and tag outputs with snapshot_id.
+- Deterministic, context‑aware small‑batch gating:
+  - Unit test deterministic rules for n==1, especially for zero_spend and concentrated_spend flags.
+- Provenance & logging:
+  - Log per record: zero_spend_flag, zero_spend_subslice_id, slice_trust_score, p_prior_slice, N_slice, p_combined_before_penalty, logit_shift, p_combined_after_penalty, se_combined, z_adj, p_final, reason_code.
+- Canary & shadow testing:
+  - Shadow run v3.5.2 on prior batches incl. 0074_01..0083_01; block rollout if trusted_slice recall drops > 2% absolute or concentrated_spend FP increases > 10% relative.
+- Monitoring:
+  - Add dashboards: zero_spend subslice recall/precision, per‑slice sample_count growth, novelty_score distribution for zero_spend records, audit queue composition.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New per‑record metrics to persist:
+  - zero_spend_flag, zero_spend_subslice_id, slice_trust_score, N_slice, p_prior_slice, p_final, logit_shift_amount, model_disagreement.
+- Model & training changes:
+  - GLM_fallback v12:
+    - Add features: zero_spend_flag, zero_spend_subslice_onehot or ordinal, zero_spend × age_bucket, zero_spend × cabin_deck, zero_spend × homeplanet, top_channel_percentile, channel_outlier_zscore, novelty_score.
+    - Enforce stratified sampling for zero_spend sub‑slices (oversample small high‑precision subslices).
+  - Calibrator: covariate‑aware logistic calibrator trained with slice indicators and novelty covariates.
+- Active learning:
+  - Priority labels: zero_spend contradictions (predicted False & actual True), concentrated_spend contradictions (predicted True & actual False).
+  - Upweight these examples in next training cycles.
+- Preprocessing:
+  - Keep raw spends for bin lookup & slice detection; use winsorized/log1p spends for features fed into models to avoid coefficient leverage on raw extremes.
+
+Updated deterministic scoring pipeline (v3.5.2) — flow
+1. Snapshot load (batch start): channel_spend_bin, channel_spend_stats, slice_trust_table (zero_spend_subslices included), models & calibrators, hyperparams.
+2. Per record preprocessing:
+   - Compute total_spend, num_nonzero_channels, zero_spend_flag, spend_entropy, top_channel, top2_share, top_channel_spend, top_channel_percentile_by_channel, top_channel_spend_bin_id, channel_outlier_zscore, cryo_flag, Age_bucket, Cabin_deck, HomePlanet.
+   - Compute zero_spend_subslice candidates (e.g., cryo + zero_spend, age_bucket + zero_spend, deck + zero_spend, planet + zero_spend).
+   - Compute novelty_score (existing), but set novelty_contribution to near 0 if any trusted zero_spend subslice present.
+3. Prior lookups:
+   - Lookup channel_spend_bin posterior_mean & SE, slice_trust entries for all matching zero_spend_subslices; compute hierarchical slice_prior (most specific gets priority).
+4. Model inference:
+   - Run GLM_fallback v12, aggregator, SRM; get per‑model p ± SE and model_disagreement metric.
+5. P_prior construction:
+   - Combine channel_bin_prior and slice_prior and other priors with weights w_bin and w_slice computed from N_bin, N_slice and τs.
+6. Combine ensemble:
+   - p_combined_prepenalty = α_prior * P_prior + α_ens * E (E = ensemble aggregated model score).
+7. Outlier & zero_spend handling:
+   - If concentrated_top2_flag && extreme_absolute_flag && NOT any_trusted_slice_flag:
+     - Apply soft logit_shift_outlier (δ_logit_outlier * novelty_scale) and increase var_novelty.
+   - If zero_spend_flag:
+     - If any zero_spend_subslice trusted → do NOT apply logit_shift; instead ensure slice_prior contributes (via w_slice).
+     - If no trusted subslice but zero_spend_total_count per matching subslice >= bin_min_n → use slice_prior with smaller weight.
+8. Variance & SE:
+   - Compute var_prior (including var_slice and var_bin), var_ensemble (from per‑model SEs), var_novelty; var_combined = α_prior^2 * var_prior + α_ens^2*var_ensemble + var_novelty + β_slice*var_slice.
+   - se_combined = sqrt(max(var_combined, base_min_se(context)^2)).
+9. Calibrate:
+   - Compute z_adj (abatement for trusted slices): z_adj = base_z * (1 + γ1*FP_risk + γ2*disagreement + γ3*novelty_score); if trusted_slice_flag True → z_adj *= (1 − λ_trust).
+   - p_lower = p_combined_after_penalty − z_adj * se_combined.
+   - p_final = covariate_calibrator.predict([p_lower, novelty_score, zero_spend_flag, zero_spend_subslice_id, top_channel_percentile, model_disagreement]).
+10. Decisioning / gating:
+   - If trusted_slice_flag True and p_final ≥ accept_threshold_trusted (e.g., posterior_mean_slice − 1.0*se_slice) → auto‑accept.
+   - Else if concentrated extreme & bin_n < bin_min_n → route to priority_audit (unless ensemble consensus extremely high).
+   - Else standard thresholding & audit routing.
+11. Persist provenance fields, append to audit/AL queue if flagged.
+12. Post‑batch: update channel_spend_bin & slice_trust_table counts with labeled results (exponential decay), schedule retrain if contradictions exceed thresholds.
+
+Default hyperparameters (v3.5.2 initial; tuning required)
+- slice_trust_min_n = 50 (minimum examples to mark a subslice "trusted")
+- slice_trust_TP_threshold = 0.70 (TP rate required to be considered trusted)
+- τ_slice = 100 (slice prior smoothing)
+- channel_spend_bin_min_n = 30
+- extreme_percentile_threshold = 0.995 (for concentrated extreme detection)
+- top2_share_concentrated = 0.98
+- δ_logit_outlier = 0.8 (initial)
+- β_slice = 1.0
+- small_batch_min = 10
+- base_min_se (n==1):
+  - trusted_slice floor = 0.02
+  - zero_spend_nontrusted = 0.04
+  - novelty_high & not trusted = 0.08
+- z parameters:
+  - base_z = 1.645; γ1 = 1.0; γ2 = 0.6; γ3 = 1.0; λ_trust = 0.35 (trust reduces z_adj by 35%)
+- calibrator: covariate logistic; regularization C controlled via CV.
+- ensemble weights start: aggregator 0.5, GLM 0.3, SRM 0.2 (tune during retrain)
+- var_novelty κ initial = 0.015
+
+Validation experiments & acceptance criteria
+- Stratified validation slices:
+  - zero_spend × CryoSleep, zero_spend × Age_bucket (≤12, 13–25, 26+), zero_spend × Cabin_deck, zero_spend × HomePlanet, concentrated_top2 × top_channel_percentile bins, per‑channel spend_bin.
+- Test set includes prior failing batches: 0069_01..0083_01 (include 0082_01, 0082_02, 0082_03).
+- Metrics:
+  - Per‑slice recall & precision, Brier score, ECE, CI coverage, audit precision/recall, tiny‑batch FP/FN.
+- Acceptance criteria (relative to v3.5.1 baseline):
+  - zero_spend subslice recall (for subslices with N ≥ slice_trust_min_n): maintain or improve (no recall drop > 1% absolute).
+  - Concentrated_spend FP rate for high percentile bins: decrease ≥ 50% OR no regression > 5% versus v3.5.1.
+  - Overall FN increase must be ≤ 5% (with slice‑level constraints above).
+  - Audit load increase initially allowed up to 1.5×, but must trend down via active learning within 4 weeks.
+- Parameter sweeps:
+  - slice_trust_min_n ∈ {30,50,75}
+  - δ_logit_outlier ∈ {0.5,0.8,1.2}
+  - base_min_se(n==1) for zero_spend ∈ {0.02,0.04,0.06}
+  - τ_slice ∈ {50,100,200}
+- Ablations:
+  - Remove slice_prior; remove logit_outlier; remove trusted_slice exceptions; measure per-slice impacts.
+
+Unit test matrix (add to CI)
+- Case A (audit/reject expected): concentrated high RoomService (RoomService=7406, others 0, CryoSleep False) → should not auto‑accept; route to audit.
+- Case B (trusted accept expected): zero_spend & CryoSleep True (0082_02) → auto‑accept.
+- Case C (new accept expected): zero_spend & Age ≤12 & deck F (0082_03 example) → if zero_spend_subslice (age≤12 & deck F) is trusted → auto‑accept.
+- Case D (zero_spend & not trusted): zero_spend & random context (no trusted subslice) → behave per prior and calibrator; ensure no undue automatic trusts.
+- Case E: large batch with many concentrated spends → ensure concentrated_spend FP rate does not regress.
+- Synthetic OOD tests: many extreme spends in unseen ranges → verify logit penalty applied and audit routing triggers.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+  - Generate zero_spend_subslice aggregation (daily): groupings by CryoSleep, Age_bucket, Cabin_deck, HomePlanet; compute N_slice, TP_rate, posterior_mean, posterior_se; create slice_trust_table.
+  - Expose low‑latency lookup for slice_trust_table and channel_spend_bin.
+2. Scoring engine:
+  - Implement preprocessor updates (zero_spend_subslice detection, slice_trust lookup).
+  - Implement conditional novelty/outlier penalty suppression when trusted_slice_flag True.
+  - Add detailed provenance logging fields.
+  - Shadow run v3.5.2 on last N batches (include 0082_01..0082_03).
+3. ML:
+  - Retrain GLM_fallback v12 and calibrator with new covariates. Run stratified validation and parameter sweep.
+4. Ops/SRE:
+  - Add canary metrics for zero_spend_subslice recall & concentrated_spend FP; block rollout until acceptance criteria are met.
+5. Product/ops:
+  - Update human audit triage and instructions to prioritize zero_spend contradictions & concentrated_outliers.
+6. Monitoring:
+  - Create dashboards for zero_spend subslice growth and performance, novelty distribution per subslice, audit queue health.
+
+How v3.5.2 would handle the concrete cases
+
+- 0082_01 (RoomService = 7406; concentrated single channel FP previously)
+  - Preprocess detects concentrated_top2_flag True, extreme_absolute_flag True, top_channel_percentile high; channel_bin sample_count low.
+  - Ensemble probably high; P_prior from bin weak.
+  - novelty_score high; logit outlier penalty applied; se_combined increased; p_lower reduced.
+  - Decision: route to priority_audit (unless ensemble consensus extremely high). Expected: prevent auto‑accept (prevents FP).
+
+- 0082_02 (all spends = 0; CryoSleep = True — prior FN)
+  - Preprocess: zero_spend_flag True, cryo_flag True → zero_spend_cryo subslice matched; slice_trust likely True.
+  - Do NOT apply novelty penalty; slice_prior contributes with weight; base_min_se lowered; z_adj reduced.
+  - p_final boosted by calibrator (trained with cryo covariate).
+  - Decision: auto‑accept. Expected: recall restored.
+
+- 0082_03 (all spends = 0; CryoSleep = False; Age = 8 — new FN)
+  - Preprocess: zero_spend_flag True, age_bucket = ≤12, deck=F, homeplanet=Mars; zero_spend_subslice candidate (age≤12 & deck F) present.
+  - If slice_trust_table indicates this subslice meets sample_count & TP thresholds → trusted_slice_flag True → same exceptions as 0082_02 (no novelty penalty, lower SE, calibrator boosts p_final).
+  - If subslice is not yet trusted (N_slice < slice_trust_min_n):
+    - Still include slice_prior with conservative w_slice = N_slice/(N_slice + τ_slice); reduce novelty contribution if similar historical patterns exist across broader subslices (e.g., age≤12 across decks).
+    - Route ambiguous cases to priority_audit if p_combined_after_penalty falls below decision thresholds but slice_prior suggests positive.
+  - Expected: if historical data supports this subslice, auto‑accept; if support weak, at least avoid blanket FN (prefer audit) and push for human labeling to grow N_slice.
+
+Expected tradeoffs & mitigations
+- Tradeoffs:
+  - Initial increase in summary audit volume for zero_spend nontrusted subslices and concentrated outliers while slice_trust_table accumulates data.
+  - Slight delay for some legitimate concentrated positives until bins/slices reach min_n.
+- Mitigations:
+  - Active learning priority labeling for zero_spend contradictions and concentrated contradictions.
+  - Conservative but not blocking trusted slices: mark slices trusted only when sample_count and TP_rate exceed thresholds.
+  - Staged rollout and canary gating.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudocode implementing v3.5.2 rules (preprocessing, priors, outlier penalty suppression for trusted zero_spend subslices, calibrator call, gating).
+- zero_spend_subslice generation script + retention/decay policy (daily update).
+- slice_trust_table generation logic (automated daily update).
+- Shadow retrain: GLM_fallback v12 + covariate calibrator + stratified validation report.
+- Minimal CI unit test matrix (including 0082_01, 0082_02, 0082_03).
+- Dashboard & canary configuration.
+- 72‑hour implementation checklist mapped to owners.
+
+One‑line summary
+v3.5.2 extends v3.5.1 by adding hierarchical zero_spend subslice trust, context‑aware small‑batch gating, covariate‑aware calibration, and updated priors—preventing concentrated_spend FPs while restoring recall for zero_spend contexts beyond CryoSleep (e.g., children and certain cabins).
+
+Recommended immediate next action
+Implement the zero_spend_subslice table + trusted_slice lookup and the conditional novelty/outlier‑penalty suppression in a shadow scorer (0–48h), and concurrently prepare GLM/calibrator retraining with new covariates (2–14d). I can produce either (A) deterministic scorer skeleton (Python pseudocode) or (B) minimal CI unit test matrix for v3.5.2 next — which would you like first?
+
+============================================================

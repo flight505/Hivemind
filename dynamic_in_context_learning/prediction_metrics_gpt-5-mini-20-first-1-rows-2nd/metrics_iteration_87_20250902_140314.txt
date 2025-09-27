@@ -1,0 +1,308 @@
+PREDICTIVE METRICS - ITERATION 87
+============================================================
+
+Updated Predictive Metrics Report — v3.9.0 (post_0110_01 & 0110_04 triage)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A single-record batch produced two contrasting failures:
+  - 0110_01: false-positive (Pred=True, Actual=False). Pattern = concentrated_high spend (Spa ≈ 3,929; sum_spend ≈ 5,100; top1_share ≈ 0.77) + categorical missingness (Cabin=NaN) → overconfident positive auto-decision.
+  - 0110_04: false-negative (Pred=False, Actual=True). Pattern = true_zero spend (all spend channels 0) + CryoSleep=True → model under-weighted CryoSleep × zero-spend interaction and returned low p.
+- Immediate implication: The scorer is mis-handling fragile single-record slices at both extremes (imputed/true-zero and concentrated_high/outlier channels), and missing categorical fields (Cabin) + slice-novelty are not being reflected properly in uncertainty or gating. Result: outsized FP and FN impact for n==1 batches.
+- Immediate priorities (0–72h):
+  1. Treat concentrated_high and high-channel-outliers, and zero/imputed-zero patterns as first-class fragile slices.
+  2. Add CryoSleep as an explicit pooled_prior component and a novelty interaction (cryo × spend-zero, cryo × concentration).
+  3. Harden n==1 gating: require GLM_fallback agreement or very high ensemble consensus + low uncertainty, otherwise priority_audit.
+  4. Add var_missing_cat, var_concentration, var_cryo_interaction to SE model and raise SE-floors for fragile patterns so the model cannot be overconfident.
+  5. Persist per-record provenance (missing_count, top1_channel_id, feature_snapshot_hash, batch_snapshot, gating_reasons) to speed triage.
+  6. Shadow-deploy gating + variance changes and run CI including cases 0108_03, 0108_02, 0110_01, 0110_04.
+
+Direct answers to the six requested questions (concise)
+1) Signals that led to this error
+   - n == 1 (single-record batch) → pooled_prior/logit_shifts dominated without strict gating.
+   - 0110_01: extreme concentration (top1_share ≈ 0.77) + missing Cabin → high novelty not reflected in SE or gating.
+   - 0110_04: true_zero spend + CryoSleep=True → missing explicit CryoSleep prior / cryo×zero interaction; model relied heavily on zero-spend signal and under-predicted.
+   - Missing categorical fields and channel-specific risk not in variance/prior model → under- or over-confidence.
+
+2) Decision-rule changes to prevent recurrence
+   - Make fragile-pattern detection first-class.
+   - n==1 & untrusted_subslice:
+     - imputed_zero → priority_audit (stopgap).
+     - concentrated_high / high_channel_outlier → require GLM_fallback agree OR ensemble_agreement ≥ 0.999 AND se_combined ≤ pattern_accept_se_max; otherwise priority_audit.
+     - true_zero & CryoSleep=True → require GLM_fallback OR ensemble_agreement ≥ 0.995 and se_combined ≤ 0.06; else audit.
+   - n ≤ 3 with any fragile pattern → raise agreement by +0.003 and lower allowed se by 0.02 (stricter).
+   - Always persist gating_reasons and block auto-decisions when gating_reasons non-empty.
+
+3) New pattern insights
+   - Fragility is bi-modal: zero-end (true_zero/imputed_zero) and high-end (concentrated_high, channel_outliers) both create large predictive risk.
+   - Channel-specific behavior matters: some channels (Spa, VRDeck) have higher historical contradiction rates; top1_channel must be first-class.
+   - CryoSleep interacts with spend patterns — CryoSleep=True turns some zero-spend records into higher-probability positives; this interaction was previously unmodeled.
+
+4) Confidence recalibration summary
+   - Add var_missing_cat, var_concentration, var_channel_risk, var_cryo_interaction to variance model.
+   - Increase SE floors for fragile patterns (prevent underestimation of uncertainty).
+   - Retrain calibrator (quantile-capable) to output p10/p50/p90 and sd; use quantiles + sd + ensemble_agreement + novelty_score to drive gating rather than mean alone.
+
+5) Consistency adjustments
+   - Standardize imputation: numeric spend NaN → 0 + imputation_flags; categorical missing → explicit missing token + flag.
+   - Enforce per-batch snapshot (batch_snapshot_id, feature_snapshot_hash, scoring_version) persisted per record.
+   - All gating thresholds, hyperparams and slice definitions must be snapshoted; CI must assert their presence.
+
+6) Metric improvements for edge cases
+   - Add new canaries: concentrated_high contradictions per top1_channel, imputed_zero contradictions, true_zero_cryo contradictions.
+   - Per-slice ECE/Brier/FN/FP for zero- and concentrated-tiers and per-channel risk.
+   - Active-label seeding and fast-label pipelines for concentrated_high and imputed_zero contradictions.
+
+Detailed failure chains (what went wrong, why)
+- 0110_01 (FP; mirror of earlier 0108_03):
+  - Snapshot: PassengerId 0110_01; Spa ≈ 3929; VRDeck=764; sum_spend≈5109; top1_channel=Spa; top1_share≈0.77; Cabin=NaN; missing_categorical_count≥1; n==1.
+  - Failures:
+    1. concentrated_high not enforced as fragile pattern → gating allowed auto-decision.
+    2. Variance model lacked var_concentration and var_missing_cat → se_combined underestimated.
+    3. Ensemble agreement gating not strict enough for concentrated_high n==1 → allowed overconfident positive.
+    4. Logit_shift magnitude not sufficiently damped for concentration + missing_cat combination.
+
+- 0110_04 (FN):
+  - Snapshot: PassengerId 0110_04; CryoSleep=True; Cabin=B/5/P; all spends 0 → true_zero; n==1.
+  - Failures:
+    1. Model treated zero-spend as strong negative signal; CryoSleep effect insufficiently represented in pooled_prior.
+    2. No explicit cryo × zero interaction in GLM_fallback/calibrator → mis-estimated p.
+    3. Gating allowed auto-decision on n==1 true_zero with CryoSleep (lack of special-case handling).
+    4. No var_cryo_interaction term → overconfident on a novel interaction.
+
+Minimum signals to capture per record (must persist)
+- batch_snapshot_id, scoring_version, feature_snapshot_hash, passenger_id, record_id, run_timestamp
+- n_batch, Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile_by_channel, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, channel_spend_zscores
+- missing_count, missing_categorical_count, per_channel_missing_flags, imputation_flags, imputed_zero_flag, true_zero_flag
+- CryoSleep flag, HomePlanet, Age_bucket, VIP flag
+- pooled_prior components (μ_global, μ_channel, μ_subslice, μ_spend_bucket, μ_missing_bucket, μ_channel_risk, μ_cryo), τs
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- novelty_score, interaction_novelty_score (concentration × categorical_missing, cryo×zero)
+- applied_logit_shift components and final logit_shift magnitude
+- p_after_logit_shift, p_final_mean, p10/p50/p90, p_final_uncertainty (sd), se_combined
+- gating_decision + gating_reasons, label & label_source (if available)
+
+Revised pattern definitions (v3.9.0; first-class)
+- true_zero_spend_flag: sum_spend == 0 AND missing_count == 0
+- imputed_zero_spend_flag: sum_spend == 0 AND missing_count > 0
+- micro_concentrated_flag: 0 < sum_spend ≤ S_low AND top1_share ≥ T_mc AND num_nonzero_channels ≤ 2
+- concentrated_topK_flag: top1_share ≥ T_mc AND num_nonzero_channels ≤ K_thresh
+- mid_concentrated_high_spend_flag: top1_share ≥ T_mc_mid AND sum_spend ≥ S_mid
+- concentrated_high_spend_flag: concentrated_topK_flag AND (spend_zscore ≥ Z_high OR sum_spend ≥ S_high)
+- high_channel_outlier_flag: top1_channel ∈ high_risk_channels AND (channel_spend_zscore ≥ channel_Z or channel_share ≥ channel_share_thresh)
+- cryo_zero_interaction_flag: CryoSleep==True AND true_zero_spend_flag (first-class fragile interaction)
+
+POOLING / pooled_prior (updated & spend-/missing-/cryo-aware)
+- pooled_prior = (τ_pattern * μ_pattern + τ_channel * μ_channel + N_subslice * μ_subslice + τ_spend_bucket * μ_spend_bucket + τ_missing * μ_missing_bucket + τ_channel_risk * μ_channel_risk + τ_cryo * μ_cryo) / (τ_pattern + τ_channel + N_subslice + τ_spend_bucket + τ_missing + τ_channel_risk + τ_cryo)
+- Rationale: add μ_cryo so CryoSleep effects are injected into single-record pools; increase τ_pattern for fragile slices to ensure pattern priors meaningfully influence small pools.
+
+DIRECTION-AWARE logit_shift (dampen high-novelty impacts)
+- Pipeline:
+  - raw_sum = log(1 + sum_spend)
+  - sum_damp = clamp(raw_sum / log(1 + S_damp), ε, 1.0)
+  - polarity = 2 * pooled_prior − 1
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - concentration_damp = (top1_share ≥ T_conc ? conc_shift_frac : 1.0)
+  - missing_cat_damp = (missing_categorical_count > 0 ? missing_cat_shift_frac : 1.0)
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp * concentration_damp * missing_cat_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- Defaults: conc_shift_frac = 0.6 (reduce overconfidence for concentrated patterns), missing_cat_shift_frac = 0.5
+- Rationale: damp shifts for concentration and categorical-missingness; inject CryoSleep through pooled_prior rather than ad-hoc logit boosts.
+
+VARIANCE / SE MODEL (explicit additions)
+- New variance terms:
+  - var_missing_cat = κ_missing_cat * (missing_categorical_count / M_cat_scale)^2 * (1 + (1 − spend_entropy))
+  - var_concentration = κ_conc * (top1_share)^2 * (sum_spend / S_scale)^2 * (1 + (1 − spend_entropy))
+  - var_channel_risk = κ_channel_risk * channel_risk_score * (sum_spend / S_scale)
+  - var_cryo_interaction = κ_cryo * (CryoSleep ? 1 : 0) * (true_zero_spend_flag ? 1 : 0) * (1 + (1 − spend_entropy))
+- Combine:
+  - var_combined = var_prior + var_ens + var_novelty_cond + β_slice*var_slice + β_pattern*var_pattern + var_spend_extremity + var_missingness + var_missing_cat + var_concentration + var_channel_risk + var_cryo_interaction
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- SE floors (v3.9.0):
+  - trusted_slice_floor = 0.02
+  - true_zero_nontrusted_floor = 0.18
+  - imputed_zero_nontrusted_floor = 0.22
+  - concentrated_nontrusted_floor = {micro:0.16, mid_concentrated:0.12, concentrated_high:0.22}
+  - extreme_novelty_floor = 0.14
+- Rationale: explicitly capture concentration, categorical-missingness, channel risk and cryo interactions into uncertainty so single-record fragile patterns are not overconfident.
+
+DECISION GATING (coherent & conservative)
+- Definitions:
+  - ensemble_agreement = max_fraction_of_models_predicting_top_class
+  - model_disagreement = 1 − ensemble_agreement
+  - accept_se_max_trusted = 0.06
+  - accept_se_max_general = 0.05
+  - general_agreement_threshold = 0.98
+  - fragile_agreement_thresholds (n==1 & untrusted):
+    - zero_true: 0.995 (with GLM_fallback encouraged)
+    - zero_imputed: route_to_audit (stopgap)
+    - micro: 0.999
+    - mid_concentrated: 0.995
+    - concentrated_high: 0.999
+    - high_channel_outlier: 0.999
+- Pseudocode:
+  1. If Trusted_subslice AND p_final_mean ≥ accept_threshold_trusted AND se_combined ≤ accept_se_max_trusted AND ensemble_agreement ≥ general_agreement_threshold → auto_accept.
+  2. Else if n == 1 AND pattern_type ∈ fragile_patterns AND NOT Trusted_subslice:
+       - If pattern_type == imputed_zero → priority_audit (stopgap).
+       - Else if pattern_type == concentrated_high OR high_channel_outlier:
+           - Require (ensemble_agreement ≥ fragile_threshold AND se_combined ≤ accept_se_max_general AND GLM_fallback agrees with predicted class). Else → priority_audit.
+       - Else if pattern_type == true_zero:
+           - If cryo_zero_interaction_flag: require (GLM_fallback agrees OR ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06). Else → priority_audit.
+       - Else: require pattern-specific fragile_threshold + se bound + fallback agreement else audit.
+  3. Else if n ≤ 3 AND fragile pattern present: apply stricter thresholds (agreement +0.003, se −0.02).
+  4. Else: general gating (require se_combined ≤ accept_se_max_general and ensemble_agreement ≥ general_agreement_threshold else audit).
+- Rationale: only allow auto-decisions for fragile single-records when the ensemble and fallback agree and uncertainty is demonstrably low; otherwise route to human/priority_audit.
+
+CALIBRATOR & GLM_FALLBACK (retrain plan)
+- Calibrator objectives:
+  - Output p10/p50/p90 and sd (not just mean).
+  - Features: p_after_logit_shift, pattern_type, imputed_zero_flag, missing_count, missing_categorical_count, top1_share, spend_zscore, sum_spend_bucket, spend_entropy, novelty_score, pooled_prior, N_subslice, ensemble_agreement, top1_channel_id, Cabin_missing_flag, CryoSleep, Age_bucket, HomePlanet.
+  - Model: quantile LightGBM ensemble or small Bayesian NN with grouped CV by (time, top1_channel_id, sum_spend_bucket, missing_bucket).
+  - Upweight concentrated_high contradictions and imputed_zero contradictions in training set.
+- GLM_fallback adjustments:
+  - Add interactions: concentrated_high × missing_categorical_count × top1_channel_id; CryoSleep × true_zero_spend; channel_risk_score × sum_spend_bucket × Age_bucket; imputed_zero × missing_count × channel_missing_flags.
+
+MONITORING, METRICS & ALERTS (what to add)
+- New slice monitors:
+  - concentrated_high contradictions per top1_channel: ECE, Brier, FP/FN
+  - imputed_zero contradictions: ECE, Brier, FN
+  - cryo_zero contradictions (true_zero & CryoSleep): FN rate, contradiction frequency
+  - n==1 routing metrics: fraction auto_accepted, auto_rejected, routed_to_audit; FN/FP
+- Alerts:
+  - concentrated_high FP rate > 20% above baseline (24h) → block auto_accept for concentrated_high + urgent triage.
+  - imputed_zero FN rate > 20% above baseline (24h) → block auto_reject + alert.
+  - cryo_zero FN rate > 15% above baseline (24h) → immediate triage.
+  - n==1 auto_accept rate below expected threshold or audit routing fraction drop → alert.
+  - missing provenance or batch_snapshot mismatch → alert.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- CI tests to add/update:
+  - M1..M4 from v3.7.x preserved (true_zero, micro, concentrated_top1, concentrated_high).
+  - M5: 0108_02 (mid_concentrated_high_spend, n==1, untrusted) → priority_audit
+  - M6: 0108_03 (imputed_zero_spend, n==1, untrusted) → priority_audit
+  - M7: 0110_01 (concentrated_high, top1_channel=Spa, Cabin missing, n==1, untrusted) → priority_audit
+  - M8 (new): 0110_04 (true_zero & CryoSleep=True, n==1, untrusted) → require fallback/strict gating (not auto-reject)
+  - Trusted subslice variations: allow calibrated auto-decisions
+- Validation experiments:
+  - Retrain calibrator & GLM_fallback with grouped CV and test on held-out historical contradictions (concentrated_high + imputed_zero + cryo_zero).
+  - Shadow deploy updated scorer to measure audit queue, per-slice FN/FP and ECE for 14 days.
+- Acceptance targets (vs baseline v3.7.x):
+  - concentrated_high contradictions: ≥30–40% relative reduction on test set.
+  - imputed_zero contradictions: ≥40% relative reduction.
+  - cryo_zero contradictions: ≥30% relative reduction.
+  - overall FN increase ≤3 percentage points absolute (aim ≤1).
+  - Audit queue ≤1.5× baseline first 2 weeks and trending down.
+
+Operational actions (0–72 hours) — prioritized
+1. Engineering (0–24h):
+   - Implement concentrated_high, high_channel_outlier, cryo_zero detectors; compute top1_share, channel_risk_score, missing_categorical_count, CryoSleep flag.
+   - Persist required per-record provenance fields and snapshotable config.
+   - Implement stopgap gating: n==1 & imputed_zero → priority_audit; n==1 & concentrated_high & NOT Trusted_subslice → require GLM_fallback or route to audit (configurable via shadow).
+2. Scoring engine (24–48h; shadow):
+   - Add var_missing_cat & var_concentration & var_cryo_interaction in variance calc and raise SE floors for fragile patterns.
+   - Apply damped logit_shift pipeline (sum_damp + conc_damp + missing_cat_damp).
+   - Enforce strict n==1 gating for fragile patterns; persist gating_reasons.
+   - Shadow this scorer and run CI tests including 0110_01 and 0110_04.
+3. ML (24–72h):
+   - Retrain GLM_fallback & calibrator including cryo interactions; calibrator to return quantiles.
+   - Start active-label seeding for concentrated_high and imputed_zero contradictions and for cryo_zero contradictions.
+4. Ops & Monitoring (24–72h):
+   - Deploy updated dashboards & canaries; add alerts as defined.
+   - Do not promote to full live until shadow meets acceptance criteria ≥72h.
+5. Product / Audit (24–72h):
+   - Create fast-label workflows for concentrated_high, imputed_zero and cryo_zero contradictions to accelerate trust growth.
+
+Per-record provenance to log (required)
+- batch_snapshot_id, scoring_version, passenger_id, record_id, run_timestamp, feature_snapshot_hash
+- pattern_type, sum_spend, sum_spend_bucket, spend_zscore, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, missing_count, missing_categorical_count, per_channel_missing_flags
+- Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components + final pooled_prior
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- applied_logit_shift components, p_after_logit_shift, p_final_mean, p10/p50/p90, p_final_uncertainty (sd), se_combined
+- gating_decision and gating_reasons, label and label_source
+
+Hyperparameters (v3.9.0 initial; sweepable)
+- S_low = 50
+- T_mc = 0.75
+- T_mc_mid = 0.60
+- S_mid = 500
+- S_high = 1000
+- Z_mid = 2.0
+- Z_high = 3.0
+- S_damp = 200
+- τ_pattern: {K1:100, K2:160, K3:220, zero:360, micro:340, mid_concentrated:200, concentrated_high:360}
+- τ_channel = 120
+- τ_spend_bucket = 80
+- τ_missing = 140
+- τ_channel_risk = 100
+- τ_cryo = 140
+- δ_logit_pattern = {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40, mid_concentrated:0.50, concentrated_high:0.45}
+- imputed_zero_nontrusted_floor = 0.22
+- true_zero_nontrusted_floor = 0.18
+- concentrated_high_nontrusted_floor = 0.22
+- agreement_thresholds (n==1 & untrusted): zero_true:0.995, zero_imputed:route_to_audit, micro:0.999, mid_concentrated:0.995, concentrated_high:0.999, high_channel_outlier:0.999
+- conc_shift_frac = 0.6
+- missing_cat_shift_frac = 0.5
+- w_dis = 0.80
+- κ_spend = 0.04, Z_scale = 3.0
+- κ_missing = 0.06, M_scale = 3.0
+- κ_missing_cat = 0.09, M_cat_scale = 2.0
+- κ_conc = 0.045, S_scale = 2000
+- κ_channel_risk = 0.06
+- κ_cryo = 0.03
+
+CI TESTS (explicit expected outcomes; include both 0110 cases)
+- 0103_02 (true_zero_spend, untrusted, n==1) → priority_audit
+- 0103_01 (micro_concentrated, untrusted, n==1) → priority_audit
+- 0102_01 (concentrated_top1, untrusted, n==1) → priority_audit
+- 0107_01 (concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_02 (mid_concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_03 (imputed_zero_spend, untrusted, n==1) → priority_audit
+- 0110_01 (concentrated_high_spend, top1_channel=Spa, Cabin missing, untrusted, n==1) → priority_audit
+- 0110_04 (true_zero_spend & CryoSleep=True, untrusted, n==1) → NO auto-reject; require fallback/strict gating
+- Trusted subslice variations → allow calibrated auto-decisions
+
+Monitoring & Alerting (exact triggers)
+- concentrated_high FP rate > 20% above baseline for 24h → block auto_accept for concentrated_high + alert triage
+- imputed_zero FN rate > 20% above baseline for 24h → block auto_reject and alert
+- cryo_zero FN rate > 15% above baseline for 24h → urgent triage
+- n==1 audit routing fraction < expected threshold → alert
+- mismatch between batch_snapshot_id and per-record provenance → alert
+
+Acceptance criteria (post-deploy shadow -> live)
+- concentrated_high contradictions: ≥30–40% relative reduction
+- imputed_zero contradictions: ≥40% relative reduction
+- cryo_zero contradictions: ≥30% reduction
+- true_zero contradictions: ≥30% reduction
+- mid_concentrated contradictions: ≥30% reduction
+- overall FN increase ≤3% absolute (aim ≤1)
+- Audit queue ≤1.5× baseline for first 2 weeks, trending back to baseline
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.9.0) implementing:
+   - concentrated_high, high_channel_outlier, cryo_zero, imputed_zero/true_zero detectors
+   - per-record provenance persistence
+   - damped logit_shift pipeline + var_missing_cat, var_concentration, var_cryo_interaction
+   - n==1 fragile gating stopgap (imputed_zero->audit; concentrated_high & cryo_zero require fallback)
+2. CI test updates adding 0110_01 and 0110_04 expectations.
+3. Slice_trust_table seeding update including per-channel risk and cryo priors.
+4. GLM_fallback + calibrator retrain plan + grouped CV validation report (quantiles).
+5. Dashboards & canary configuration for concentrated_high, imputed_zero, cryo_zero.
+6. Active learning labeling plan + fast-label workflow for concentrated_high & imputed_zero & cryo_zero contradictions.
+
+One-line summary
+v3.9.0: Treat concentrated_high, high-channel outliers, true/imputed-zero and cryo_zero interactions as first-class fragile patterns; add concentration, categorical-missing and cryo-interaction uncertainty to variance; damp spend-driven logit shifts for fragile records; require GLM_fallback + stricter ensemble consensus for single-record fragile cases; persist full per-record provenance; shadow-deploy and retrain calibrator to fix failures like 0110_01 and 0110_04.
+
+Recommended immediate artifact to prepare first
+- Build the deterministic scorer skeleton + CI test updates (includes 0108_02, 0108_03, 0110_01, 0110_04 expectations). Rationale: lightweight to implement, shadowable, immediate protection (concentrated_high & imputed_zero & cryo_zero stopgaps + provenance logging) while calibrator/GLM retrain proceeds.
+
+If you want, I will:
+- produce the deterministic scorer skeleton + CI updates now (recommended), or
+- produce the slice_trust_table seeding script in parallel.
+
+Which should I prepare first?
+
+============================================================

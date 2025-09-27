@@ -1,0 +1,34 @@
+PREDICTIVE RULES - ITERATION 2
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. Define TotalSpend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck and define "spend diversity" as the count of different amenity categories with nonzero spend.
+
+2. Require multiple independent positive signals: predict Transported = True only when at least two independent positive signals are present among {VIP == True, CryoSleep == False with nonzero spend, high TotalSpend relative to peers from the same HomePlanet or Deck, spend diversity >= 2, cabin-group majority True, surname-family majority True, strongly favorable HomePlanet→Destination→Deck baseline}. A single positive signal is not sufficient except when overridden by a strong group/cell baseline (see rule 11).
+
+3. Treat CryoSleep as ambiguous, not automatically negative: if CryoSleep == True and TotalSpend == 0 then mark as "uncertain" and resolve with family/cabin majority, age-dependent rules, and HomePlanet→Destination→Deck priors; if CryoSleep == True and TotalSpend > 0 or VIP == True, count CryoSleep as a positive signal.
+
+4. Make VIP a supporting, not sole, determinant: VIP == True contributes one positive signal but only guarantees Transported = True when combined with at least one other independent positive signal (e.g., diversified nonzero spend, cabin/family majority True, CryoSleep with nonzero spend, or a strong favorable baseline).
+
+5. Require spend to be contextualized: label TotalSpend "high" only when it is noticeably above the peer median for the same HomePlanet or Deck and preferably when spending is distributed across two or more amenities; large spending concentrated in a single amenity should be down-weighted and requires an additional positive signal.
+
+6. Use surname-based family groups in addition to cabin grouping: infer family groups by surname (last token of Name) across cabins; when a family-majority outcome is supported by multiple members with independent strong signals, propagate that majority to ambiguous dependents and CryoSleep True family members.
+
+7. Strengthen cabin-group majority usage: when two or more passengers share an identical Cabin string, use a cabin majority outcome to predict remaining members, but only when that cabin majority is corroborated by independent indicators (spend, VIP, CryoSleep status) before overriding an individual's strong contrary signals.
+
+8. Age-dependent decision rules: infants/toddlers (age <= 3) follow caregiver/family/cabin-majority outcome; children and teenagers (age 4–17) follow adult majority within their cabin or surname-family group and otherwise require at least one additional positive signal to be predicted True; adults (18–59) require a strong positive signal plus supporting evidence; seniors (age >= 60) require stronger evidence (e.g., VIP, CryoSleep with nonzero spend, diversified high TotalSpend relative to peers, or a cabin/family majority True) to predict True.
+
+9. Handle missing cabin/name conservatively: when Cabin or surname is missing, do not predict True from a single spending or VIP signal; require at least two independent positive signals or a strongly favorable HomePlanet→Destination→Deck baseline.
+
+10. Use HomePlanet→Destination→Deck priors as contextual priors: compute conditional base-rates by HomePlanet, Destination and Deck letter; use these priors to bias predictions—if the prior is strongly positive and the passenger has one supporting individual signal, bias toward True; if the prior is strongly negative and there are no supporting signals, bias toward False.
+
+11. Resolve conflicts by preferring corroborated group signals: when individual signals conflict, prefer family- or cabin-majority outcomes that are themselves supported by multiple independent indicators; treat isolated individual signals (single high spend, VIP alone, or single-amenity outlier) as weak and require additional support.
+
+12. Down-weight extreme outlier spends: if a passenger's spend profile is an extreme outlier relative to peers from the same HomePlanet/Deck (very large total or single-amenity spike), down-weight that spend signal and require at least one additional independent positive signal before predicting True.
+
+13. Propagate strong positives to ambiguous dependents: if multiple strong positive signals exist for adults in a family or cabin (e.g., diversified high spend + VIP or consistent non-CryoSleep spend) then propagate True to dependent children and CryoSleep==True members of that family/cabin unless there is strong contradictory evidence.
+
+14. Conservative fallback: default to False when there are fewer than two independent positive signals and no strong cabin/family majority or favorable baseline; default to True only when the two-signal rule or a robust group-majority True (supported by independent indicators) is satisfied.
+
+============================================================

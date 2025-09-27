@@ -1,0 +1,127 @@
+PREDICTIVE METRICS - ITERATION 146
+============================================================
+
+**UPDATED PREDICTIVE METRICS REPORT v16.6**  
+**PRIORITY ENHANCEMENT: CRYOSLEEP-ZERO-SPEND VALIDATION & BATCH CONSISTENCY OPTIMIZATION**  
+
+---
+
+### **1. Analysis of Prediction Error for Passenger 0190_01**  
+
+#### **Passenger Profile (Error Case):**  
+-   **PassengerId:** 0190_01  
+-   **HomePlanet:** Earth  
+-   **CryoSleep:** True  
+-   **Cabin:** G/32/S  
+-   **Destination:** 55 Cancri e  
+-   **Age:** 11.0 (Child)  
+-   **VIP:** False  
+-   **Spending:** RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0  
+-   **TotalSpend:** 0.0  
+-   **Name:** NaN  
+
+#### **Root Cause of Predictive Error (v16.5 Logic Gap):**  
+The v16.5 update over-prioritized high-spend non-cryosleep overrides (HSO-1) but **failed to enforce CryoSleep=True with zero spending as a definitive indicator of transport**. For Passenger 0190_01, CryoSleep=True and zero spending should have triggered a high-confidence `Transported=True` prediction, but the system instead produced "None" due to:  
+-   **Insufficient Weight for CryoSleep+Zero-Spend Combination:** Although rules like CZSO-1 (CryoSleep Zero-Spend Override) exist, their confidence boosts (+70% for `Transported=True`) were diluted by subsequent spending-based rules that added ambiguity.  
+-   **Destination and Age Context Misapplication:** Destination 55 Cancri e (typically non-rescue) and age 11.0 (child) introduced conflicting signals, with DCP-7 applying +15% for `Transported=False` despite CryoSleep=True.  
+-   **Batch Smoothing Artifacts:** The ambiguity range (0.45–0.55) was too narrow, and batch-level averaging further reduced confidence for edge cases.  
+
+**Summary of the Faulty v16.5 Logic Chain for 0190_01:**  
+1.  **CSSV-2:** `CryoSleep=True` → Applied +60% confidence for `Transported=True`.  
+2.  **CZSO-1:** `CryoSleep=True` and zero spending → Applied +70% confidence for `Transported=True`.  
+3.  **ESP-3:** `TotalSpend=0.0` (<500 threshold) → Skipped.  
+4.  **HSO-1:** `CryoSleep=True` (not False) → Skipped.  
+5.  **MSP-4:** Zero spending → Skipped (no mixed spending).  
+6.  **ISP-2:** Zero spending → Skipped.  
+7.  **DCP-7:** Destination 55 Cancri e → Applied +15% confidence for `Transported=False` (erroneously applied despite CryoSleep=True).  
+8.  **Final Erroneous Prediction ("None"):** Cumulative confidence for `Transported=True` was 0.75 (from CSSV-2 and CZSO-1), but DCP-7 reduced it to 0.60, placing it within the ambiguous range (0.45–0.55 after batch smoothing). Actual outcome was `True`.  
+
+**What the Correct Logic Must Enforce:**  
+**Passengers with CryoSleep=True and zero spending (TotalSpend = 0.0) must be auto-classified as `Transported=True` with near-absolute confidence, overriding destination or age context.** CryoSleep implies suspended animation, and zero spending confirms no pre-incident activity, making transport highly likely.  
+
+---
+
+### **2. Critical Modifications to Decision Rules (v16.6 ENHANCEMENT)**  
+
+The system requires stronger overrides for CryoSleep=True with zero spending and adjustments to prevent context rules from contradicting primary signals.  
+
+#### **New and Overhauled Rules:**  
+-   **CRYOSLEEP_ZERO_SPEND_ABSOLUTE (CZSA-1) - NEW RULE:**  
+    -   **Condition:** `CryoSleep == True` AND `TotalSpend == 0.0`  
+    -   **Action:** Apply **+95% confidence for `Transported=True`** (absolute override).  
+    -   **Priority:** Insert immediately after CZSO-1 (CryoSleep Zero-Spend Override).  
+    -   **Rationale:** Ensures zero-spend cryosleep passengers are predicted as `Transported=True` without ambiguity.  
+
+-   **Update CRYOSLEEP_ZERO_SPEND_OVERRIDE (CZSO-1) -> CZSO-2:**  
+    -   **Modify Condition:** For `CryoSleep=True` and `TotalSpend=0.0`, skip if CZSA-1 is triggered.  
+    -   **Adjust Confidence:** Reduce to +50% for `Transported=True` (supplementary).  
+
+-   **Update DESTINATION_CONTEXT_PRIMACY (DCP-7) -> DCP-8:**  
+    -   **Add Exclusion:** Skip if CZSA-1, CSSV-2, or CZSO-2 is triggered (avoid contradicting cryosleep overrides).  
+    -   **Modify Condition:** Only apply destination boosts if CryoSleep=False or spending >0.  
+
+-   **Update AGE_IMMUTABLE_OVERRIDE (AIO-1):**  
+    -   **Add Exclusion:** Skip if CZSA-1 is triggered.  
+
+-   **Update BATCH_PROCESSING_FAILSAFE (BPF-1):**  
+    -   **Add Pre-Screen:** Flag all CryoSleep=True and zero-spend passengers for CZSA-1 processing.  
+
+#### **Processing Order Overhaul (v16.6):**  
+1.  GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)  
+2.  GLOBAL: CRYOSLEEP_NAN_INFERENCE (CNI-1)  
+3.  GLOBAL: CRYOSLEEP_SPENDING_VALIDATION (CSSV-2)  
+4.  GLOBAL: CRYOSLEEP_ZERO_SPEND_OVERRIDE (CZSO-2) // UPDATED  
+5.  **GLOBAL: CRYOSLEEP_ZERO_SPEND_ABSOLUTE (CZSA-1) // NEW**  
+6.  GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-5)  
+7.  GLOBAL: AGE_IMMUTABLE_OVERRIDE (AIO-1) // UPDATED  
+8.  GLOBAL: YOUNG_CHILD_ZERO_SPEND (YCZ-1)  
+9.  GLOBAL: NAN_CRYOSLEEP_ZERO_SPEND (NCZS-1)  
+10. GLOBAL: EXTREME_SPENDING_PATHWAY (ESP-3)  
+11. GLOBAL: HIGH_SPEND_OVERRIDE (HSO-1)  
+12. GLOBAL: MIXED_SPENDING_POSITIVE (MSP-4)  
+13. GLOBAL: IMBALANCED_SPENDING_PENALTY (ISP-2)  
+14. GLOBAL: LOW_SPEND_EARTH_CONTEXT (LSE-6)  
+15. GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1 v5)  
+16. GLOBAL: MIXED_SPENDING_PATTERN_ANALYSIS (MSPA-3)  
+17. GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-8) // UPDATED  
+18. GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)  
+19. GLOBAL: ZERO_SPENDING_VALIDATION (ZSV-1 v8)  
+20. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1) // UPDATED  
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**  
+-   **Insight 28: CryoSleep + Zero Spending = Near-Certain Transport.** Passengers with CryoSleep=True and zero spending are overwhelmingly likely transported, as no pre-incident activity occurred.  
+-   **Insight 29: Destination Context Should Not Override CryoSleep Signals.** For CryoSleep=True, destination-based rules must be suppressed to prevent false penalties.  
+-   **Insight 30: Batch Smoothing Must Preserve High-Confidence Overrides.** Confidence aggregation should not dilute absolute overrides (e.g., CZSA-1) below the ambiguity threshold.  
+
+---
+
+### **4. Confidence Level Recalibration**  
+-   **CZSA-1 Confidence:** Apply **+95% for `Transported=True`** (override).  
+-   **CZSO-2 Confidence:** Reduce to +50% for `Transported=True` (supplementary).  
+-   **DCP-8 Confidence:** Apply +0% if CryoSleep=True (suppressed).  
+-   **Ambiguity Threshold Adjustment:** Widen ambiguous range to **0.40–0.60** but strengthen overrides to push clear cases beyond this zone.  
+-   **Batch-Level Confidence Aggregation:** Use priority-weighted mean (override rules count 3x) to preserve signal strength.  
+
+---
+
+### **5. Adjustments for Batch Prediction Consistency**  
+-   **Enhanced Batch Pre-Screening:** Flag all CryoSleep=True and zero-spend passengers for CZSA-1 processing.  
+-   **Cross-Rule Validation:** Ensure CZSA-1 executes before destination, age, or spending rules to prevent conflicts.  
+-   **Ambiguity Resolution:** For predictions near threshold, prioritize cryosleep overrides over context.  
+-   **Batch-Level Smoothing:** Apply cohort-based confidence averaging only for non-override cases.  
+
+---
+
+### **6. Handling of Edge Cases**  
+The v16.6 update adds a dedicated cryosleep zero-spend absolute override pathway:  
+1.  **CryoSleep Zero-Spend Absolute (CZSA-1):** Unambiguous override for `Transported=True`.  
+2.  **CryoSleep Zero-Spend Supplementary (CZSO-2):** Secondary support.  
+3.  **Destination Context Suppression (DCP-8):** Prevents contradiction of cryosleep signals.  
+
+**Conclusion:** The error for passenger 0190_01 revealed that cryosleep with zero spending requires an absolute override to prevent ambiguity from context rules. The v16.6 enhancements introduce CZSA-1 and refine rule exclusions to ensure high-confidence predictions. The updated feature hierarchy is: 1) **CryoSleep Status**, 2) **Zero Spending with CryoSleep**, 3) **High Spending (TotalSpend > 500)**, 4) **Age (0.0)**, 5) **Age (0.1–5.0)**, 6) Extreme Spending, 7) Spending Concentration, 8) Partial Zero-Spending, 9) Low Spending, 10) Planetary Origin, 11) Destination.  
+
+**//END OF REPORT**
+
+============================================================

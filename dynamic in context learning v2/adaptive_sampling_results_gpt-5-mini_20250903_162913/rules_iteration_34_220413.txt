@@ -1,0 +1,38 @@
+PREDICTIVE RULES - ITERATION 34
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. [Do NOT automatically label CryoSleep = True as Transported = True. Predict Transported = True for CryoSleep = True only when supported by at least one independent positive indicator: (a) all spending categories are zero AND Age <= 12 OR Destination in {TRAPPIST-1e, 55 Cancri e, PSO J318.5-22}; OR (b) VIP = True; OR (c) the majority of identifiable cabin-mates are predicted Transported = True. Otherwise treat CryoSleep = True as uncertain and defer to spending/VIP/cabin rules.]
+
+2. [If CryoSleep = True AND any spend category (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) > 0 then treat this as a contradictory record: predict Transported = False UNLESS there is at least one strong supporting signal (VIP = True OR cabin-majority = Transported = True OR Age <= 12).]
+
+3. [If CryoSleep is missing/NaN treat it conservatively as False, but upgrade to Transported = True when at least two independent positive indicators are present among {VIP = True, nonluxury_spend = RoomService + FoodCourt + ShoppingMall >= 500, cabin-mate CryoSleep = True, or Age <= 12}.]
+
+4. [Non-luxury spend signal: If nonluxury_spend = RoomService + FoodCourt + ShoppingMall >= 1000 then predict Transported = True, unless overridden by an extreme-luxury anomaly (Spa + VRDeck > 5000 OR total_spend > 12000) which indicates likely Not Transported.]
+
+5. [Moderate spending patterns: If any single non-luxury category exceeds a destination-sensitive moderate threshold (FoodCourt >= 1000 OR ShoppingMall >= 500 OR RoomService >= 800) AND Age < 60 then predict Transported = True (spending engagement in core services is a positive transported signal).]
+
+6. [Luxury concentration rule: If Spa + VRDeck > 3000 OR total_spend > 8000 then predict Transported = False (very large luxury aggregation is strongly associated with Not Transported), but allow an override to True only when accompanied by VIP = True AND at least one other positive indicator (nonluxury_spend >= 500 OR cabin-majority = Transported).]
+
+7. [VIP corrective rule: If VIP = True then increase probability of Transported = True. Specifically, predict Transported = True for VIP passengers when they have any non-zero spend OR at least one cabin-mate predicted Transported = True, unless there is a direct luxury-anomaly disqualifier (Spa + VRDeck > 3000 OR total_spend > 8000).]
+
+8. [Age-based modifiers: (a) Children and infants (Age <= 12) with zero or low spending are strongly likely Transported = True; predict True. (b) Young adults (13 <= Age < 30) with moderate-to-high nonluxury spending (see rule 5) are likely Transported = True. (c) Elderly (Age >= 60) reduce transported baseline probability, but high spending patterns (nonluxury_spend >= 1000 OR FoodCourt >= 1000) should override the age effect and predict Transported = True.]
+
+9. [Deck/Cabin modifier: Use cabin deck letter as a soft modifier — passengers in front/higher decks (A, B, C) have a higher base transported prior; those in rear/lower decks (G, F, E, etc.) have a lower base transported prior. Apply this as a tiebreaker: when other signals are borderline, boost prediction toward True for decks {A,B,C} and toward False for decks {E,F,G}, unless strong spend/VIP/CryoSleep signals indicate otherwise.]
+
+10. [Cabin-group propagation: When multiple passengers share the same exact Cabin identifier, propagate a Transported = True label across the cabin only if at least one cabin member exhibits a strong, non-contradictory positive signal (CryoSleep = True with all spends = 0 and Age <=12 OR VIP = True with any spend OR nonluxury_spend >= 1000). Do NOT force unanimous cabin labels from weak or missing signals.]
+
+11. [Destination-sensitive spending rule: For destinations TRAPPIST-1e and 55 Cancri e, moderate-to-high FoodCourt or ShoppingMall spending (FoodCourt >= 500 OR ShoppingMall >= 300) increases transported likelihood — predict Transported = True when combined with any additional positive signal (RoomService > 0, VRDeck > 0, Age < 60, or VIP = True). For PSO J318.5-22 treat very low engagement + CryoSleep signals more conservatively (require an additional support to predict True).]
+
+12. [Contradiction resolution priority: When CryoSleep and spending pattern disagree, prioritize spending signals to predict Transported = True if nonluxury_spend >= 1000 OR any single non-luxury category exceeds its moderate threshold. Conversely, if CryoSleep = True but there is any spend > 0 and no supporting VIP/cabin signals, favor Not Transported.]
+
+13. [Zero-spend conservative rule: If all spends == 0 AND CryoSleep = False AND VIP = False AND Age > 50 then predict Transported = False (absence of engagement and older age -> not transported). For zero-spend minors (Age <= 12) predict Transported = True unless cabin-majority indicates otherwise.]
+
+14. [Missing-critical-fields rule: When HomePlanet or Age are missing, require at least two robust indicators among {CryoSleep = True with consistent spend pattern, VIP = True, nonluxury_spend >= 500, cabin-majority = Transported, Destination in {TRAPPIST-1e,55 Cancri e}} before predicting Transported = True; otherwise predict False.]
+
+15. [Handle extreme single-category anomalies: If a single category is extremely large (RoomService > 3000 OR FoodCourt > 10000 OR ShoppingMall > 5000 OR Spa > 5000 OR VRDeck > 5000) use destination and cabin context: for FoodCourt and ShoppingMall extremes at TRAPPIST-1e or 55 Cancri e predict Transported = True; for extreme Spa/VRDeck (luxury) predict Not Transported unless VIP = True combined with cabin-majority True.]
+
+16. [Default tiebreakers: When cases remain tied/uncertain after applying rules, use this ordered priority to decide: 1) strong nonluxury spend signals, 2) VIP presence, 3) cabin-majority consensus, 4) CryoSleep supported by age/destination, 5) deck letter modifier. Apply the highest-priority available signal to determine the prediction.]
+
+============================================================

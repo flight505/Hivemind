@@ -1,0 +1,235 @@
+PREDICTIVE METRICS - ITERATION 98
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): In a 1-record batch the model made a confident false positive on PassengerId 0123_01 (pred=True, label=False). The record shows very high concentration in one channel (FoodCourt) with low spend entropy (top1_share ≈ 0.85). The scorer rewarded concentration and raw spend signals but lacked channel-aware priors and missingness/consistency-aware variance; n==1 gating allowed an auto-decision despite fragile slice evidence.
+- Immediate implication: concentrated-single-channel patterns can produce confident but wrong predictions when (a) channel directionality/priors are absent, (b) per-channel consistency (stability) is low or not consulted, and (c) variance floors are too small for fragile slices. Stopgap gating and provenance + monitoring updates are required immediately.
+- Top priorities (0–72h):
+  1. Implement n==1 stopgap gating: any record with top1_share ≥ 0.70 (concentration) or all_zero/missingness patterns must pass channel_consistency + GLM_fallback/ensemble consensus to auto-accept; otherwise route to priority_audit.
+  2. Persist concentration and missingness fields (top1_channel, top1_share, spend_entropy_norm, all_zero_flag, missingness_profile) into provenance and metric pipelines.
+  3. Add channel-aware pooled priors and channel_consistency_score; add var_channel and var_missingness to SE model so fragile slices get higher uncertainty.
+  4. Retrain calibrator & GLM_fallback with new features and upweight contradictions from concentrated_by_channel and all_zero slices; run a 14-day shadow validation before promotion.
+  5. Add canaries (include this record 0123_01) and block auto-decisions for them until classifiers and gating prove robust.
+
+1) What specific patterns caused this error?
+- Derived values for 0123_01:
+  - sum_spend = 55 + 597 + 49 + 0 + 1 = 702
+  - top1_channel = FoodCourt, top1_spend = 597
+  - top1_share = 597 / 702 ≈ 0.85 (very concentrated)
+  - num_nonzero_channels = 4, spend_entropy low
+  - batch n = 1 (single-record batch)
+- Failure mechanics:
+  - The scorer prioritized high top1_share and absolute spend without consulting channel-specific directionality priors (μ_channel_conc) or channel_consistency_score. Because variance model lacked terms for channel fragility and concentration, se_combined was underestimated and gating allowed an auto-decision.
+  - No pattern-aware gating for concentrated_by_channel was present, so a fragile n==1 decision escaped audit despite contradictory slice history risk.
+
+2) How should decision rules be modified to prevent recurrence?
+- High-level changes:
+  - Make concentration (top1_share), concentration_type, and missingness first-class in gating logic.
+  - For n==1, require per-channel consistency + GLM_fallback/ensemble consensus for auto-decisions on concentrated or all_zero/missing records.
+  - Route ambiguous or weakly-supported concentrated records to priority_audit.
+- Concrete pseudocode (pattern-aware):
+  - Inputs: n_batch, sum_spend, top1_share, top1_channel, channel_consistency_score, N_conc_samples, missingness_count, GLM_fallback_prob, ensemble_agreement, se_combined.
+  - Constants (initial): top1_conc_threshold = 0.70, C_high = 0.80, N_min_conc = 25, A_high = 0.995, SE_accept = 0.06.
+  - If n_batch == 1:
+      - If top1_share ≥ top1_conc_threshold:
+          - If channel_consistency_score ≥ C_high AND N_conc_samples ≥ N_min_conc AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept AND GLM_fallback_agrees:
+              → allow auto_decision
+          - Else → priority_audit (gating_reason='conc_stopgap')
+      - If all_zero_flag OR missingness_count ≥ 1:
+          - Similar logic: require zero_consistency_score ≥ Z_high, N_zero_samples ≥ N_min_zero_samples, etc.; else priority_audit.
+  - For n ≤ 3: tighten thresholds (higher N_min and A_high, higher se_floor).
+- Channel exceptions: if pooled_prior shows a channel has historically contradictory directionality (negative/unstable coefficient), default to audit unless very strong evidence exists.
+
+3) What new insights about passenger transport patterns?
+- Channel-specific directionality matters: the polarity associated with a concentration differs by channel (FoodCourt vs VRDeck vs Spa). A large share in one channel is not uniformly predictive.
+- Concentration (top1_share) is a stronger fragility signal than raw sum_spend alone for n==1 cases — concentrated-high with moderate total spend can still be risky.
+- n==1 amplifies risk: single-row batches must rely more heavily on pooled/channel priors + robust uncertainty estimates instead of raw logits.
+
+4) How should confidence be recalibrated?
+- Expand the SE model with pattern-aware variance components so fragile slices produce wider uncertainty:
+  - var_channel = κ_chan * (1 − channel_consistency_score) * (top1_share^2) * log(1 + sum_spend)
+  - var_spend_scale = κ_scale * log(1 + sum_spend)
+  - var_missingness = κ_miss * missingness_count * novelty_scale * (1 − zero_consistency_score)
+  - var_all_zero = κ_zero * (1 − zero_consistency_score) * sqrt(1 + sum_imputed_features)
+  - var_combined = var_base + var_top1_share + var_dispersion + var_channel + var_missingness + var_all_zero
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Add dynamic SE floors:
+  - concentrated_high & weak_channel_consistency → se_floor = 0.20–0.30
+  - concentrated_high & strong_channel_consistency → se_floor = 0.06–0.08
+  - all_zero & weak_consistency → se_floor = 0.25–0.30
+- Retrain calibrator to output p10/p50/p90 and sd (credible intervals), not only a point probability. Include an ECE penalty in training loss and upweight contradictions from risky slices.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Standardize feature computation across scorer, pooled_prior, GLM_fallback, and calibrator: top1_share, spend_entropy_norm, all_zero_flag, missingness_profile, concentration_type must be identical and versioned.
+- Introduce a slice_trust_table (channel × concentration × demographics) storing channel_consistency_score, N_samples, FP/FN rates, and a 'trusted' flag.
+- Persist full per-record provenance so every decision, gate, and variance component can be audited and replayed.
+- Harmonize gating thresholds centrally and attach immutable gating_reasons to each prediction for downstream analysis.
+
+6) How can metrics be improved to handle edge cases?
+- Add slices and monitoring:
+  - concentrated_by_channel (top1_channel × top1_share_bucket): track ECE, Brier, FP, FN, contradiction_count.
+  - all_zero_missing (HomePlanet × Age_bucket × missing_pattern): same metrics.
+  - n==1 auto_accept_rate per slice.
+- Active learning & canaries:
+  - Add canaries including 0123_01 plus earlier problematic IDs (0114_01, 0115_01, 0119_01). Default these canaries to priority_audit.
+  - Seed the active-label queue with concentrated_by_channel and all_zero records.
+- Retraining strategy:
+  - Retrain GLM_fallback & calibrator with channel × concentration × HomePlanet × Age_bucket interactions and upweight contradictions and rare slices.
+  - Use grouped cross-validation by (top1_channel, spend_pattern_bucket, HomePlanet, all_zero_flag) to validate slice-level generalization.
+
+Complete updated predictive metrics report (actionable components)
+
+A. New/updated feature definitions (vX → vX+1)
+- top1_channel, top1_spend, top1_share = top1_spend / max(1, sum_spend)
+- sum_spend = sum(RoomService, FoodCourt, ShoppingMall, Spa, VRDeck)
+- spend_entropy_norm = normalized Shannon entropy across channel spends
+- concentration_type: {none, absolute_concentrated_high, dispersed_borderline, dispersed_high}
+  - absolute_concentrated_high = top1_share ≥ 0.70
+  - dispersed_borderline = top3_shares small but spread
+- all_zero_flag: sum_spend == 0 AND num_nonzero_channels == 0
+- missingness_profile: vector of booleans for key fields (homeplanet_missing, cryo_missing, name_missing, cabin_missing)
+- zero_consistency_score = (α + pos_count_zero) / (α + pos_count_zero + neg_count_zero), α default = 20
+- channel_consistency_score = (α + pos_count_channel_conc) / (α + pos_count_channel_conc + neg_count_channel_conc) per (channel × concentration)
+
+B. Channel-aware pooled_prior extension
+- Add μ_channel_conc_demo: pooled prior means for concentrated spends by (channel × HomePlanet × Age_bucket).
+- Add μ_zero_demo and μ_missingness_demo for all_zero and missingness patterns.
+- Blend global and local priors with τ weights; allow per-channel τ tuning.
+
+C. Direction-aware logit_shift
+- conc_shift_frac = clamp(base_conc_shift + w_conc_dir*(channel_consistency_score − 0.5)*2 + w_conc_sum*(log(1+sum_spend)/scale), min,max)
+- If channel_consistency_score low → damp conc_shift_frac towards 0.
+- Do not let logit_shifts override pooled_prior when N_samples or consistency is low (pattern_damp).
+
+D. Variance / SE model (explicit)
+- New variance terms (examples):
+  - var_channel = κ_chan * (1 − channel_consistency_score) * (top1_share^2) * log(1 + sum_spend)
+  - var_spend_scale = κ_scale * log(1 + sum_spend)
+  - var_missingness = κ_miss * missingness_count * novelty_scale * (1 − zero_consistency_score)
+  - var_all_zero = κ_zero * (1 − zero_consistency_score) * sqrt(1 + sum_imputed_features)
+- Combine:
+  - var_combined = var_base + var_top1_share + var_dispersion + var_channel + var_missingness + var_all_zero
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Example κ defaults (sweepable):
+  - κ_chan = 0.06, κ_scale = 0.02, κ_miss = 0.05, κ_zero = 0.045
+
+E. Decision-gating (pattern-aware; concrete)
+- Constants (initial):
+  - top1_conc_threshold = 0.70
+  - C_high = 0.80, N_min_conc = 25
+  - A_high = 0.995, SE_accept = 0.06
+  - Z_high = 0.80, N_min_zero_samples = 15
+- Pseudocode (n==1):
+  - If top1_share ≥ top1_conc_threshold:
+      - If channel_consistency_score ≥ C_high AND N_conc_samples ≥ N_min_conc AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept AND GLM_fallback_agrees:
+          → allow auto_decision
+      - Else → priority_audit (gating_reason='conc_stopgap')
+  - If all_zero_flag or missingness_count ≥ 1:
+      - If zero_consistency_score ≥ Z_high AND N_zero_samples ≥ N_min_zero_samples AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept AND GLM_fallback_agrees:
+          → allow auto_decision
+      - Else → priority_audit (gating_reason='all_zero_missing_stopgap')
+- For n ≤ 3: tighten thresholds (+N_min, +A_high, smaller SE_accept).
+
+F. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Outputs: p10, p50, p90, sd
+  - Features: p_after_logit_shift, ensemble_agreement, top1_channel, top1_share, spend_entropy_norm, num_nonzero_channels, concentration_type, channel_consistency_score, missingness_profile, all_zero_flag
+  - Loss: quantile loss (for p10/p50/p90) + ECE penalty; upweight contradictions from concentrated_by_channel and all_zero slices ×3–5.
+  - CV: grouped by (top1_channel, spend_pattern_bucket, HomePlanet, all_zero_flag)
+- GLM_fallback:
+  - Add interactions: top1_channel × concentration_flag × Age_bucket × HomePlanet, zero_flag × HomePlanet × Age_bucket, missingness_profile interactions
+  - Regularization: elastic net; enforce sign/stability checks per coefficient
+- Shadow-run: minimum 14 days across live traffic enriched for edge slices. Acceptance: ≥30–40% reduction in contradictions on targeted slices.
+
+G. Monitoring, metrics & alerts
+- New slice monitors / dashboards:
+  - concentrated_by_channel (top1_channel × top1_share_bucket): ECE, Brier, FP, FN, contradiction_count
+  - all_zero_missing (HomePlanet × Age_bucket × cryo_missing): same metrics
+  - n==1 auto_accept_rate per slice
+- Alerts:
+  - concentrated_by_channel FP rate > 20% above baseline over 24h → block auto_accept + alert
+  - all_zero_missing FP > 20% above baseline → block auto_accept + urgent triage
+  - sudden spike in missingness of key fields → alert
+- Canaries:
+  - Add 0123_01, 0114_01, 0115_01, 0119_01 — expected gating_reasons include priority_audit; auto-decisions blocked until validated.
+
+H. CI tests & validation
+- Unit tests:
+  - Ensure any record with top1_share ≥ 0.70 and n==1 gets gating_reason 'conc_stopgap' unless channel_consistency_score ≥ C_high AND GLM_fallback_agrees.
+  - Ensure se_combined increases for concentrated and all_zero records relative to baseline se.
+  - Ensure calibrator spreads (p90−p10) are larger for weak-consistency slices.
+- Shadow-run targets:
+  - contradictions on concentrated_by_channel and all_zero slices reduced ≥30–40%.
+  - audit queue ≤1.5× baseline first 2 weeks, trending down.
+  - overall FN change ≤ +1–3% absolute (target ≤1).
+
+I. Operational actions (0–72 hours)
+1. Immediate engineering (0–12h):
+   - Persist top1_channel/top1_share, spend_entropy_norm, all_zero_flag, missingness_profile into predictions and provenance.
+   - Implement n==1 stopgap gating: top1_share ≥ 0.70 or all_zero/missingness → priority_audit unless strong_consistency + consensus.
+   - Add canary 0123_01 to CI (block auto-decisions).
+2. Scoring engine (12–48h):
+   - Expose var_channel and var_missingness components in provenance; add conc_shift_frac dampers.
+3. ML pipeline (24–72h):
+   - Retrain calibrator + GLM_fallback with new features and upweighting; run 14-day shadow validation.
+4. Monitoring & ops (24–72h):
+   - Deploy dashboards and alerts for new slices; monitor canary behavior.
+5. Product/audit (24–72h):
+   - Fast-label UI for priority_audit; seed active-label queue with concentrated_by_channel and all_zero records.
+6. Promotion:
+   - Promote only after shadow-run acceptance targets met.
+
+J. Per-record provenance to log (required)
+- concentration_type
+- top1_channel, top1_spend, top1_share, top2_share, top3_share
+- spend_entropy_norm, num_nonzero_channels
+- all_zero_flag, missingness_profile, missingness_count
+- zero_consistency_score, channel_consistency_score
+- N_conc_samples, N_zero_samples
+- conc_shift_frac_used, disp_shift_frac_used, zero_shift_frac_used (value & version)
+- μ_channel_conc_demo components and τ weights
+- var_top1_share, var_dispersion, var_channel, var_missingness, var_all_zero
+- GLM_fallback_probs, GLM_fallback_agreement_flag
+- p10/p50/p90, p_final_sd
+- gating_reasons
+- scorer_version, pooled_prior_snapshot_id
+
+K. Hyperparameters (initial; sweepable)
+- top1_conc_threshold = 0.70
+- C_high = 0.80
+- N_min_conc = 25
+- A_high = 0.995
+- SE_accept = 0.06
+- κ_chan = 0.06, κ_scale = 0.02, κ_miss = 0.05, κ_zero = 0.045
+- base_conc_shift = 0.45, w_conc_dir = 0.35, w_conc_sum = 0.15
+- N_min_zero_samples = 15, Z_high = 0.80
+
+L. CI canaries & expected behavior (include 0123_01)
+- 0123_01 (FoodCourt concentrated, top1_share ≈ 0.85): expected gating_reasons include 'conc_stopgap' and routing to priority_audit unless channel_consistency_score ≥ C_high AND GLM_fallback_agrees. Auto-decision should be blocked by default.
+- 0114_01, 0115_01, 0119_01: continue to be blocklisted for auto-decisions until retrain/shadow validated.
+
+M. Quick triage checklist for 0123_01 (operational)
+1. Verify computed fields: sum_spend = 702, top1_channel = FoodCourt, top1_share ≈ 0.85, spend_entropy_norm low.
+2. Check channel_consistency_score for (FoodCourt, concentration) over last 90 days and N_conc_samples.
+3. Inspect pooled_prior components used: was μ_channel_conc_demo available for (FoodCourt × HomePlanet × Age_bucket)?
+4. Inspect GLM_fallback output and agreement flag.
+5. Inspect se_combined and var_channel / var_spend_scale values—confirm whether se was floored correctly.
+6. If channel_consistency_score < C_high or pooled_prior lacked channel-level conc interactions → mark 0123_01 priority_audit and add to active-label queue; seed retrain.
+
+Why this will reduce batch errors going forward
+- Elevating concentration and missingness to first-class signals prevents a generic spend boost from producing false confidence across channels.
+- Channel-aware pooled_priors and channel_consistency_score give the scorer better local priors for n==1 decisions.
+- var_channel and var_missingness increase uncertainty on fragile slices so gating will block unsafe auto-decisions.
+- Retraining the calibrator and GLM_fallback with interactions and upweighted contradictions improves slice-level calibration and reduces contradiction rate.
+- Provenance and canaries accelerate triage and targeted active-learning to close remaining gaps.
+
+Immediate one-line corrective action
+- Enforce n==1 gating: any record with top1_share ≥ 0.70 (or all_zero/missingness) must be routed to priority_audit unless channel_consistency ≥ 0.80 AND GLM_fallback/ensemble consensus—add 0123_01 as a CI canary and block auto-accept.
+
+Next steps I can produce for you (pick one)
+- Deterministic scorer skeleton: API spec + exact feature calculations + provenance JSON schema (ready for engineering).
+- Exact retrain spec for calibrator & GLM_fallback: dataset selection, upweighting schema, CV fold definitions, and training hyperparameters.
+
+Which would you like me to generate now?
+
+============================================================

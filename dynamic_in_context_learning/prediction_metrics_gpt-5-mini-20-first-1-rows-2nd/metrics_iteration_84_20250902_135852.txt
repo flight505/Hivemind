@@ -1,0 +1,324 @@
+PREDICTIVE METRICS - ITERATION 84
+============================================================
+
+Updated Predictive Metrics Report — v3.8.1 (post_0110_01 corrections)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A single-record batch (n == 1) produced a false-positive on Passenger 0110_01 (Pred=True, Actual=False). This record is a high-absolute, top1-concentrated spender (Spa ≈ 3,929; sum_spend ≈ 5,100; top1_share ≈ 0.75+) with at least one important categorical missingness (Cabin = NaN). The model produced an overconfident positive prediction. This is the mirror failure to 0108_03: fragile 1-record slices at both spend extremes (imputed_zero and mid/high concentrated spend) are producing confident but wrong auto-decisions.
+- Immediate implications: The system continues to mis-handle single-record fragile slices at both extremes — leading to outsized FP/FN impact. We must:
+  - treat concentrated_high (and channel-concentrated outliers) as first-class fragile patterns (same priority as imputed_zero),
+  - increase uncertainty for missing categorical + concentrated spend combinations,
+  - enforce stricter n==1 gating (audit / fallback) for fragile patterns,
+  - persist per-record provenance so triage is immediate.
+- Stopgap 0–72h actions (must implement immediately):
+  1. Detect concentrated_high and channel_outlier patterns; treat n==1 concentrated_high + Trusted_subslice==False as priority_audit until calibrator retrain.
+  2. For concentrated_high (true or imputed categorical missingness): require pattern-specific ensemble_agreement ≥ 0.999 AND se_combined ≥ 0.18 before any auto-decision; otherwise priority_audit.
+  3. Add/strengthen var_missing_cat and var_concentration terms in variance model; raise concentrated_high_nontrusted SE-floor to 0.18 (imputed_zero_nontrusted remains 0.20).
+  4. Persist missing_count, categorical_missing_count, imputation_flags, top1_channel_id, batch_snapshot_id, feature_snapshot_hash per record (CI fail if missing).
+  5. Shadow-deploy gating changes and run extended CI including 0108_03, 0108_02, and 0110_01.
+
+Direct answers to the six requested questions (concise)
+1) Signals that led to this error
+   - n == 1 (single-record batch) → pooled_prior / heuristics and logit_shifts dominated without stricter gating.
+   - sum_spend high (≈5,100) with top1_share ≈ 0.75+ → concentrated_high pattern.
+   - categorical missingness (Cabin NaN) → novelty/misalignment not explicitly modeled.
+   - se_combined underestimated because concentration + categorical-missingness were not in variance model.
+   - Ensemble agreement gating either too lax or not enforced for concentrated_high n==1 → allowed overconfident auto-decision.
+
+2) Decision-rule changes to prevent recurrence
+   - Treat concentrated_high (and channel-specific concentrated outliers) as first-class fragile patterns.
+   - For n==1 & untrusted_subslice:
+     - If pattern == imputed_zero → priority_audit (as previously).
+     - If pattern == concentrated_high or high_channel_outlier → priority_audit unless ensemble_agreement ≥ 0.999 and se_combined ≤ pattern_floor (0.18). Otherwise audit.
+   - For n ≤ 3 batches with fragile pattern(s): require stricter consensus or fallback to GLM_fallback.
+   - Persist gating_reasons per record and block auto-decisions when gating_reasons non-empty.
+
+3) New pattern insights
+   - High absolute spend concentrated in a single channel (Spa, VRDeck, etc.) is not uniformly positive signal — it can correlate with negative labels in some strata (channel- and country-specific effects). Concentration interacts with categorical missingness (e.g., missing Cabin) to create high novelty.
+   - Different channels have different risk/noise profiles — top1_channel matters (Spa and VRDeck are higher contradiction channels historically).
+   - Fragility is bi-modal: imputed_zero (low-end) and concentrated_high (high-end) both produce outsized mispredictions and must be treated symmetrically.
+
+4) Confidence recalibration summary
+   - Add var_concentration and var_missing_cat to the variance model; include channel_risk multiplier (based on historical contradiction rate for top1_channel).
+   - Increase SE floors for concentrated_high_nontrusted (0.18) and imputed_zero_nontrusted (0.20).
+   - Retrain calibrator to output quantiles (p10/p50/p90) and sd, and use these to drive gating decisions (not just mean).
+   - Use model_disagreement + novelty_score interactions to down-weight logit_shift magnitude for fragile records.
+
+5) Consistency adjustments
+   - Standardize imputation: numeric spend NaN → 0, categorical missing → explicit NaN flag; always log per-channel missing flags.
+   - Enforce batch-scoped config snapshot (batch_snapshot_id + scoring_version + feature_snapshot_hash) persisted per-record.
+   - Global rule: small batches (n ≤ 3) are subject to stricter gating for any fragile pattern.
+   - All gating thresholds and hyperparameters must be snapshot and recorded with each batch.
+
+6) Metric improvements for edge cases
+   - New canaries: concentrated_high contradictions (per top1_channel), concentrated_high FN/FP rates, n==1 routing ratio.
+   - Per-slice ECE/Brier/FN/FP for zero/imputed-zero and concentrated tiers.
+   - Active-label seeding for concentrated_high contradictions and imputed_zero contradictions with fast-label workflows.
+
+0110_01 — detailed failure chain (what went wrong, why)
+- Canonicalized snapshot:
+  - PassengerId 0110_01; HomePlanet=Europa; CryoSleep=False; Cabin=NaN (missing); Destination=TRAPPIST-1e; Age=32; VIP=False;
+    RoomService=0; FoodCourt=410; ShoppingMall=6; Spa=3929; VRDeck=764 => sum_spend ≈ 5109; top1_channel=Spa; top1_share ≈ 0.77; missing_count > 0; missing_categorical_count ≥1 (Cabin)
+- Failure chain:
+  1. Pattern detection: concentrated_high should have been flagged as fragile but was not treated as first-class in gating (or gating enforcement failed).
+  2. Single-record batch (n==1) allowed pooled_prior and logit_shifts to dominate; calibrator confidence not sufficiently conservative.
+  3. Variance model lacked var_concentration and var_missing_cat → se_combined too low.
+  4. ensemble_agreement gating threshold for concentrated_high was not strict enough for n==1 → overconfident auto-decide.
+  5. Per-record provenance (missing categorical count, top1_channel history) not persisted → delayed triage and slower root-cause.
+
+Minimum signals to capture per-record (must persist)
+- n_batch, record_id, passenger_id, batch_snapshot_id, scoring_version, feature_snapshot_hash
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile_by_channel, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels
+- missing_count, missing_categorical_count, per_channel_missing_flags, imputed_zero_flag, true_zero_flag
+- Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components (μ_global, μ_channel, μ_subslice, μ_spend_bucket, μ_missing_bucket, μ_channel_risk) and τs
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- novelty_score, interaction_novelty_score (concentration × categorical_missing)
+- applied_logit_shift components and final logit_shift
+- p_after_logit_shift, p_final_mean, p_final_uncertainty (sd/p10/p90), se_combined
+- gating_decision + gating_reasons, label & label_source (if available)
+
+Revised pattern definitions (v3.8.1 additions; make first-class)
+- true_zero_spend_flag: sum_spend == 0 AND missing_count == 0
+- imputed_zero_spend_flag: sum_spend == 0 AND missing_count > 0
+- micro_concentrated_flag: 0 < sum_spend ≤ S_low AND top1_share ≥ T_mc AND num_nonzero_channels ≤ 2
+- concentrated_topK_flag: top1_share ≥ T_mc AND num_nonzero_channels ≤ K_thresh
+- mid_concentrated_high_spend_flag: top1_share ≥ T_mc_mid AND sum_spend ≥ S_mid
+- concentrated_high_spend_flag: concentrated_topK_flag AND (spend_zscore ≥ Z_high OR sum_spend ≥ S_high)
+- high_channel_outlier_flag: top1_channel ∈ high_risk_channels AND (channel_spend_zscore ≥ channel_Z or channel_share ≥ channel_share_thresh)
+Rationale: add concentrated_high and high_channel_outlier as first-class fragile patterns. Missing categorical fields (Cabin) amplify novelty when combined with concentration.
+
+POOLING / pooled_prior (updated & spend-/missing-aware)
+- pooled_prior = (τ_pattern * μ_pattern + τ_channel * μ_channel + N_subslice * μ_subslice + τ_spend_bucket * μ_spend_bucket + τ_missing * μ_missing_bucket + τ_channel_risk * μ_channel_risk) / (τ_pattern + τ_channel + N_subslice + τ_spend_bucket + τ_missing + τ_channel_risk)
+- Add μ_channel_risk/τ_channel_risk so records concentrated in historically-contradictory channels (Spa/VRDeck) get their own prior.
+- τ_pattern adjust: increase τ for concentrated_high so pattern prior meaningfully influences single-record pools.
+- Default τ_pattern (v3.8.1): {K1:100, K2:160, K3:220, zero:320, micro:340, mid_concentrated:200, concentrated_high:320}
+- τ_missing default: 140, τ_channel_risk default: 100
+Rationale: increase influence of pattern- and channel-risk priors for fragile slices.
+
+DIRECTION-AWARE logit_shift (safe-for-concentration + missingness)
+- Keep compressed sum_damp (log scaling); add concentration_damp and strong missing_cat_damp for categorical missingness.
+- Pipeline sketch:
+  - raw_sum = log(1 + sum_spend)
+  - sum_damp = clamp(raw_sum / log(1 + S_damp), ε, 1.0)
+  - polarity = 2 * pooled_prior − 1
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - concentration_damp = (top1_share ≥ T_conc ? conc_shift_frac : 1.0)  # conc_shift_frac < 1
+  - missing_cat_damp = (missing_categorical_count > 0 ? missing_cat_shift_frac : 1.0)
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp * concentration_damp * missing_cat_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- Defaults: conc_shift_frac = 0.6 (reduce impact for concentrated patterns), missing_cat_shift_frac = 0.5
+Rationale: concentrated or categorical-missing records are high-novelty → damp shifts.
+
+VARIANCE / SE MODEL (explicit, add concentration + categorical missingness)
+- New terms:
+  - var_missingness (numerics) as before
+  - var_missing_cat = κ_missing_cat * (missing_categorical_count / M_cat_scale)^2 * (1 + (1 − spend_entropy))
+    - κ_missing_cat default 0.08, M_cat_scale default 2.0
+  - var_concentration = κ_conc * (top1_share)^2 * (sum_spend / S_scale)^2 * (1 + (1 − spend_entropy))
+    - κ_conc default 0.035, S_scale default 2000
+  - var_channel_risk = κ_channel_risk * channel_risk_score * (sum_spend / S_scale)
+    - κ_channel_risk default 0.05 (channel_risk_score ∈ [0,1] derived from historical contradictions)
+- Combine:
+  - var_combined = var_prior + var_ens + var_novelty_cond + β_slice*var_slice + β_pattern*var_pattern + β_channel*var_channel + var_spend_extremity + var_missingness + var_missing_cat + var_concentration + var_channel_risk
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- SE floors (v3.8.1 initial):
+  - trusted_slice_floor = 0.02
+  - true_zero_nontrusted_floor = 0.15
+  - imputed_zero_nontrusted_floor = 0.20
+  - concentrated_nontrusted_floor = {micro:0.15, mid_concentrated:0.12, concentrated_high:0.18}
+  - extreme_novelty_floor = 0.14
+Rationale: explicitly capture concentration and categorical-missingness uncertainty (0110_01).
+
+DECISION GATING (updated pseudocode)
+- ensemble_agreement = max_fraction_of_models_predicting_top_class
+- model_disagreement = 1 − ensemble_agreement
+- thresholds:
+  - agreement_threshold_general = 0.98
+  - accept_se_max = 0.06 (trusted)
+  - pattern_agreement_thresholds (v3.8.1; n==1 & untrusted):
+    - zero_true: 0.995
+    - zero_imputed: route_to_audit (stopgap until retrain)
+    - micro: 0.999
+    - mid_concentrated: 0.995
+    - concentrated_high: 0.999
+    - high_channel_outlier: 0.999
+- Pseudocode:
+  1. If Trusted_subslice and p_final_mean ≥ accept_threshold_trusted and se_combined ≤ accept_se_max → auto_accept.
+  2. Else if n == 1 AND pattern_type ∈ fragile_patterns AND NOT Trusted_subslice:
+       - If pattern_type == imputed_zero: → priority_audit (stopgap).
+       - Else if pattern_type ∈ {concentrated_high, high_channel_outlier}:
+           - If ensemble_agreement ≥ pattern_agreement_threshold AND se_combined ≥ concentrated_nontrusted_floor AND |logit_shift| ≤ δ_pattern*pattern_shift_frac → allow auto_decision only.
+           - Else → priority_audit.
+       - Else (other fragile): require pattern-specific consensus + se floor else audit.
+  3. Else if n ≤ 3 AND any fragile pattern present: apply stricter thresholds (raise agreement by +0.003, raise se_floor by +0.02).
+  4. Else: general gating using se_combined calibrated z-adjustment and audit if uncertainty high.
+Rationale: concentrated_high + imputed_zero are high-novelty and must be highly conservative on single-record, untrusted batches.
+
+CALIBRATOR & GLM_FALLBACK (retrain plan)
+- GLM_fallback interactions to include:
+  - concentrated_high × missing_categorical_count × top1_channel_id
+  - channel_risk_score × sum_spend_bucket × Age_bucket
+  - imputed_zero × missing_count × channel_missing_flags
+- Calibrator:
+  - Model: quantile-capable calibrator (LightGBM quantile ensemble or small Bayesian NN) that outputs p10/p50/p90 and sd.
+  - Grouped CV by (time, top1_channel_id, sum_spend_bucket, missing_bucket).
+  - Minimal inputs: p_after_logit_shift, pattern_type, imputed_zero_flag, missing_count, missing_categorical_count, top1_share, spend_zscore, sum_spend_bucket, spend_entropy, novelty_score, pooled_prior, N_subslice, ensemble_agreement, top1_channel_id, Cabin_missing_flag, Age_bucket, HomePlanet.
+  - Output: p_final_mean, p_final_uncertainty (sd, p10, p90).
+- Retrain targets & sampling:
+  - Upweight concentrated_high contradictions, imputed_zero contradictions.
+  - Active-label seeding for top1_channel contradictions.
+Rationale: calibrator must internalize concentration × categorical-missingness interactions and channel-specific risks.
+
+MONITORING, METRICS & ALERTS (what to add)
+- New slice monitoring canaries:
+  - concentrated_high contradictions per top1_channel (Spa, VRDeck, FoodCourt etc): ECE, Brier, FN/FP rates
+  - imputed_zero contradictions: ECE, Brier, FN rate
+  - n==1: fraction auto_accepted, auto_rejected, routed_to_audit; FN/FP rates
+  - ensemble_agreement distribution & model_disagreement per pattern
+- Alerts:
+  - concentrated_high FP rate > 20% above baseline for 24h → immediate block on auto_accept for concentrated_high + urgent triage
+  - imputed_zero FN rate > 20% above baseline for 24h → block auto_reject and alert
+  - n==1 audit routing fraction below expected threshold → alert
+  - missing per-record provenance or batch_snapshot mismatches → alert
+Rationale: detect regression on fragile slices quickly.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- New CI tests (minimum):
+  - Preserve M1..M4 from v3.7.1 (true_zero, micro, concentrated_top1, concentrated_high)
+  - M5: 0108_02 (mid_concentrated_high_spend, n==1, untrusted) → priority_audit
+  - M6: 0108_03 (imputed_zero_spend, n==1, untrusted) → priority_audit
+  - M7 (new): 0110_01 (concentrated_high_spend, top1_channel=Spa, Cabin missing, n==1, untrusted) → priority_audit
+  - Trusted subslice variations → allow calibrated auto-decisions
+- Validation experiments:
+  - Retrain calibrator & GLM_fallback with grouped CV; test on held-out historical contradictions (include concentrated_high + imputed_zero).
+  - Shadow deploy updated scorer (gating + variance changes) for 2 weeks; measure audit queue, per-slice FN/FP and ECE.
+- Acceptance targets (relative to baseline v3.7.x):
+  - concentrated_high contradictions: ≥30–40% relative reduction on historical test set.
+  - imputed_zero contradictions: ≥40% relative reduction.
+  - true_zero contradictions: ≥30% relative reduction.
+  - overall FN increase ≤3 percentage points absolute (aim ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+Rationale: measurable reductions on fragile slices while limiting audit overload.
+
+OPERATIONAL ACTIONS (0–72 hours) — prioritized
+1. Engineering (0–24h):
+   - Implement concentrated_high & high_channel_outlier detectors; compute top1_share, channel_risk_score, missing_categorical_count.
+   - Persist missing_count, missing_categorical_count, imputation_flags, top1_channel_id, batch_snapshot_id, scoring_version, feature_snapshot_hash per record.
+   - Enforce stopgap: n==1 & imputed_zero → priority_audit; n==1 & concentrated_high & NOT Trusted_subslice → priority_audit (configurable via shadow flag).
+2. Scoring engine (24–48h; shadow):
+   - Enforce strict n==1 gating for fragile patterns (imputed_zero, true_zero, micro_concentrated, mid_concentrated, concentrated_high, high_channel_outlier).
+   - Add var_missing_cat & var_concentration in variance calculation and raise SE floors for concentrated_high.
+   - Apply compressed sum_damp + concentration_damp + missing_cat_damp on δ application.
+   - Persist per-record provenance into audit logs (required for triage).
+   - Shadow this scorer and validate CI tests (including 0110_01).
+3. ML (24–72h):
+   - Retrain GLM_fallback + calibrator including concentration × missingness × channel interactions; calibrator returns quantiles.
+   - Start active learning label collection for concentrated_high and imputed_zero contradictions.
+4. Ops & Monitoring (24–72h):
+   - Deploy new dashboards & canaries for concentrated_high, imputed_zero, true_zero slices; add alerts.
+   - Block full live rollout until shadow meets acceptance criteria for at least 72h.
+5. Product / Audit (24–72h):
+   - Create fast-label workflows for concentrated_high contradictions to accelerate slice trust growth and reduce audit backlog.
+   - Triage pipeline: escalate suspected label/record mismatches and batch_snapshot issues.
+
+PER-RECORD PROVENANCE TO LOG (must persist)
+- batch_snapshot_id, scoring_version, passenger_id, record_id
+- pattern_type (true_zero/imputed_zero/micro/mid_concentrated/concentrated_high/high_channel_outlier)
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, missing_count, missing_categorical_count, per-channel_missing_flags
+- Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components + final pooled_prior
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- applied_logit_shift components
+- p_after_logit_shift, p_final_mean, p_final_uncertainty (sd/p10/p90), se_combined
+- gating_decision and gating_reasons (audit/auto_accept/auto_reject + checks)
+- label and label_source (if available)
+- feature_snapshot_hash, run_timestamp
+
+HYPERPARAMETERS (v3.8.1 initial; sweepable)
+- S_low = 50
+- T_mc = 0.75
+- T_mc_mid = 0.60
+- S_mid = 500
+- S_high = 1000
+- Z_mid = 2.0
+- Z_high = 3.0
+- S_damp = 200
+- τ_pattern (v3.8.1): {K1:100, K2:160, K3:220, zero:320, micro:340, mid_concentrated:200, concentrated_high:320}
+- τ_channel = 120
+- τ_spend_bucket = 80
+- τ_missing = 140
+- τ_channel_risk = 100
+- δ_logit_pattern = {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40, mid_concentrated:0.50, concentrated_high:0.45}
+- imputed_zero_nontrusted_floor = 0.20
+- true_zero_nontrusted_floor = 0.15
+- concentrated_high_nontrusted_floor = 0.18
+- agreement_thresholds (v3.8.1, n==1 & untrusted): zero_true:0.995, zero_imputed:route_to_audit, micro:0.999, mid_concentrated:0.995, concentrated_high:0.999, high_channel_outlier:0.999
+- conc_shift_frac = 0.6
+- missing_cat_shift_frac = 0.5
+- w_dis = 0.80
+- κ_spend = 0.04, Z_scale = 3.0
+- κ_missing = 0.06, M_scale = 3.0
+- κ_missing_cat = 0.08, M_cat_scale = 2.0
+- κ_conc = 0.035, S_scale = 2000
+- κ_channel_risk = 0.05
+
+CI TESTS (explicit expected outcomes; include new case 0110_01)
+- 0103_02 (true_zero_spend, untrusted, n==1) → priority_audit
+- 0103_01 (micro_concentrated, untrusted, n==1) → priority_audit
+- 0102_01 (concentrated_top1, untrusted, n==1) → priority_audit
+- 0107_01 (concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_02 (mid_concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_03 (imputed_zero_spend, untrusted, n==1) → priority_audit
+- 0110_01 (concentrated_high_spend, top1_channel=Spa, Cabin missing, untrusted, n==1) → priority_audit (new)
+- Trusted subslice variations → allow calibrated auto-decisions
+- Preserve earlier regression tests
+
+MONITORING & ALERTING (exact triggers)
+- concentrated_high FP rate > 20% above baseline for 24h → block auto_accept for concentrated_high + alert triage
+- imputed_zero FN rate > 20% above baseline for 24h → block auto_reject and alert
+- true_zero FN rate > 20% above baseline for 24h → block auto_reject and alert
+- n==1 audit routing fraction < expected threshold → alert
+- mismatch between batch_snapshot_id and per-record provenance → alert
+
+ACCEPTANCE CRITERIA (post-deploy shadow -> live)
+- concentrated_high contradictions: ≥30–40% relative reduction
+- imputed_zero contradictions: ≥40% relative reduction
+- true_zero contradictions: ≥30% reduction
+- mid_concentrated contradictions: ≥30% reduction
+- overall FN increase ≤3% absolute (aim ≤1%)
+- Audit queue ≤1.5× baseline for first 2 weeks, trending back to baseline
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.8.1) implementing:
+   - concentrated_high & high_channel_outlier detection; compute missing_categorical_count.
+   - imputed_zero and true_zero detection + missing_count computation.
+   - symmetric n==1 gating for fragile patterns and immediate stopgap for imputed_zero and concentrated_high.
+   - compressed sum_damp + concentration_damp + missing_cat_damp + reduced δ for fragile patterns.
+   - var_missing_cat & var_concentration + raised SE floors for concentrated_high.
+   - mandatory per-record provenance logging + snapshotable config.
+2. Minimal CI test suite extending v3.8.0 with 0110_01 expectation.
+3. Updated slice_trust_table seeding script including per-channel risk aggregation.
+4. GLM_fallback + calibrator retrain plan & grouped CV validation report (including quantiles).
+5. Dashboards & canary configuration for concentrated_high, imputed_zero, true_zero slices.
+6. Active learning labeling plan for concentrated_high & imputed_zero contradictions.
+
+One-line summary
+v3.8.1: Treat concentrated_high and high-channel outliers as first-class fragile patterns (auto-audit n==1 untrusted), keep imputed_zero as first-class, add categorical-missingness-driven variance and concentration-driven variance, compress/dampen spend-driven logit shifts for fragile records, require stricter ensemble consensus for single-record fragile cases, enforce per-record provenance, retrain calibrator to return uncertainty, and shadow-deploy to fix errors like 0110_01 and 0108_03.
+
+Recommended immediate artifact to prepare first
+- Produce the deterministic scorer skeleton + CI test updates now (includes 0108_02, 0108_03 and new 0110_01 expectations). Rationale: lightweight to implement, shadowable, immediate protection (concentrated_high & imputed_zero stopgaps + strict n==1 gating + required provenance logging) while calibrator/GLM retrain proceeds.
+
+Notes / questions
+- The batch log indicated “ALL ERRORS IN THIS BATCH (2 total)” but only 0110_01 details were included. If you want full analysis for the second record, please attach the second error row (or confirm both errors are the two we discussed: 0108_03 and 0110_01). I can then add that to the CI/validation corpus and re-run the recommended threshold tuning.
+
+If you want, I can:
+- prepare the deterministic scorer skeleton + CI test updates now (recommended), or
+- prepare the slice_trust_table seeding + aggregation script in parallel.
+
+Which should I prepare first?
+
+============================================================

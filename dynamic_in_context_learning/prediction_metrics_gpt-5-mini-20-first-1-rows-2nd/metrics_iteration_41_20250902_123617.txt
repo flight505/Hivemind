@@ -1,0 +1,258 @@
+PREDICTIVE METRICS - ITERATION 41
+============================================================
+
+Updated Predictive Metrics Report — v3.0
+Goal: fix high‑spend single_spike false positives (e.g., 0066_01) while retaining v2.9 improvements for none_low (zero‑spend) and preserving determinism, reproducibility and full per‑prediction provenance.
+
+EXECUTIVE SUMMARY — immediate takeaway and top priorities
+- Immediate problem: 0066_01 (dominant VRDeck spike, total_spend ≈ 811, top_contrib_share ≈ 0.567, CryoSleep=False) was predicted True but actual False. Root cause: model over‑trusted a dominant channel spike (single_spike) without (a) per‑channel reliability weighting, (b) anomaly detection for extreme spikes, and (c) dynamic uncertainty inflation for channel anomalies. SRM/aggregator treated the spike as high‑reliability signal and the pipeline accepted a positive without sufficient GLM/consensus scrutiny.
+- Impact: single_spike high‑spend false positives are a distinct failure mode from none_low false negatives. Fixing one regime (none_low) must not undo protections for the other (single_spike). We must add per‑channel reliability, anomaly scoring, and stronger single_spike routing/uncertainty rules.
+- Top immediate priorities (deploy in order):
+  1. Short term (24–72h): add deterministic single_spike/anomaly safeguards — compute per‑record anomaly_score (Mahalanobis on per_channel z), compute top_channel_reliability multiplier, force GLM_fallback for suspicious spikes (top_contrib_share ≥ 0.5 AND (anomaly_score high OR channel_reliability low)), raise min_se_logit dynamically for anomalous spikes, and route suspicious True predictions to audit.
+  2. Medium term (1–14d): retrain SRM to incorporate anomaly & per‑channel reliability signals; retrain GLM_fallback with channel interactions and anomaly features; implement coverage_guard regressor for dynamic se.
+  3. Long term: continuous retraining with audit labels; per‑segment/channel priors; refined two‑stage calibration per cluster & anomaly bands.
+
+1) What specific patterns in the current metrics led to 0066_01
+- Single_spike regime mishandling:
+  - top_contrib_share = 460/811 ≈ 0.567 → flagged as single_spike; the aggregator treated the large VRDeck contribution as strong positive evidence.
+- No per‑channel reliability weighting:
+  - VRDeck may historically be less predictive or more noisy for transported=True than other channels; pipeline lacked channel‑level priors to downweight noisy channels.
+- Missing anomaly detection:
+  - The spend vector is extreme relative to cluster centroids (high Mahalanobis distance) — not flagged, so uncertainty was not inflated.
+- Over‑confident SRM/aggregator:
+  - SRM likely increased reliability due to large spend magnitude; se_logit_final remained too low for this outlier.
+- Inference routing gap:
+  - GLM_fallback may not have been forced for single_spike unless other heuristics fired; or GLM agreed with aggregator because it lacked interaction/anomaly features.
+
+Net effect: a dominant channel spike produced a high aggregator and SRM reliability reading that the pipeline accepted, producing a false positive.
+
+2) Deterministic decision‑rule modifications to prevent similar errors
+High‑level principle: treat single_spike + channel‑anomaly as a separate regime, with explicit rules that (a) downweight low‑reliability channels, (b) inflate uncertainty for anomalous spend vectors, and (c) require explicit GLM consensus for True.
+
+New/updated deterministic components and rules (versioned snapshot)
+- Definitions:
+  - single_spike if top_contrib_share ≥ 0.50 (persist single_spike_flag).
+  - anomaly_score = squared Mahalanobis distance of per_channel_z vector relative to cluster centroid/covariance (persist).
+    - anomaly_high if anomaly_score ≥ chi2_quantile(df = n_channels, p = 0.999) (~20.5 for 5 channels).
+    - anomaly_medium if anomaly_score ≥ chi2_quantile(df = n_channels, p = 0.99) (~15.1).
+  - channel_reliability(top_channel) = historical P(transport | top_channel_spend > q) / global_prior (computed per snapshot), clipped to [0.5,1.05] for stability.
+  - channel_reliability_multiplier = channel_reliability(top_channel) (persist).
+- Single_spike routing:
+  - If single_spike_flag == True:
+    - Compute channel_reliability_multiplier and anomaly_score.
+    - Force GLM_fallback if any of:
+      - anomaly_high or anomaly_medium,
+      - channel_reliability_multiplier ≤ 0.85,
+      - top_channel_percentile ≥ 0.995 (extreme channel value).
+    - Increase min_se_logit for this record: se_logit_final = max(se_logit_final, min_se_by_cluster * anomaly_multiplier * (1 + (1 - channel_reliability_multiplier))). (See recommended defaults below.)
+    - Decision thresholds:
+      - If anomaly_high: require GLM_p_lower ≥ 0.85 to return True; GLM_p_lower in [0.75,0.85) → Abstain → audit; else False.
+      - If anomaly_medium: require GLM_p_lower ≥ 0.80 to return True; GLM_p_lower in [0.70,0.80) → Abstain; else False.
+      - If not anomalous and channel_reliability_multiplier ≥ 0.90: follow standard single_spike rules (as v2.9) but require aggregator/GLM consensus (2/3).
+- Aggregator attenuation change:
+  - augment spend_factor = clip(0.40 + 0.60 * SRM_score, 0.40, 1.0) * coherence_factor * channel_reliability_multiplier(top_channel).
+  - For single_spike suspected anomalies, allow channel_reliability_multiplier < 1 to reduce aggregator impact.
+- None_low and missingness rules:
+  - Preserve v2.9 none_low deterministic safeguards (force GLM_fallback, min_se_logit none_low = 0.22, GLM thresholds for none_low positives). These remain unchanged.
+- Consensus & deterministic thresholds (integrating single_spike):
+  - effective_reliability = SRM_score * coherence_factor.
+  - Decision tiers (updated):
+    - High reliability (eff_rel ≥ 0.92): accept aggregator positive if p_lower_agg ≥ 0.80 (GLM persisted for audit).
+    - Medium reliability (0.80 ≤ eff_rel < 0.92): force GLM_fallback; require 2/3 agreement among {aggregator_post_att, GLM, SRM_binary}. If no consensus → Abstain & audit.
+    - Low reliability (eff_rel < 0.80) OR none_low OR single_spike_anomalous:
+      - Force GLM_fallback. Return True only if GLM_p_lower meets cluster+anomaly threshold (see above) and aggregator non‑contradiction (aggregator_p_lower ≥ 0.60). Otherwise Abstain or False depending on gap.
+- Per‑prediction provenance persisted (extended):
+  - anomaly_score, anomaly_flag (none/medium/high), top_channel, top_contrib_share, top_channel_percentile, channel_reliability_multiplier, single_spike_flag, and prior v2.9 provenance fields.
+
+3) New insights about passenger transport patterns from this error group
+- Dominant‑channel spikes (single_spike) are not uniformly predictive: VRDeck or some channels may produce heavy spending that does not correlate with transported=True as strongly as other channels. Per‑channel predictive power varies.
+- Anomalous spending vectors (Mahalanobis outliers) often indicate data irregularities, episodic behavior, or label noise; these require extra scrutiny and higher uncertainty.
+- Spending magnitude alone is insufficient — distribution across channels and channel identity materially change predictive value.
+- Label noise at high spend tails persists; human audit labels in these tails are high value for model improvement.
+
+4) How confidence levels should be recalibrated
+- Maintain two‑stage calibration (global Platt → per_cluster/per_segment offsets).
+- Add anomaly adjustment to z selection / uncertainty inflation:
+  - Base z selection (by eff_rel):
+    - eff_rel ≥ 0.92 → z_base = 1.28 (90%).
+    - 0.80 ≤ eff_rel < 0.92 → z_base = 1.96 (95%).
+    - eff_rel < 0.80 → z_base = 2.33 (98%).
+  - Anomaly adjustment:
+    - anomaly_high: z = max(z_base, 2.58) (99%).
+    - anomaly_medium: z = max(z_base, 2.33) (98%).
+  - Dynamic min_se_logit:
+    - Use coverage_guard predicted_se + enforce min_se_by_cluster scaled by anomaly and (1 - channel_reliability_multiplier):
+      - se_logit_final = max(predicted_se, min_se_by_cluster * (1 + anomaly_scale) * (1 + (0.5 - channel_reliability_multiplier)))
+      - anomaly_scale = 0.10 for medium, 0.25 for high (initial).
+- Rational: anomalies and low channel reliability should widen uncertainty and require stronger evidence to mark True.
+
+5) Adjustments needed for better consistency across batch predictions
+- Snapshot & provenance (extended):
+  - Persist channel_reliability table & computation; Mahalanobis cluster centroids & covariances; anomaly thresholds; winsorization quantiles per channel; snapshot_id, seeds and versions.
+- Batch precommit checks (new/updated):
+  - fraction_single_spike > baseline * 1.25 → alert & secondary review.
+  - fraction_anomaly_high > baseline * 1.1 → alert.
+  - per_channel_FP_rate (VRDeck, ShoppingMall, FoodCourt) > baseline * 1.10 → alert.
+  - fraction_GLM_fallback > baseline * 1.5 → alert.
+- Audit queue triggers:
+  - single_spike & predicted True
+  - anomaly_high & predicted True
+  - SRM_score < 0.80 & predicted True
+  - contradiction_flag & eff_rel < 0.92
+  - per_channel_FP_rate spikes and any predicted True
+- Deterministic seeding & reproducible bootstraps: store seeds & bootstrap maps in snapshot.
+
+6) How metrics/models should be improved to handle edge cases like 0066_01
+- Diagnostics to persist per prediction (expanded):
+  - All v2.9 diagnostics plus: anomaly_score, anomaly_flag, top_channel, top_channel_percentile, channel_reliability_multiplier, channel_percentiles, per_channel_winsor_thresholds, spike_intensity, winsorized_channel_values.
+- New/updated models & components:
+  - ChannelReliabilityModel: deterministic table computed per snapshot (Laplace‑smoothed) for P(transport | channel_spend > thresholds) to compute channel_reliability_multiplier.
+  - AnomalyDetector v1: Mahalanobis distance on per_channel_z using cluster covariances. Returns anomaly_score and flags.
+  - SRM v3: GBM/logistic to predict reliability that takes anomaly_score, channel_reliability_multiplier, top_contrib_share, per_channel_percentiles, CryoSleep, VIP, Cabin_deck, Destination, Age_bucket.
+  - GLM_fallback v4: enriched deterministic GLM with anomaly & per_channel interactions + bootstrapped CI; oversample single_spike false positives and audit labels.
+  - Coverage Guard regressor: predict se_logit per record; used to set dynamic min_se.
+- Training & data:
+  - Oversample/weight single_spike false positives (and none_low positives) in GLM_fallback training.
+  - Build audit labeled set with high‑spend anomalies and channel‑spike failure cases (including 0066_01, 0045_01 etc.).
+  - Compute per_channel percentiles and channel reliability metrics per snapshot.
+- Immediate stop‑gap mitigations (24–72h):
+  - Force GLM_fallback for any single_spike where top_channel_percentile ≥ 0.995 OR anomaly_score ≥ anomaly_medium threshold.
+  - Multiply se_logit_final by 1.15 for anomaly_medium and 1.30 for anomaly_high as stop‑gap.
+  - For now, set single_spike min_se_logit = 0.32 (raised from 0.28).
+  - Route single_spike predicted True to audit if channel_reliability_multiplier ≤ 0.9 OR anomaly_flag.
+- Near term (1–14 days):
+  - Train SRM v3 and GLM_fallback v4 with enriched features; compute and persist channel_reliability table.
+  - Tune thresholds (top_contrib_share, anomaly thresholds, GLM_p_lower acceptance levels, min_se_by_cluster).
+- Medium/long term:
+  - Continuous retraining with audit labels, automated active learning on Abstain cases, per‑segment per‑channel calibration maps.
+
+Deterministic scoring pipeline — v3.0 (production outline)
+1. Snapshot load (persist snapshot_id): winsor quantiles per channel/cluster, cluster centroids & covariances, channel_reliability table, GLM/SRM versions, calibration maps, deterministic seeds.
+2. Base priors & Laplace smoothing (unchanged).
+3. SpendPatternClustering: assign cluster_id (none_low, balanced, single_spike, multi_high) deterministically.
+4. Precompute per_channel_z, per_channel_percentiles, top_channel & top_contrib_share, top_channel_percentile. Persist.
+5. AnomalyDetector: compute Mahalanobis anomaly_score and flags (none/medium/high).
+6. Compute channel_reliability_multiplier from snapshot table for top_channel.
+7. none_low detection & missingness flags (same as v2.9):
+   - If none_low_flag OR per_channel_NaNs ≥ 2 → force GLM_fallback (continue computing aggregator for diagnostics).
+8. Aggregator: per_cluster winsorize; apply channel_reliability_multiplier to spend contributions; compute spending contribution logit and se (with per_cluster covariance).
+9. Run SRM v3 (deterministic): SRM_score & bootstrap_se — SRM uses anomaly_score and channel_reliability.
+10. Dynamic routing & attenuation:
+    - spend_factor = clip(0.40 + 0.60 * SRM_score, 0.40, 1.0) * coherence_factor * channel_reliability_multiplier(top_channel).
+    - For single_spike anomalous cases: override spend_factor downward if channel_reliability_multiplier < 1 or anomaly_flag.
+11. GLM_fallback v4 (if invoked):
+    - Deterministic GLM with enriched features + bootstrap CI.
+12. Aggregate & uncertainties:
+    - Compute logit_final & se_logit_final using cluster covariance + coverage_guard predicted_se; enforce dynamic min_se_logit_by_cluster * anomaly_scale * (1 + (1 - channel_reliability_multiplier)).
+    - Choose z per effective_reliability and anomaly adjustments (see recalibration).
+    - Two‑stage calibration: global Platt then per_cluster/per_segment offsets.
+13. Decision & provenance:
+    - Apply deterministic consensus rules including single_spike/anomaly rules. Persist full diagnostics and primary_decision_reason.
+    - If Abstain or high‑risk True → route to audit.
+14. Post‑batch checks & alerts:
+    - Run precommit checks; issue alerts or block per thresholds.
+
+Concrete initial parameter defaults (tune on validation)
+- cluster detection:
+  - single_spike if top_contrib_share ≥ 0.50
+  - none_low if total_spend ≤ 1.0 OR sum(nonzero_flags)==0 OR proportion_NaN ≥ 0.33
+- anomaly thresholds (n_channels = 5):
+  - anomaly_medium: Mahalanobis^2 ≥ 15.1 (chi2 p=0.99)
+  - anomaly_high: Mahalanobis^2 ≥ 20.5 (chi2 p=0.999)
+- channel_reliability_multiplier: compute per snapshot; clip to [0.5,1.05]. (If snapshot unavailable, use conservative defaults and compute immediately from host data; e.g., set VRDeck=0.90 as temporary.)
+- min_se_logit_by_cluster:
+  - none_low = 0.22
+  - balanced = 0.18
+  - single_spike = 0.32 (temporary raised)
+  - multi_high = 0.35
+- anomaly scaling to se:
+  - anomaly_medium: multiply min_se by 1.10
+  - anomaly_high: multiply min_se by 1.25
+- GLM acceptance thresholds (single_spike):
+  - anomaly_high: GLM_p_lower ≥ 0.85 → True; [0.75,0.85) → Abstain/audit
+  - anomaly_medium: GLM_p_lower ≥ 0.80 → True; [0.70,0.80) → Abstain
+  - non‑anomalous single_spike and high channel_reliability_multiplier: GLM_p_lower ≥ 0.75 required and 2/3 consensus
+- z selection (updated):
+  - eff_rel ≥ 0.92 → z = 1.28
+  - 0.80 ≤ eff_rel < 0.92 → z = 1.96
+  - eff_rel < 0.80 → z = 2.33
+  - if anomaly_medium → z = max(z, 2.33); if anomaly_high → z = max(z, 2.58)
+
+Validation experiments (priority)
+- Stratified LOO by cluster, channel, anomaly strata:
+  - Holdouts: single_spike with top_channel VRDeck (top percentiles), single_spike with other top channels, none_low with CryoSleep True/False, multi_high anomaly cases.
+  - Metrics: per_cluster FP/FN, Brier score, ECE, abstain fraction, CI coverage.
+- Anomaly detector validation:
+  - Evaluate Mahalanobis coverage and resulting change in FP/FN when anomaly rules applied.
+- ChannelReliabilityModel validation:
+  - Compute channel_reliability and check consistency across snapshots; evaluate impact of applying per-channel multipliers on aggregator precision/recall.
+- Sensitivity sweeps:
+  - top_contrib_share ∈ {0.45,0.5,0.55}, anomaly thresholds grid, min_se adjustments, GLM_p_lower thresholds grid.
+- Decision ablation:
+  - Compare v3.0 dynamic rules to v2.9 to quantify FP reduction on single_spike vs FN changes in none_low.
+
+Monitoring & alerts (per prediction + batch)
+- Persist per prediction:
+  - anomaly_score, anomaly_flag, top_channel, top_contrib_share, channel_reliability_multiplier, single_spike_flag, along with v2.9 diagnostics.
+- Dashboards & alerts:
+  - fraction_single_spike: alert if > baseline * 1.25
+  - fraction_anomaly_high: alert if > baseline * 1.1
+  - per_channel_FP_rate (VRDeck, FoodCourt, ShoppingMall): alert if > baseline * 1.10
+  - GLM_fallback fraction per batch: alert if > baseline * 1.5
+  - Zero_spend FN rate: alert if > baseline * 1.10 (preserve none_low monitoring)
+- Audit queue:
+  - All anomaly_high predicted True
+  - single_spike & predicted True
+  - GLM_fallback_used
+  - Contradiction_flag & eff_rel < 0.92
+
+Case‑level diagnosis — how v3.0 would handle 0066_01
+- Input: 0066_01 — RoomService=1, FoodCourt=153, ShoppingMall=197, Spa=0, VRDeck=460, CryoSleep=False, Age=62.
+- v3.0 deterministic flow:
+  1. Snapshot load & clustering → total_spend=811 → cluster_id = single_spike (top_contrib_share ≈ 0.567).
+  2. Compute per_channel_z & Mahalanobis anomaly_score. VRDeck=460 is high‑percentile; anomaly_score likely medium/high depending on snapshot covariances.
+  3. Compute top_channel_percentile and channel_reliability_multiplier(VRDeck) from snapshot. If VRDeck reliability historically ≤ 0.90, multiplier < 1.
+  4. Because single_spike_flag True AND (anomaly_medium/high OR channel_reliability_multiplier ≤ 0.90), v3.0 forces GLM_fallback, inflates se_logit_final (min_se_single_spike * anomaly_scale), sets z to at least 2.33 (or 2.58 if high).
+  5. GLM_fallback v4 evaluates enriched features (channel interactions, anomaly flag, age, destination). In many realistic training sets GLM will reduce predicted probability for anomalous spikes or low‑reliability channels; GLM_p_lower likely below anomaly thresholds.
+  6. Decision rule applies: for anomaly_high require GLM_p_lower ≥ 0.85 to accept; otherwise Abstain/False. v3.0 would not return a confident True; it would either return False or Abstain → audit.
+- Net: v3.0 avoids overconfident True on 0066_01 and routes it to GLM/Audit, preventing this FP.
+
+Immediate operational actions (24–72 hours)
+1. Implement deterministic anomaly detector (Mahalanobis) and top_channel percentiles; persist these diagnostics in snapshot.
+2. Implement per_channel_reliability computation in snapshot (Laplace smoothing).
+3. Force GLM_fallback for: single_spike & (anomaly_medium/high OR top_channel_percentile ≥ 0.995 OR channel_reliability_multiplier ≤ 0.90).
+4. Increase single_spike min_se_logit = 0.32 and inflate se for anomalous spikes (medium ×1.10; high ×1.25).
+5. Route any single_spike predicted True → audit queue.
+6. Add 0066_01 and prior high‑spend failure cases to retraining/audit set.
+
+Near term (1–14 days)
+1. Train SRM v3 + GLM_fallback v4 with enriched features and audit cases oversampled.
+2. Tune anomaly thresholds, channel_reliability multiplier clipping, min_se scalars and GLM_p_lower acceptance thresholds via stratified validation.
+3. Update batch precommit checks and monitoring dashboards for single_spike & anomaly metrics.
+
+Medium/long term
+- Iterate SRM/GLM with audit labels; automated active learning on Abstain; per‑segment/channel priors; consider replacing static single_spike rule with SRM‑learned routing policy.
+
+Expected tradeoffs
+- Short term: more GLM_fallback usage, increased audit load, and additional compute/latency; but meaningful reduction in single_spike FPs.
+- Medium term: improved calibration and lower FP rate on high spend spikes without undoing none_low FN improvements.
+- Risk: overly conservative anomaly thresholds and channel downweighting could increase FNs for legitimate single_spike positives; mitigate by tuning on stratified validation and using abstain → audit rather than forced False for borderline cases.
+
+Validation success signals (post‑deployment)
+- Single_spike FP rate reduced ≥ 50% vs v2.8/v2.9 on validation.
+- None_low FN reduction preserved (≥ 50% reduction vs pre‑v2.9 baseline).
+- CI coverage per cluster close to nominal.
+- Abstain fraction ≤ 5–8% after tuning (majority of abstains routed to audit).
+- Per‑channel FP/FN stabilization (no channel drift).
+
+Deliverables I can produce next (deterministic, versioned)
+- Deterministic Python scorer skeleton implementing v3.0 (anomaly detector + channel_reliability + single_spike rules + SRM v3 / GLM_fallback v4 stubs + diagnostics).
+- LOO validation report on your labeled set demonstrating behavior for edge cases (0045_01, 0053_01, 0061_01, 0062_01, 0064_02, 0066_01) under v3.0.
+- Unit tests, audit log schema, and batch precommit checks for the new diagnostics.
+- Parameter sweep notebooks (for tuning thresholds and min_se scaling).
+
+One‑line summary: v3.0 augments v2.9 with deterministic single_spike/anomaly handling, per‑channel reliability weighting and dynamic uncertainty inflation so high‑spend spikes (like 0066_01) are either downweighted, forced to GLM consensus, or sent to audit — preventing single_spike false positives while preserving the none_low fixes.
+
+Which of the deliverables would you like first: the scorer skeleton, the LOO validation run, or both?
+
+============================================================

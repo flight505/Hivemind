@@ -1,0 +1,252 @@
+PREDICTIVE METRICS - ITERATION 5
+============================================================
+
+Executive summary — what happened and immediate corrective priorities
+- New failure (Breney 0020_04) is a false negative (predicted False, actual True). This joins two recent false positives (Philda 0017_02, Almary 0020_01). Together they expose two complementary small-data failure modes that our pipeline must address:
+  1. Small-n / correlated weak positives can additively produce false positives (Almary / Philda).
+  2. Over-weighting of a single, moderately reliable negative signal (CryoSleep=False or a low-n Deck bucket) can flip an otherwise positive outcome into a false negative (Breney).
+- Immediate priorities (deploy in this order):
+  1. Enforce Laplace smoothing + reliability shrinkage (k = 5), and reliability-scaling of feature weights (k2 = 5) — this reduces overconfident small-n buckets and downweights unstable buckets.
+  2. Cap any per-feature log-odds contribution (max_delta = ±0.8).
+  3. Replace the single “abstain-or-default-to-False” rule with a directional evidence gate that:
+     - Separately measures positive vs negative support, and
+     - Abstains when overall evidence is Low; if an automatic fallback is required, default to the baseline class (p0) rather than always defaulting to Not Transported.
+  4. Log p_final, support_pos, support_neg, support_total, reliable_count_pos/neg and top-3 contributors per row for diagnostics.
+- Rationale: these changes keep the conservative behavior for positive calls (reduce FPs) while avoiding mechanically increasing false negatives by always defaulting to Not Transported when evidence is low.
+
+A. Updated dataset summary (after adding Breney 0020_04)
+- Total labeled rows: 23
+- Transported = True: 14
+- Not transported = 9
+- Smoothed baseline (Laplace add-one): p0 = (T + 1) / (N + 2) = (14 + 1) / (23 + 2) = 15/25 = 0.6000
+
+B. Buckets that changed when Breney was added (Laplace per-value, then shrinkage)
+(Only buckets that changed materially are listed. n/t are after Breney was added.)
+
+Per-value Laplace-smoothed p_i_smoothed:
+- CryoSleep:
+  - True: n=5 → p_smoothed = (4+1)/(5+2) = 5/7 ≈ 0.714286 (unchanged)
+  - False: n=18 → p_smoothed = (10+1)/(18+2) = 11/20 = 0.55
+- HomePlanet:
+  - Earth: n=14 → p_smoothed = (9+1)/(14+2) = 10/16 = 0.625
+- Destination:
+  - TRAPPIST-1e: n=17 → p_smoothed = (11+1)/(17+2) = 12/19 ≈ 0.631579
+- Deck:
+  - E: n=3 → p_smoothed = (1+1)/(3+2) = 2/5 = 0.40
+- Side:
+  - S: n=10 → p_smoothed = (6+1)/(10+2) = 7/12 ≈ 0.583333
+- Spending:
+  - total=0: n=8 → p_smoothed = (6+1)/(8+2) = 7/10 = 0.70
+- VIP:
+  - False: n=22 → p_smoothed = (14+1)/(22+2) = 15/24 = 0.625
+
+Interpretation: many previously-positive signals remain positive but have shifted slightly; some low-n buckets (Deck E) remain noisy.
+
+C. Reliability shrinkage (k = 5) — pull small-n buckets toward baseline p0 = 0.6
+p_i_shrunk = (n/(n+k)) * p_i_smoothed + (k/(n+k)) * p0
+
+Important p_i_shrunk (rounded):
+- CryoSleep = True (n=5): p_shrunk ≈ 0.65714
+- CryoSleep = False (n=18): p_shrunk ≈ 0.56087
+- HomePlanet = Earth (n=14): p_shrunk ≈ 0.61842
+- Destination = TRAPPIST-1e (n=17): p_shrunk ≈ 0.62390
+- Deck = E (n=3): p_shrunk = 0.52500
+- Side = S (n=10): p_shrunk ≈ 0.58889
+- Spending = 0 (n=8): p_shrunk ≈ 0.66154
+- VIP = False (n=22): p_shrunk ≈ 0.62037
+
+Per-bucket reliability r_i used for downweighting:
+- r_i = n / (n + k2) with k2 = 5
+- Examples: r_CryoFalse = 18/23 ≈ 0.7826; r_DeckE = 3/8 = 0.375; r_Spending0 = 8/13 ≈ 0.6154; r_VIPFalse = 22/27 ≈ 0.8148.
+
+D. What specifically caused the Breney 0020_04 error (root cause)
+Passenger 0020_04 Breney — features:
+- HomePlanet = Earth
+- CryoSleep = False
+- Cabin = E/0/S → Deck = E, Side = S
+- Destination = TRAPPIST-1e
+- Age = 10 (child)
+- VIP = False
+- TotalSpend = 0
+
+Why the model predicted False (original/previous pipeline)
+- The original aggregator overweighted CryoSleep and low-n Deck buckets (Deck=E had a very low unshrunk p_smoothed previously) and lacked reliability-scaling. CryoSleep=False was treated as a moderately negative signal and Deck=E (low-n) added a large negative contribution. Together those negative contributions overcame several moderate positive signals (spending=0, TRAPPIST, VIP=False, Earth) and produced a negative final score.
+- There were no conservative differential rules for low-evidence cases (the pipeline defaulted to a negative decision in some low-evidence situations), which turned a marginal case into a false negative.
+
+Why the new shrinkage + reliability weighting helps
+- Shrinkage pulls Deck=E from an untrustworthy extreme toward p0; reliability-scaling reduces Deck’s influence (r=0.375 → smaller weight). That prevents a single low-n bucket from flipping the decision.
+- However, the case is still low-evidence: many features provide only small positive deviations from p0; aggregated support is not strong. Under a strictly conservative “default-to-Not-Transported” rule that we had suggested previously, Breney would be abstained or defaulted to Not Transported, which would create a false negative. Therefore the safety rule must be directional and use the baseline p0 intelligently.
+
+E. Updated operational scoring formula (production-ready, deterministic)
+Use this single-pass pipeline per batch. Defaults and thresholds tuned for small-data situations.
+
+1) Baseline prior:
+   - p0 = (T + 1) / (N + 2)
+
+2) Per-value Laplace smoothing (alpha = 1):
+   - p_i_smoothed = (t_i + 1) / (n_i + 2), with p_i_smoothed = p0 when n_i = 0.
+
+3) Reliability shrinkage (k = 5):
+   - p_i_shrunk = (n_i/(n_i + k)) * p_i_smoothed + (k/(n_i + k)) * p0
+
+4) Log-odds deltas:
+   - logit0 = ln(p0 / (1 − p0))
+   - delta_i = ln(p_i_shrunk / (1 − p_i_shrunk)) − logit0
+   - Cap delta_i to ±max_delta (recommend max_delta = 0.8)
+
+5) Base feature weights (starting point; re-fit when >50 new labels). Example starting weights:
+   - CryoSleep: 0.30
+   - Deck letter: 0.22
+   - Spending bucket: 0.12
+   - Age group: 0.08
+   - HomePlanet: 0.10
+   - Destination: 0.08
+   - Side: 0.06
+   - VIP: 0.04
+
+6) Reliability scaling of weights:
+   - r_i = n_i / (n_i + k2) with k2 = 5
+   - raw_w_i = base_w_i * r_i
+   - normalized weights w_i = raw_w_i / Σ_j raw_w_j
+
+7) Combine in log-odds:
+   - logit_final = logit0 + Σ_i w_i * capped(delta_i)
+   - p_final = sigmoid(logit_final)
+
+8) Evidence (signed) and support metrics:
+   - support_i_signed = (p_i_shrunk − p0) * r_i
+   - support_pos = Σ_i base_w_i * max(0, support_i_signed)
+   - support_neg = Σ_i base_w_i * max(0, −support_i_signed)
+   - support_abs_total = support_pos + support_neg
+
+9) Reliable-signal counts (directional):
+   - reliable_pos_count = count_i( r_i ≥ 0.6 AND (p_i_shrunk − p0) ≥ 0.05 )
+   - reliable_neg_count = count_i( r_i ≥ 0.6 AND (p0 − p_i_shrunk) ≥ 0.05 )
+
+10) Decision / abstain / fallback (direction-aware):
+   - If support_abs_total < T_low (recommend T_low = 0.03) AND max(reliable_pos_count, reliable_neg_count) < 2:
+       - If system can abstain → Abstain (send for manual review).
+       - Else (auto-label required) → Default to baseline class: return True if p0 ≥ 0.5 else False.
+     Rationale: many low but same-direction signals + baseline majority suggests defaulting against a blanket Not-Transported fallback reduces false negatives like Breney.
+   - Else (sufficient evidence):
+       - If support_pos > support_neg → predict Transported if (support_pos ≥ 0.04 OR reliable_pos_count ≥ 2) else: use p_final threshold 0.5
+       - If support_neg > support_pos → predict Not Transported if (support_neg ≥ 0.04 OR reliable_neg_count ≥ 2) else: use p_final threshold 0.5
+   - Persist p_final, support_pos, support_neg, support_abs_total, reliable counts, top-3 contributors, and whether abstained/defaulted.
+
+Notes on thresholds:
+- T_low = 0.03 is more permissive than the previous 0.04; it reduces the number of automatic "default-to-False" decisions that caused Breney false negative. If you prefer even fewer false positives, raise T_low; if you must reduce false negatives, lower it further or always default to baseline when abstaining.
+
+F. Worked example: Breney 0020_04 under the revised pipeline (numerical)
+- p0 = 15/25 = 0.6000
+- Key p_i_shrunk (k=5) [rounded]:
+  - CryoSleep=False: 0.56087
+  - Deck=E: 0.52500
+  - Side=S: 0.58889
+  - HomePlanet=Earth: 0.61842
+  - Destination=TRAPPIST-1e: 0.62390
+  - Spending=0: 0.66154
+  - VIP=False: 0.62037
+- logit0 = ln(0.6/0.4) ≈ 0.40547
+- Per-value delta_i (log-odds vs baseline) — approx:
+  - CryoSleep=False: delta ≈ −0.161
+  - Deck=E: delta ≈ −0.305
+  - Side=S: delta ≈ −0.046
+  - HomePlanet=Earth: delta ≈ +0.078
+  - Destination=TRAPPIST: delta ≈ +0.101
+  - Spending=0: delta ≈ +0.264
+  - VIP=False: delta ≈ +0.086
+- Reliability r_i (n/(n+5)) examples:
+  - CryoSleepFalse r≈0.7826, DeckE r=0.375, Spending0 r≈0.6154, VIP r≈0.8148, etc.
+- After reliability-scaling and normalization (weights approximate), the weighted delta sum ≈ −0.045 (detailed arithmetic in analysis).
+- logit_final ≈ logit0 + (−0.045) = 0.40547 − 0.045 ≈ 0.36047 → p_final ≈ sigmoid(0.36047) ≈ 0.589
+  - This p_final is positive (≈0.59). Under the original pipeline (no shrinkage/reliability-scaling), the negative Deck=E and CryoSleep=False signals dominated and produced False; shrinkage corrects that.
+- Evidence metrics:
+  - support_pos (sum of positive signed supports, weighted) ≈ 0.014–0.038 per feature; total support_abs_total ≈ 0.025 (approx).
+  - reliable_pos_count = 1 (Spending=0 is the only feature with r_i ≥ 0.6 and |p_i_shrunk − p0| ≥ 0.05)
+  - reliable_neg_count = 0
+- Decision under the revised rule:
+  - support_abs_total ≈ 0.025 < T_low (0.03) and reliable counts < 2 → Abstain preferred.
+  - If auto-fallback required -> default to baseline p0 → predicts True (p0 >= 0.5), which matches the actual label and avoids a false negative.
+- Bottom line: shrinkage + reliability-scaling prevents the single low-n Deck feature from flipping the result; the directional evidence gate + baseline fallback prevents turning a low-evidence case into a false negative.
+
+G. Concrete rule changes to prevent similar errors going forward (priority order)
+1) Immediate (deploy within 24–48h)
+   - Implement Laplace smoothing and reliability shrinkage (k=5) — mandatory.
+   - Implement reliability-weighted base-weight normalization and cap per-feature delta (max_delta = ±0.8).
+   - Replace the single “default-to-Not-Transported” low-evidence fallback with the directional evidence gate + baseline fallback described above.
+   - Start logging p_final, p_shrunk, support_pos/support_neg, reliable counts, and top contributors for every prediction.
+
+2) Near-term (1–2 weeks)
+   - Add age-conditioned feature adjustments: reduce CryoSleep weight for children (e.g., weight multiplier 0.6 for age <= 12) because CryoSleep’s predictive behavior differs by age in the observed data.
+   - Add a simple interaction term for (Deck, HomePlanet) and (CryoSleep, AgeGroup) so that the model can learn when a Deck or CryoSleep signal should be muted.
+   - Implement per-value FPR/FNR alerts (control charts) for buckets that historically produce errors (Deck E/F, spending=0, age buckets).
+
+3) Medium-term (after +50–100 labels)
+   - Re-fit base weights via regularized logistic regression (L2) using the smoothed/shrunk p_i_shrunk features and the reliability r_i as meta-features. This will produce better calibrated weights and interactions.
+   - Introduce uncertainty-aware evidence score: compute per-feature standard error and use z-scores to quantify statistically-significant support rather than absolute thresholds only.
+
+4) Long-term (100+ labels)
+   - Move to parametric models (regularized logistic / tree-based) with the same Laplace/shrinkage preprocessing and explicit interaction features. Use cross-validation to learn weights rather than hand-setting them.
+   - Consider a hierarchical Bayesian model (partial pooling) over categorical buckets to properly share strength across related categories.
+
+H. Confidence mapping (revised)
+- Compute support_abs_total and map:
+  - support_abs_total ≥ 0.08 → High confidence (accept p_final threshold)
+  - 0.03 ≤ support_abs_total < 0.08 → Medium confidence (accept but add to monitored set)
+  - support_abs_total < 0.03 → Low confidence → Abstain preferred; if auto-labeling is required, default to baseline class (p0 rule).
+- Note: these thresholds are tunable; if your risk tolerance is higher for false positives, push thresholds up; if recall is more important, lower thresholds or prefer baseline fallback.
+
+I. How this improves batch-prediction consistency
+- Deterministic, order-independent pipeline (single-pass compute, then group reconciliation) avoids run-to-run variance.
+- Persist the counts (n_i, t_i) at prediction time to ensure predictions for a given snapshot are reproducible.
+- Logging of top contributors per-row enables quick triage of new failure modes.
+- Group reconciliation: if group/party members have labels, apply post-hoc majority consensus or flag inconsistencies for review.
+
+J. Metrics to monitor (daily/weekly)
+- Brier score and calibration (plot predicted probability buckets vs. observed outcomes).
+- Confusion matrix broken out by:
+  - Deck letter (E/F)
+  - CryoSleep status
+  - Age group (infant / child / adult)
+  - Spending buckets (0 / low / high)
+- Fraction of predictions that are Abstained / Defaulted (and their true label distribution).
+- Per-bucket FPR and FNR control charts (Deck E, TRAPPIST, Spending=0, CryoSleep).
+- Distribution of support_abs_total and reliable counts; monitor drift in these distributions.
+- Trigger a re-fit when +50 labels collected or when per-feature error > threshold.
+
+K. Edge-case handling (explicit rules)
+- For very small n buckets (n ≤ 3): treat p_i_shrunk as effectively neutral unless there are ≥2 independent reliable signals elsewhere.
+- For infants (age ≤ 1): require at least two reliable supporting signals to predict True.
+- For newly observed categorical values (n = 0): p_i_shrunk = p0 and mark support as low.
+- If a case has contradictory evidence (support_pos roughly equals support_neg, and support_abs_total low): Abstain.
+
+L. Rollout & implementation checklist (practical)
+1) Implement smoothing + shrinkage + reliability weighting + delta cap in staging.
+2) Implement directional evidence scoring, reliable counts and the abstain / baseline fallback logic.
+3) Add verbose logging for first 500 predictions; collect audit trails.
+4) Run a leave-one-out (LOO) evaluation on current labeled set (N=23) and compute Brier, accuracy, how many abstentions, and how many previous FPs/FNs are corrected.
+5) Refit base weights when +50 labels or if daily monitoring triggers weight changes.
+6) Move to parametric re-fit after 100–200 labels.
+
+M. Expected short-term tradeoffs
+- Fewer false positives overall (good) at the cost of more abstentions/manual review. If auto-fallback to baseline is used instead of abstain, false negatives will not rise as much.
+- Conservative gating will reduce overconfident predictions on low-n buckets; this may slightly reduce maximum achievable accuracy until more data is collected and we re-fit model weights.
+
+N. Immediate recommended next steps (top 3)
+1) Deploy updated deterministic scoring pipeline (steps E1–E9) to staging with k=5, k2=5, max_delta=0.8 and T_low=0.03; enable verbose logging.
+2) Change low-evidence automatic fallback from “Not Transported” to “baseline class (p0)” when abstaining is not possible.
+3) Authorize a short LOO evaluation and provide permission for me to produce a compact Python implementation of the new pipeline and run LOO on the 23-row set (will show in-sample Brier, accuracy, how many abstentions, and which previous errors would be prevented).
+
+Summary — why this will reduce both types of errors
+- Shrinkage + reliability-scaling stops low-n categories from dominating (fixes Philda/Almary-like FPs and the Deck-driven component of Breney).
+- Delta caps prevent single strong features from dominating unexpectedly.
+- Directional evidence gating with baseline fallback avoids turning low-evidence cases into automatic negatives (so Breney-like cases are abstained or defaulted to baseline), while still preventing noisy additive weak positives from producing unwarranted positive calls.
+- Logging and monitoring permit rapid detection of new small-data failure modes so thresholds and weights can be tuned quickly.
+
+Would you like:
+- A minimal drop-in Python function that implements the revised pipeline (smoothing, shrinkage, reliability-weighted logit aggregation, support_pos/support_neg, abstain/base-rate fallback, and diagnostic logging)? — I can provide it now.
+- A quick LOO evaluation on the current 23-row labeled set (shows in-sample effect, Brier, accuracy and how many previous FPs/FNs are corrected under the new rules)? — I can run it and report results.
+
+Which of the two (Python implementation, LOO evaluation, or both) would you like me to produce next?
+
+============================================================

@@ -1,0 +1,82 @@
+BEST PREDICTIVE RULES
+==================================================
+Accuracy: 71.7%
+From Iteration: 2
+Generated: 2025-09-03 18:02:03
+==================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. CryoSleep = True AND total spend (RoomService+FoodCourt+ShoppingMall+Spa+VRDeck) = 0:
+   - If Cabin deck in {B, C, E} -> Transported = True.
+   - If Cabin deck in {F, G, T} AND Cabin side = 'P' -> Transported = False.
+   - Otherwise, do not force a decision; evaluate destination/spend/age rules below.
+
+2. Age <= 12:
+   - If CryoSleep = True -> Transported = True.
+   - If CryoSleep = False AND total spend = 0 AND Destination = TRAPPIST-1e AND Age <= 3 -> Transported = True.
+   - Otherwise, do not infer True from zero spend alone.
+
+3. Replace prior FoodCourt > 1000 negative rule:
+   - If (Spa + VRDeck) > 1000 (any destination, any CryoSleep) -> Transported = False.
+   - Remove the “FoodCourt > 1000 -> False” logic.
+
+4. Non-Cryo, Destination in {TRAPPIST-1e, 55 Cancri e} with “retail-dominant” spend:
+   - If max(FoodCourt, ShoppingMall) is the dominant category AND categories with nonzero spend <= 2 AND total spend between 300 and 3000 AND (Spa + VRDeck) <= 200 -> Transported = True.
+
+5. Non-Cryo, Destination = 55 Cancri e:
+   - If (Spa + VRDeck) >= 500 OR categories with nonzero spend >= 3 AND total spend >= 1500 -> Transported = False.
+   - Else if max(FoodCourt, ShoppingMall) is dominant (>= 60% of total spend) -> Transported = True.
+
+6. Non-Cryo, Destination = PSO J318.5-22 (replacing hard False rule):
+   - If (Spa + VRDeck) >= 600 OR categories with nonzero spend >= 3 AND total spend >= 1200 -> Transported = False.
+   - Else if FoodCourt is dominant (>= 60% of total spend) AND total spend <= 2500 AND (Spa + VRDeck) <= 200 -> Transported = True.
+
+7. HomePlanet = Europa AND Destination = TRAPPIST-1e AND CryoSleep = False:
+   - If FoodCourt is dominant (>= 50% of total) AND (Spa + VRDeck) <= 400 -> Transported = True.
+   - If (Spa + VRDeck) > 1200 -> Transported = False.
+
+8. HomePlanet = Mars AND Destination = TRAPPIST-1e AND CryoSleep = False:
+   - If max(FoodCourt, ShoppingMall) is dominant AND categories with nonzero spend <= 2 AND total spend between 300 and 2500 AND (Spa + VRDeck) <= 300 -> Transported = True.
+   - Otherwise follow general spend rules.
+
+9. Refine multi-category penalty:
+   - Predict Transported = False for 3+ nonzero categories only when total spend >= 3000 OR (Spa + VRDeck) >= 400.
+   - Do not use “3+ categories” alone to force False for moderate retail-dominant spend.
+
+10. RoomService-only spend (only RoomService > 0, others = 0/NaN) AND CryoSleep = False:
+    - If RoomService <= 150 -> Transported = True (low, single-category leisure).
+    - If RoomService > 150 -> Transported = False.
+    - Ignore destination bias from the prior “TRAPPIST-1e + RS-only -> True” rule.
+
+11. VIP = True:
+    - If (Spa + VRDeck) >= 800 -> Transported = False.
+    - Otherwise, ignore VIP status and apply destination/spend rules (do not default VIP with spend to False).
+
+12. CryoSleep missing:
+    - If total spend = 0 -> treat as CryoSleep = True and apply Rule 1.
+    - If total spend > 0 -> treat as CryoSleep = False and apply destination/spend rules herein.
+
+13. Cabin side/deck rules as tiebreakers only:
+    - Use Cabin side ('P' -> more likely True; 'S' -> more likely False) and deck tendencies only when spend patterns, destination, and CryoSleep do not provide a clear decision. Do not override strong spend/destination signals with side/deck.
+
+14. Destination = TRAPPIST-1e AND CryoSleep = False, “mid-retail”:
+    - If max(FoodCourt, ShoppingMall) dominant AND categories with nonzero spend <= 2 AND total spend between 400 and 2600 AND (Spa + VRDeck) <= 300 -> Transported = True.
+
+15. Destination = TRAPPIST-1e AND CryoSleep = False, “tech/spa-heavy”:
+    - If (Spa + VRDeck) >= 800 OR VRDeck >= 600 -> Transported = False, unless retail (FoodCourt+ShoppingMall) is > 70% of total and >= 1200 (then defer to Rule 4/14).
+
+16. Children on 55 Cancri e:
+    - If Age <= 12 AND Destination = 55 Cancri e AND total spend = 0 -> Transported = True (regardless of CryoSleep).
+
+17. Group/cabin majority inference (safety guard):
+    - Apply group (PassengerId prefix) or shared-cabin majority only when there are at least two other known members AND agreement >= 2/3.
+    - Do not apply group/cabin majority when the individual has strong spend/destination evidence (Rules 3–6, 9–15).
+
+18. HomePlanet = Earth AND CryoSleep = False AND Destination = TRAPPIST-1e:
+    - If ShoppingMall is dominant (>= 50% of total) AND total spend between 500 and 2500 AND (Spa + VRDeck) <= 300 AND categories with nonzero spend <= 2 -> Transported = True.
+
+19. Override for extreme Spa/VR:
+    - Regardless of destination/home/retail patterns, if (Spa + VRDeck) >= 2000 -> Transported = False.
+
+==================================================

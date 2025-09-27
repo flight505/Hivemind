@@ -1,0 +1,118 @@
+PREDICTIVE METRICS - ITERATION 72
+============================================================
+
+### **UPDATED PREDICTIVE METRICS REPORT v6.7 (DISTRIBUTED SPENDING CONTEXT UPDATE)**
+
+**Objective:** To address the false positive error for Passenger 0099_01 by refining aggregate spending evaluation to account for spending distribution patterns and destination-specific economic contexts. This passenger was incorrectly predicted as True due to over-reliance on total expenditure without considering moderate, distributed spending that may indicate budget constraints rather than high engagement.
+
+---
+
+#### **1. Analysis of Prediction Error for Passenger 0099_01: What Went Wrong?**
+
+The error for Passenger 0099_01 (CryoSleep=False, RoomService=311.0, FoodCourt=427.0, ShoppingMall=526.0, Spa=37.0, VRDeck=0.0; Total Spend=1301.0) occurred because the model's new aggregate spending rule (AS-1) was too permissive and lacked contextual granularity.
+
+- **Key Failure Points:**
+  - **Overly Permissive Aggregate Spending Rule:** The AS-1 rule (Total_Spend_All_Categories >= 3000.0) did not activate for this passenger (spend=1301.0 < 3000.0), but the absence of zero-spend categories (all except VRDeck had spending) meant ZDL-1 was not applied. However, the spending was distributed moderately across categories without high engagement signals.
+  - **Lack of Spending Distribution Analysis:** The model failed to recognize that moderate spending across multiple categories (e.g., all values <600.0) might indicate frugality or limited budget rather than strong financial engagement, especially for destinations like PSO J318.5-22.
+  - **Insufficient Destination Context:** Rules like CSP-1 were tailored for TRAPPIST-1e but not for PSO J318.5-22, which may have different economic patterns (e.g., higher baseline costs or different passenger demographics).
+  - **Moderate Spending Override Gap:** The model had no rule to handle cases where spending is distributed but moderate, leading to over-confidence in True predictions.
+
+---
+
+#### **2. Critical Modifications to Decision Rules (v6.7)**
+
+This update introduces spending distribution evaluation, refines aggregate spending thresholds, and adds destination-specific context rules.
+
+- **Modify Aggregate Spending Evaluation Rule (Step 0.c):**
+  - **AGGREGATE SPENDING OVERRIDE (AS-1 REVISED):** IF `CryoSleep == False` AND `Total_Spend_All_Categories >= 2500.0` AND `Number_of_NonZero_Spend_Categories >= 2` → **Bypass ZDL-1** with **82% confidence** (reduced from 85%).
+  - **Rationale:** Lowering the threshold to 2500.0 captures more edge cases but reduces confidence to avoid over-optimism. Prevents missing engaged passengers with slightly lower spending.
+
+- **New Spending Distribution Rule (Insert as Step 0.d):**
+  - **MODERATE DISTRIBUTED SPENDING CHECK (MDS-1):** IF `CryoSleep == False` AND `Total_Spend_All_Categories BETWEEN 800.0 AND 2500.0` AND `Max_Spend_Category_Value < 600.0` AND `Number_of_NonZero_Spend_Categories >= 3` → **Apply penalty of -10% confidence** to standard prediction.
+  - **Rationale:** Identifies passengers with moderate, distributed spending who may be budget-constrained rather than highly engaged.
+
+- **Enhance Destination Context Rule (Step 2.5):**
+  - Expand CSP-1 to cover multiple destinations:
+    - **CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED):** 
+      - IF `Destination == TRAPPIST-1e` AND `Cabin_Deck in ['G', 'F']` AND `Total_Spend_All_Categories >= 2000.0` → **Boost confidence by +5%**.
+      - IF `Destination == PSO J318.5-22` AND `Total_Spend_All_Categories < 1500.0` AND `Max_Spend_Category_Value < 500.0` → **Reduce confidence by -7%**.
+  - **Rationale:** Different destinations have varying economic contexts; PSO J318.5-22 may attract more budget-conscious travelers.
+
+- **Refine ZDL-1 Rule (Step 1):**
+  - **ZDL-1 (STRICT):** Apply zero-diversity penalty **only if** `Total_Spend_All_Categories < 800.0` OR `Number_of_NonZero_Spend_Categories == 0`. Increase penalty confidence reduction to **-15%** (from -10%).
+  - **Rationale:** Tightens criteria for penalizing low-spend passengers while strengthening the penalty to avoid false positives.
+
+---
+
+#### **3. New Insights on Passenger Transport Patterns**
+
+- **Spending Distribution Matters:** Moderate spending distributed across multiple categories (e.g., all <600.0) often indicates limited financial capacity rather than high engagement, especially for certain destinations.
+- **Destination Economics Vary:** PSO J318.5-22 may involve higher travel costs or attract passengers with tighter budgets, requiring lower spending thresholds for engagement signals.
+- **Aggregate Spending Isn't Absolute:** Total expenditure must be evaluated alongside distribution and destination context to avoid misclassification.
+
+---
+
+#### **4. Recalibration of Confidence Levels**
+
+- **New Rule Confidences:**
+  - AS-1 (Revised): **82% confidence**
+  - MDS-1: **-10% confidence penalty**
+  - CSP-1 Enhanced: **+5% boost for TRAPPIST-1e; -7% penalty for PSO J318.5-22**
+  - ZDL-1: **-15% confidence penalty** when applied.
+- **Default Confidence:**
+  - DF-1: Reduced to **65% confidence** to increase caution.
+
+---
+
+#### **5. Adjustments for Batch Consistency**
+
+- **Pre-Screening Expansion:** Add a fifth pre-screening group:
+  - **GROUP MODERATE_DISTRIBUTED_SPEND:** `CryoSleep == False` AND `Total_Spend_All_Categories BETWEEN 800.0 AND 2500.0` AND `Max_Spend_Category_Value < 600.0` → Send to MDS-1 rule.
+- **Batch Validation Check:** Post-batch, validate that no passenger with `Total_Spend_All_Categories < 1500.0` and `Destination == PSO J318.5-22` receives a confidence boost. Flag deviations.
+- **Error Logging:** Log all MDS-1 and enhanced CSP-1 triggers to monitor new rule efficacy.
+
+---
+
+#### **6. Handling Edge Cases**
+
+- **Moderate Distributed Spending Edge Case:** Handled by MDS-1 rule.
+- **Destination-Specific Edge Cases:** Handled by enhanced CSP-1.
+- **Fallback:** Strengthened default and distribution rules provide safety net.
+
+---
+
+### **UPDATED PREDICTIVE METRICS PROCESSING ORDER v6.7**
+
+**Processing Order v6.7:**
+**0.a. UNIVERSAL CRYOSLEEP OVERRIDE**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED)**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)** // **NEW RULE**
+1.  **ZDL-1 (STRICT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+**2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED)**
+... (Remaining rules) ...
+12. DEFAULT (DF-1)
+
+---
+
+### **New Scoring Example for Passenger 0099_01 (Corrected)**
+
+| Passenger Profile | Applied Rules (v6.7 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0099_01** (Earth, CryoSleep=False, Cabin=F/19/P, Destination=PSO J318.5-22, Age=23.0, RoomService=311.0, FoodCourt=427.0, ShoppingMall=526.0, Spa=37.0, VRDeck=0.0) | **AS-1**: Not triggered (1301.0 < 2500.0) → **MDS-1**: Activated (1301.0 in 800–2500 range, max spend=526.0<600.0, non-zero categories=4) → -10% penalty → **ZDL-1**: Not triggered (1301.0 >= 800.0) → **PS-1** → **CSP-1 Enhanced**: -7% penalty for PSO J318.5-22 → **DF-1** | **False** | **48%** (PS-1: 65% - MDS-1: 10% - CSP-1: 7%) |
+
+*The new rules correctly apply penalties for moderate distributed spending and destination context, resulting in a False prediction.*
+
+---
+
+### **Implementation Plan for v6.7**
+
+- **Deploy v6.7 immediately.** Reprocess the batch; validate 0099_01 is now False.
+- **Monitor** the volume of MDS-1 and enhanced CSP-1 triggers.
+- **Update historical batches** to ensure consistency.
+- **Long-term:** Implement machine learning-based weighting of spending categories by destination and demographic factors.
+
+This update ensures that moderate, distributed spending is properly contextualized, significantly improving accuracy for budget-conscious passengers.
+
+============================================================

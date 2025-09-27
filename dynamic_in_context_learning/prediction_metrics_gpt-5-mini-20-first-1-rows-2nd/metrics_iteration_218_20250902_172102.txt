@@ -1,0 +1,283 @@
+PREDICTIVE METRICS - ITERATION 218
+============================================================
+
+EXECUTIVE SUMMARY — immediate takeaways
+- New batch FP/label-mismatch: 0254_01 (RoomService=702, ShoppingMall=408, FoodCourt=172, VRDeck=6, Spa=2 → top2_sum≈1110, top3_sum≈1282, top1_share≈0.544, nonzero_channels=5). Model predicted False but actual True.
+- Root cause (summary): multiple medium‑to‑high spends accumulated additively into a decision region the model mis-mapped (additive logit saturation and missing interaction conditioning). This pattern (multi‑medium_high) sits between existing “super_dominant” and “multi_high” detectors and was missed because thresholds were too coarse, calibrator variance did not depend on spend topology, and small‑n auto_accept allowed the error to escape.
+- Immediate objective: prevent small‑n auto_accepts on fragile records, compute fragility pre‑imputation, widen calibrator uncertainty for flagged items, put an interpretable GLM fallback in the gating path, add per‑feature logit/top‑k caps and cluster‑aware aggregate_medium_high detectors, and instrument canaries & provenance.
+- Short actionables: (1) compute & persist pre‑imputation spend topology flags, (2) block auto_accept for fragile records when batch small (e.g., n≤10) or batch_frac_fragile above threshold, (3) inflate calibrator variance for fragiles, (4) enable GLM_fallback and require agreement for auto_decision on fragiles, (5) run canaries (include 0253_01/0254_01).
+
+Concise answers to six questions
+1) Which specific patterns caused this error?
+- Aggregate multi‑channel medium spends (top2_sum ≈1110, top3_sum ≈1282) produced a logit pattern not captured by “super_dominant” or coarse multi_high thresholds.
+- Additive logit growth: many medium contributors summed into a wrong decision region (no topk dampening/capping).
+- Under‑conditioned calibrator: uncertainty did not depend on spend topology (topk_sum, channel_count, entropy).
+- Small-batch permissive auto_accept allowed the low‑volume FP.
+
+2) How should decision rules be modified?
+- Compute fragility BEFORE imputation; use it in scoring/calibration.
+- Add cluster‑aware aggregate_medium_high detector (top2/top3 sums and percentile thresholds).
+- Block n≤10 auto_accept for fragile records unless stringent gates pass (GLM agreement, ensemble agreement, narrow predictive interval, small p_model−p_glm).
+- Apply per_feature_logit caps and LOGIT_TOPK_SUM_CAP; if caps or scaling triggers, route to audit (don’t silently accept).
+
+3) What new transport‑pattern insights?
+- Total spend topology (diversity, topk_sum) matters more than single max channel for some cohorts; sign of effect flips across HomePlanet/Destination/CabinDeck.
+- Missing contextual fields amplify fragility: identical spend signatures map to different labels in different clusters.
+- Nonlinear saturation/gating effects appear: once several spends are active, marginal effect is not linear.
+
+4) How should confidence be recalibrated?
+- Train a heteroskedastic quantile calibrator conditioned on p_model + pre‑imputation flags (top1_share, topk_sum, channel_count_above_qX, entropy, missingness, cluster_id) to output p10/p50/p90.
+- Temporarily inflate variance for fragiles (additive κ per flag) so p90−p10 widens; use interval width + cross‑model agreement to gate small‑n auto_accept.
+
+5) What adjustments are needed for batch consistency?
+- Persist raw per_channel_spends and imputation flags before transforms.
+- Gate small‑n fragile records: require GLM_fallback + ensemble agreement before auto_decision.
+- Hold whole batches when batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 5%).
+- Canary representative fragiles; do not auto_accept canaries during hotfix.
+
+6) How can metrics be improved for edge cases like this one?
+- Add slice KPIs (aggregate_medium_high by HomePlanet/Destination/CabinDeck).
+- Create synthetic stress tests: multiple medium spends across cohorts with both labels; oversample/upweight during retraining.
+- Persist per‑record provenance and per_feature_logit breakdown to accelerate audits and targeted retraining.
+
+COMPLETE UPDATED PREDICTIVE‑METRICS REPORT (batch‑optimized, actionable)
+
+A. What happened (concise)
+- Error: 0254_01 — RoomService=702, FoodCourt=172, ShoppingMall=408, VRDeck=6, Spa=2 → model predicted False, actual True.
+- Failure chain:
+  1) No preserved pre‑imputation fragility signals (NaNs handled/filled early).
+  2) Model aggregated several non‑dominant spends additively → produced a logit/score outside calibrated slices.
+  3) Calibrator did not account for multi‑channel spend topology → under‑estimated uncertainty.
+  4) Decisioning: small‑batch (n==1) auto_accept allowed the mistaken decision.
+
+B. Immediate hotfix actions (0–3h)
+1) Pre‑imputation flags & provenance
+   - Persist raw per_channel_spends (NaNs preserved), per_channel_imputed_flags, and missingness bitmap.
+   - Compute top1_value_raw, top1_share_raw, channel_entropy_raw, non_nan_spend_count, top2_sum_raw, top3_sum_raw, channel_count_above_q75/q90 (cluster percentiles), zero_spend_vector_flag, cryo_allzero_flag, imputed_zero_all_flag, missing_context_flag.
+   - Expose these to scoring, calibrator, and gating.
+
+2) Dynamic fragility & hot gating
+   - New flags:
+     - multi_high_spend_flag (cluster aware): count(spend_i > per_channel_q90_cluster) ≥ 2 OR top3_sum_pctile ≥ cluster_p90.
+     - aggregate_medium_high_flag: (count(spend_i > per_channel_q75_cluster) ≥ 2) AND (top2_sum_raw ≥ TOP2_SUM_ABS_LOW OR top2_sum_pctile ≥ 0.85).
+   - If r.fragile_flag AND batch_size ≤ 10:
+     - Disallow auto_accept unless ALL pass:
+       - |p_model − p_glm| ≤ δ_fragile,
+       - ensemble_agreement ≥ A_high_fragile,
+       - predictive_interval_width (p90 − p10) ≤ QW_accept_fragile,
+       - confidence_score ≥ CS_accept_fragile.
+   - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD → route whole batch to audit.
+
+3) Temporary calibrator variance inflation
+   - var_combined += κ_super_dom*I(super_dominant_flag) + κ_cryo*I(cryo_allzero_flag) + κ_multi_high*I(multi_high_spend_flag) + κ_aggregate_medium*I(aggregate_medium_high_flag) + κ_impute*imputed_count + κ_missing*missing_count.
+   - Start values (sweepable): κ_super_dom=2.1, κ_cryo=1.9, κ_multi_high=2.0, κ_aggregate_medium=1.6, κ_impute=0.30, κ_missing=0.60.
+
+4) GLM_fallback (interpretable baseline)
+   - Serve ElasticNet logistic on winsorized log1p spends + fragility flags + topk_sum + entropy + key demographics.
+   - Use p_glm in gating: require agreement with p_model for auto_accept on fragiles.
+
+5) Per‑feature logit caps & top‑k dampening
+   - CAP_PER_FEATURE_LOGIT = 0.60; LOGIT_TOPK_SUM_CAP = 1.0 (initial).
+   - Compute per_feature_logit_contributions. Cap contributions above CAP_PER_FEATURE_LOGIT and set caps_triggered flag. If top_k_logit_sum > LOGIT_TOPK_SUM_CAP, scale down proportionally; if scaling > α_threshold (e.g., 25%), route to audit.
+
+6) Canaries & logging
+   - Add canonical canaries including 0253_01 and 0254_01; block auto_accept for canaries until hotfix validated; page on any canary auto_accept.
+
+C. Pre‑imputation detectors & flag definitions (compute before imputations)
+- raw_spend_vector preserved; compute:
+  - top1_value_raw, top1_channel_raw, top1_share_raw,
+  - channel_entropy_raw = −Σ(p_i log p_i) (p_i = spend_i / total_nonzero_spend),
+  - topk_sum_raw (k=2,3), top2_sum_raw,
+  - channel_count_above_q75/q90 (cluster percentiles),
+  - per_feature_outlier (spend_i > channel_outlier_quantile),
+  - zero_spend_vector_flag, cryo_allzero_flag, imputed_zero_all_flag,
+  - super_dominant_flag: top1_share_raw ≥ TOP1_SHARE_SUPERDOM (0.75) OR top1_value_raw ≥ channel_outlier_threshold,
+  - multi_high_spend_flag & aggregate_medium_high_flag as in B.2,
+  - missing_context_flag (Cabin/CryoSleep/HomePlanet missing),
+  - fragility_score: weighted sum of flags + normalized topk_sum_zscore + non_nan_spend_count (tune weights to select top ~3–5% fragile).
+
+D. Feature engineering & preprocessing updates
+- Preserve raw fields; do not collapse NaN→0 without flag.
+- Spends pipeline:
+  - winsorize per-channel at channel‑specific high quantile (e.g., 99.5), log1p transform, robust scale.
+- New features:
+  - top1_share_raw, top1_value_raw, channel_entropy_raw, non_nan_spend_count,
+  - topk_sum_raw, topk_sum_pctile (cluster & global), channel_count_above_q75/q90, spend_gini.
+- Interactions:
+  - multi_high_spend_flag × (HomePlanet, Destination, CabinDeck),
+  - topk_sum × Age/VIP/missing_context_flag.
+- Regularization/architectural changes:
+  - Penalize the L1/L2 mass on spend coefficients to avoid additive runaway.
+  - Replace naive sum-of-coefficients aggregator by a saturating aggregator feature (agg_spend = log1p(sum_spends) or learned monotonic saturator) or a small gating network that learns nonlinearity; evaluate both.
+
+E. Decision gating (pattern‑aware + batch/cohort aware)
+- fragile_flag_v2 = union(cryo_allzero, imputed_zero_all, missing_context, super_dominant, multi_high_spend, aggregate_medium_high, per_feature_outlier, caps_triggered).
+- batch_frac_fragile = count(fragile_flag_v2)/|B|.
+- Rules:
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD → hold batch → priority_audit.
+  - For fragile records with batch_size ≤ 10:
+    - Require GLM agreement + ensemble agreement + narrow predictive interval + small |p_model−p_glm| to auto_decide; else audit.
+  - Non‑fragile records flow to normal calibrated auto_accept.
+
+F. Calibrator & GLM_fallback retrain plan
+- Heteroskedastic quantile calibrator:
+  - Inputs: p_model, pre‑imputation flags (top1_share, topk_sum, counts, entropy), missingness bitmap, demographics, cluster_id.
+  - Outputs: p10/p50/p90 and var_components.
+  - Objective: weighted pinball loss (for p10/p50/p90) + coverage regularizer; upweight fragile slices 2–4×.
+  - Shadow-run for 14–28 days while hot gating is active.
+- GLM_fallback:
+  - ElasticNet logistic on winsorized log1p spends + fragility flags + interactions; oversample fragile slices; use for gating and explanations.
+
+G. Mixture priors, cluster detection & slice conditioning
+- Cluster on demographics + raw_spend_vector + missingness_signature + cabin_deck + Destination.
+- For each cluster compute μ_cluster, N_cluster and blend with global prior:
+  μ_blend = (N_cluster/(N_cluster + τ))*μ_cluster + (τ/(N_cluster + τ))*μ_global.
+- If N_cluster < N_min_slice (start 60), treat cluster as fragile and increase gating strictness.
+
+H. Variance / heteroskedastic uncertainty (hotfix & retrain)
+- var_combined = var_base +
+   κ_super_dom*I(super_dominant_flag) +
+   κ_cryo*I(cryo_allzero_flag) +
+   κ_multi_high*I(multi_high_spend_flag) +
+   κ_aggregate_medium*I(aggregate_medium_high_flag) +
+   κ_impute*imputed_count +
+   κ_missing*missing_count
+- Predictive width ∝ f(var_combined); expand intervals for flagged fragiles to block auto_accept until calibrator retrain validated.
+- Start κs per B.3.
+
+I. Monitoring, metrics & alerts (batch‑focused)
+- New KPIs:
+  - aggregate_medium_high_FP_rate & FN_rate (by HomePlanet/Destination/CabinDeck),
+  - multi_high_spend_FP/FN rates,
+  - super_dominant_FP_rate, cryo_allzero_FP_rate,
+  - n==1_auto_accept_rate and n==1_fragile_auto_accept_rate (target 0 during hotfix),
+  - batch_frac_fragile, batch_hold_rate,
+  - calibrator empirical coverage by slice (p10/p90 observed coverage),
+  - caps_trigger_rate, scaling_percentage_when_capping.
+- Alerts:
+  - Any canary auto_accepted → page on‑call.
+  - multi_high_spend_FP_rate or aggregate_medium_high_FP_rate spike → page.
+  - batch_frac_fragile ≥ threshold → hold + page.
+  - caps_trigger_rate spike (>5% of records) → page.
+
+J. CI unit tests, regression & synthetic stress tests
+- Unit tests:
+  - pre‑imputation flags & NaN semantics,
+  - multi_high_spend and aggregate_medium_high detection,
+  - super_dominant and cryo_allzero detection,
+  - gating logic for n==1 fragiles,
+  - logit capping and audit routing.
+- Regression:
+  - Slice‑level FP/FN for super_dominant, cryo_allzero, multi_high_spend, aggregate_medium_high must not regress in staging.
+- Synthetic stress tests:
+  - Generate synthetic records with multiple medium spends across cohorts with both labels — ensure gating & GLM behavior is correct.
+  - Include canaries like 0253_01 and 0254_01 variants.
+
+K. Per‑record provenance to log (minimum)
+- raw per_channel_spends (NaNs preserved), per_channel_imputed_flags & method, missingness bitmap.
+- top1_channel_raw, top1_value_raw, top1_share_raw, channel_entropy_raw, non_nan_spend_count.
+- topk_sum_raw, top2_sum_raw, channel_count_above_q75/q90, fragility flags.
+- per_feature_logit_contributions (raw & capped), caps_triggered, pooled_prior_snapshot_id, μ_slice, τ_slice_blend.
+- Variance: var_components, var_combined, predictive_width (p90−p10).
+- Decision metadata: p_model, GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, p10/p50/p90, gating_reasons, routing_decision, scorer_version.
+
+L. Initial hyperparameters (start values; sweepable)
+- SPEND_ZERO_TOLERANCE = 1e‑6
+- TOP1_SHARE_SUPERDOM = 0.75
+- CHANNEL_OUTLIER_QUANTILE = 0.995
+- CHANNEL_Q_FOR_MULTI = 0.90
+- CHANNEL_Q_FOR_MEDIUM = 0.75
+- TOP3_SUM_CLUSTER_PCTILE = 0.90
+- TOP2_SUM_ABS_LOW (aggregate_medium) = 700–900 (start 800) — but allow cluster adaptive fallback; consider lowering for clusters where top2_sum 1000 is typical.
+- MULTI_HIGH_MIN_COUNT = 2
+- CAP_PER_FEATURE_LOGIT = 0.60
+- LOGIT_TOPK_SUM_CAP = 1.0
+- BATCH_FRAGILE_THRESHOLD = 0.05
+- N_min_slice = 60
+- δ_fragile = 0.03–0.05
+- A_high_fragile = 0.99
+- QW_accept_fragile = 0.12
+- CS_accept_fragile = 0.80
+- κ_super_dom = 2.1; κ_cryo = 1.9; κ_multi_high = 2.0; κ_aggregate_medium = 1.6; κ_impute = 0.30; κ_missing = 0.60
+
+M. Gating pseudocode (batch‑focused)
+- For each batch B:
+  - compute batch_frac_fragile = count(r in B where fragile_flag_v2)/|B|.
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD: route B -> priority_audit; continue.
+  - For each record r in B:
+    - compute pre‑imputation flags (NaNs preserved).
+    - set fragile_flag_v2 = union(...)
+    - If fragile_flag_v2 AND batch_size ≤ 10:
+      - compute p_model, p_glm, ensemble_agreement, p10/p90, predictive_width, confidence_score
+      - compute per_feature_logit_contributions and topk_logit_sum; apply caps
+      - If caps_triggered: route to priority_audit
+      - Else if |p_model − p_glm| ≤ δ_fragile AND ensemble_agreement ≥ A_high_fragile AND predictive_width ≤ QW_accept_fragile AND confidence_score ≥ CS_accept_fragile:
+        - allow auto_decision
+      - Else:
+        - route r -> priority_audit
+    - Else:
+      - allow normal auto_decisions (with usual calibrator checks)
+
+N. Failure diagnosis — 0254_01 (specific)
+- Raw spends: RoomService=702, ShoppingMall=408, FoodCourt=172, VRDeck=6, Spa=2 → total_spend=1290.
+- Computed topline:
+  - top1_value_raw = 702
+  - top2_sum_raw = 702 + 408 = 1110
+  - top3_sum_raw = 702 + 408 + 172 = 1282
+  - top1_share_raw = 702 / 1290 ≈ 0.544
+  - channel_count_nonzero = 5
+- Why it failed:
+  1) Multiple medium contributors produced a net signal that the model misunderstood; thresholds for multi_high or aggregate_medium_high were too coarse relative to this pattern.
+  2) Calibrator did not inflate variance for this spend topology → p_model was overconfident.
+  3) Small‑batch auto_accept (n==1) allowed the FP to be released.
+  4) Potential missing cluster interaction: the label mapping for this spend signature differs across Demographics/Destination clusters but model did not sufficiently condition.
+- Hotfix effect:
+  - aggregate_medium_high flag will capture this record,
+  - variance inflation widens predictive interval, gating requires GLM agreement → prevents auto_accept.
+
+O. How these changes reduce batch errors
+- Pre‑imputation flags maintain the true semantics of zeros vs imputed values, enabling model/calibrator to handle cohorts differently.
+- Dynamic fragility scoring captures mid‑range multi‑channel patterns that previous absolute thresholds missed.
+- Per‑feature logit caps and topk dampening prevent many medium features from summing into runaway logits.
+- Heteroskedastic calibrator widens intervals where data is sparse or heterogenous, decreasing overconfidence and erroneous auto_accepts.
+
+P. Tradeoffs & operational notes
+- Short term: increased audit volume and latency for flagged records; more manual review.
+- Medium term: retraining/calibration cost, temporary dip in auto_accept throughput.
+- Long term: fewer high‑impact FP/FN, better auditability, improved cohort reliability.
+
+Q. Runnable checklist (concrete)
+1) Deploy hotfix gating (pre‑imputation flags, aggregate_medium_high, block small‑n fragile auto_accepts, calibrator variance inflation, GLM_fallback serving). (0–3h)
+2) Add canaries (0253_01, 0254_01) and enhanced provenance logging; block auto_accept for canaries. (0–3h)
+3) Train GLM_fallback baseline; build dashboards for batch_frac_fragile and slice KPIs. (3–24h)
+4) Acquire labeled audit data for fragiles; retrain heteroskedastic calibrator & GLM_fallback; run shadow traffic 14–28 days. (24–72h)
+5) Retrain main model with new features/interactions and hierarchical priors; validate slice KPIs. (3–8 weeks)
+
+R. Targets and acceptance criteria
+- Hotfix: n==1_fragile_auto_accepted rate → 0.
+- Retrain target: reduce aggregate_medium_high & multi_high_spend FP_rate by ≥50% on flagged slices OR reduce auto_accept_rate for fragiles to <2% while holding global calibration and AUC within acceptable bounds.
+- Canaries must not be auto_accepted during hotfix.
+
+S. Timeline (0–72h)
+- 0–3h: implement pre‑imputation logging, hot gating + canaries.
+- 3–24h: GLM_fallback baseline; dashboards; initial audit labeling.
+- 24–72h: retrain calibrator & GLM_fallback; shadow validation; tune thresholds.
+
+T. CI / PR readiness
+- I can produce a hotfix PR skeleton now including:
+  - scorer changes: pre‑imputation flagging, aggregate_medium_high detection, gating logic, provenance logs, canary gating.
+  - unit tests for flags and gating (including 0253_01 and 0254_01).
+  - monitoring hooks and stress test harness.
+- Estimated time: PR skeleton + unit tests ~1–2 hours.
+
+Immediate recommended next step
+- Approve and deploy the hotfix gating (pre‑imputation flags + dynamic fragility + block small‑n fragile auto_accepts + temporary calibrator variance inflation + GLM_fallback). This is low‑risk and high‑ROI: it prevents additional small‑n fragiles from being auto‑accepted while we collect audit labels and retrain.
+
+Which deliverable would you like first?
+- Hotfix PR skeleton + unit tests (recommended immediate), OR
+- GLM_fallback training notebook + baseline metrics, OR
+- Heteroskedastic calibrator spec & hyperparameter sweep plan.
+
+I can start the hotfix PR skeleton now and include unit tests that reproduce 0253_01 and 0254_01 as canaries.
+
+============================================================

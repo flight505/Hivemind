@@ -1,0 +1,89 @@
+CYCLE 13 STRATEGIC REFLECTION
+Generated on: 2025-09-09 13:55:15
+Cycle Performance: Best 59.68%, Average 52.69%
+Total Iterations: 10
+
+================================================================================
+
+Summary of where we are
+- Cycle 13 peak accuracy: 59.68% (above the 10-cycle average of 52.69%).
+- What clearly helped this cycle: explicit memorization of sample rows, a weighted linear “score”, and a few hard interaction thresholds (notably C*D and A+B thresholds). Tie-handling using gap/gap_ratio also helped borderline cases.
+- Remaining weaknesses: brittle thresholds, under-capture of non-linear or locally structured patterns, and misclassification in near-tie / multi-dominant situations.
+
+Strategic reflection (what I learned)
+1) Patterns observed
+- Strong multiplicative interactions matter: C * D >= threshold reliably mapped to class 1 in many examples — multiplicative terms capture “cooperative” effects that linear sums miss.
+- Weighted linear scoring is a useful global prior: a simple weighted sum (A*0.44 + B*0.3 + ...) captured many cases and provided an effective fallback.
+- Dominance / share features and pairwise sums (A+B, A+B+C) are highly predictive when combined with local thresholds (e.g., A+B >= 100).
+- Tie/near-tie behavior: small gaps between top values often require different tie-breaking logic (score vs. feature dominance).
+
+2) Failure analysis — what’s still challenging
+- Ambiguous or multi-dominant inputs: when two or more features are high (e.g., B and E both large) rigid thresholds conflict and cause errors.
+- Borderline/near-tie cases where small perturbations flip the class — existing gap_ratio heuristics are crude.
+- Nonlinear or localized patterns that depend on ordering, parity, modulo or other discrete structure — current rules are continuous/threshold-based and miss those.
+- Underrepresented decision boundaries: rules overfit the few strong patterns but miss subtler mapping regions (midrange C with medium A,B,E).
+- Overreliance on absolute thresholds rather than relative/normalized measures (percent share of total, rank positions).
+
+3) Innovation opportunities (not yet fully explored)
+- Richer feature engineering: normalized shares (A/sum), pairwise products (A*B, A*C), higher-order terms (A^2), ratios and differences, and log transforms.
+- Rank-based and gap-based rules: index of max/min, second-max, normalized gap as a smoother tie-breaker.
+- Local models/case-based reasoning: nearest-neighbor in engineered feature space to capture small local patterns instead of one global set of thresholds.
+- Soft scoring / probabilistic ensembles: combine multiple weak rules with weighted votes or soft activation (sigmoid of feature) rather than hard if-then.
+- Discrete features: parity, modulo, and bitwise patterns — these can reveal hidden cyclical rules.
+- Small decision-tree / binning and threshold search: automatic small-grid search for better thresholds and interactions without requiring large model complexity.
+
+4) Strategic direction — what to prioritize next cycle
+- Prioritize richer interactions and normalization: test product/ratio features and relative-share features first (highest potential to fix multi-dominant errors).
+- Add a localized case-based component (k-NN) using engineered features to handle small-region idiosyncrasies.
+- Replace brittle single thresholds with soft/ensemble aggregation (voting or weighted scoring) to reduce flipping at boundaries.
+- Introduce explicit rank/tie features and improve tie-breaking logic with continuous gap-based weighting.
+- Explore simple discrete/parity features as a low-cost diagnostic — if they help on preserved examples, keep them.
+
+Creative planning — 4 specific strategies to implement and test next cycle
+
+Strategy A — Interaction + normalized-share ensemble (highest priority)
+- New feature set to compute: pairwise products (A*B, A*C, B*C, C*D, D*E), squared terms (A^2, B^2), ratios and normalized shares (A/sum, B/sum, C/sum), and relative differences (max - second_max, second_max/max).
+- Logical structure: hierarchical checks
+  1) memorized rows
+  2) strong multiplicative rules (e.g., threshold on C*D, A*B; but with adaptive thresholds scaled by sum or max)
+  3) dominance by normalized share (if a feature’s share > 0.45 → class X depending on which feature)
+  4) soft aggregated score: compute several sub-scores (linear weighted sum, sigmoided product-score, normalized-share score) and average them; choose argmax class by aggregated score.
+- Handling ambiguous inputs: when top two shares are close (gap_ratio small), downweight multiplicative rules and use aggregated soft score; if still uncertain, defer to local case-based rule (Strategy B).
+
+Strategy B — Local k-NN / case-based fallback
+- Create an indexed small memory of training examples (including preserved cross-cycle examples) in engineered-feature space (normalized).
+- Distance metric: weighted Euclidean on normalized/shaped features (shares, products, ratios). Optionally use cosine similarity as alternate.
+- Prediction: if nearest neighbor within small radius → return neighbor class; else use main rule ensemble.
+- Benefit: captures localized, irregular patterns that are not well modeled by global thresholds.
+
+Strategy C — Rank + gap-aware tree with dynamic thresholds
+- Compute rank features: index_of_max, index_of_second_max, ratio second_max/max, gap and gap_ratio.
+- Use a small hand-crafted decision tree (depth 3-4) where splits are on rank/gap and a few engineered features (C*D, A+B, E share).
+- Learn dynamic thresholds by small grid search: evaluate a small set of candidate thresholds on preserved examples to find thresholds that reduce glaring errors (searchable because problem scale is small).
+- Handling ties: when gap_ratio < eps, the tree branches into a tie-resolver that compares secondary features (e.g., C*D vs E_share) instead of fixed thresholds.
+
+Strategy D — Discrete / modulo checks + parity detectors (diagnostic)
+- Add low-cost discrete features: parity of A/B/C, last-digit patterns (A%10), sum%2 or sum%3, and small bit tests on integers.
+- Logical structure: after running primary ensemble, run a short diagnostic set of if-statements checking for exact discrete patterns seen in preserved mistakes; if matched, override with mapped class.
+- Use this strategy mainly as a diagnostic: if these discrete checks improve validation on preserved set meaningfully, expand them; otherwise deprioritize.
+
+Operational plan / experiment sequencing for next cycle
+1) Implement Strategy A first (product/normalized features + soft ensemble). Measure change in accuracy and note which previously misclassified groups improve.
+2) Add Strategy B as a fallback for low-confidence or ambiguous cases; evaluate improvement on local patterns.
+3) Integrate Strategy C to refine tie-breaking and learn a few dynamic thresholds by tiny grid search on preserved examples.
+4) Run a diagnostic with Strategy D; keep only discrete rules that demonstrably help.
+5) If time remains, tune ensemble weights via simple grid search over a few preserved/held-out examples.
+
+Metrics to track
+- Overall accuracy (primary).
+- Accuracy by region: high-multiplicative cases (C*D large), multi-dominant cases (two features > 60), near-tie cases (gap_ratio small).
+- Number of memorized overrides needed (aim to reduce).
+- Confidence calibration: frequency when ensemble outputs a clear winner vs. low-confidence ties.
+
+Expected outcomes
+- Improved robustness on multi-dominant and ambiguous inputs via normalized-share and soft ensemble.
+- Better capture of localized idiosyncrasies via k-NN fallback.
+- Fewer brittle threshold errors by making thresholds adaptive (scaled by sum/max) and by using small search to tune critical splits.
+- Diagnostic parity/modulo checks only retained if they provide a clear lift.
+
+If you want, I can prioritize building Strategy A and B in the next iteration and propose concrete feature lists and the exact ordering of rule checks (flowchart-style) to implement.

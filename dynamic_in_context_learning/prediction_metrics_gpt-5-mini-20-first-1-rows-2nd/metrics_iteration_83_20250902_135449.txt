@@ -1,0 +1,305 @@
+PREDICTIVE METRICS - ITERATION 83
+============================================================
+
+Updated Predictive Metrics Report — v3.8.0 (post_0108_03 corrections)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A single-record batch (n == 1) produced a false-negative on Passenger 0108_03 (Pred=False, Actual=True). This was a zero-spend record (all spend channels = 0) with at least one missing non-spend feature (VIP NaN) → imputed_zero_spend pattern. The record slipped through current n==1 gating for zero patterns and the model produced an overconfident negative prediction. This mirrors the prior mid_concentrated_high_spend failure (0108_02): fragile single-record slices at both extremes (very-low spend with missingness, and mid-high concentrated spend) are producing confident but wrong auto-decisions.
+- Root causes (top):
+  1. Single-record batching amplified pooled_prior reliance and allowed model heuristics to dominate without stricter gating.
+  2. Zero-spend + feature missingness (imputed_zero_spend) was not treated as a fragile first-class pattern in gating (or gating rules were not enforced).
+  3. Variance/SE model lacked an explicit missingness term → se_combined underestimated uncertainty.
+  4. Ensemble agreement / gating thresholds for zero/imputed-zero patterns were insufficiently strict.
+  5. Per-record provenance and missing_count were incompletely captured → delayed triage.
+- Why it matters now: These single-record fragile slices (both zero/imputed-zero and mid_concentrated_high_spend) will continue to produce outsized false negatives or false positives unless we:
+  - treat imputed_zero and mid_concentrated as first-class fragile patterns,
+  - increase uncertainty for missing/spend-extreme records,
+  - and enforce strict consensus gating on n==1 cases.
+- Immediate 0–72h priorities (stopgap, must implement):
+  1. Add imputed_zero_spend detection and treat it as fragile: route any n==1 imputed_zero (missing_count > 0) AND Trusted_subslice==False to priority_audit (always) until calibrator retrain.
+  2. For true_zero_spend (sum_spend == 0 & missing_count == 0) AND n==1 AND NOT Trusted_subslice: require extremely strict ensemble_agreement (≥ 0.995–0.998) AND se_combined floor ≥ 0.15 before any auto-decision; otherwise route to priority_audit.
+  3. Add var_missingness term to variance model and increase zero_nontrusted SE-floor (imputed_zero_nontrusted_floor → 0.20, true_zero_nontrusted_floor → 0.15).
+  4. Persist missing_count + imputation flags + batch_snapshot_id + feature_snapshot_hash for every record (CI fail if missing).
+  5. Shadow-deploy these gating changes and run extended CI including 0108_03 and 0108_02.
+
+Direct answers to the six requested questions
+1) Signals that led to this error
+   - n == 1 (single-record batch) → pooled_prior / heuristics dominated.
+   - sum_spend == 0 (zero-spend).
+   - missing_count > 0 (VIP NaN) → imputed_zero_spend (high novelty/missingness).
+   - se_combined underestimated because missingness was not explicitly modeled.
+   - Ensemble agreement gating for this fragile pattern was not enforced, so the model's p_final was allowed to auto-decision.
+2) Decision-rule changes to prevent recurrence
+   - Treat imputed_zero_spend as first-class fragile pattern and ALWAYS route n==1 + imputed_zero + untrusted_subslice to priority_audit until a retrained calibrator proves safe.
+   - For true_zero_spend with n==1 + untrusted_subslice, require very high ensemble_agreement AND se_combined under strict floor to auto-decision; else audit.
+   - Enforce pattern-specific ensemble_agreement thresholds and SE floors for all fragile single-record patterns (mid_concentrated, concentrated_high, micro_concentrated, zero/imputed_zero).
+3) New pattern insights
+   - Zero spend is not guaranteed negative — missingness and other contextual features matter; imputed zeros are particularly novel and non-stationary.
+   - Fragility exists at both ends of spend: zero/imputed-zero and mid-high concentrated spend are separate but equally important fragile slices.
+4) Confidence recalibration summary
+   - Add an explicit var_missingness component and include spend-entropy and missingness interactions in var_combined.
+   - Use pattern-specific SE floors (imputed_zero nontrusted highest). Calibrator must return mean+sd+p10/p90.
+5) Consistency adjustments
+   - Standardize imputation (spend NaN→0) and log missing indicators per-channel and per-record.
+   - Require batch_snapshot_id, scoring_version, feature_snapshot_hash persisted for every record.
+   - Snapshot scorer config per batch and persist for audit.
+6) Metric improvements for edge cases
+   - New canaries: imputed_zero contradictions, true_zero contradictions, n==1 routing ratio.
+   - Per-slice ECE/Brier/FN/FP for zero_spend and spend-bucket tiers.
+   - Active-label seeding for zero/imputed-zero contradictions.
+
+0108_03 — detailed failure chain (what went wrong, why)
+- Record snapshot (canonicalized):
+  - PassengerId 0108_03; HomePlanet=Earth; CryoSleep=False; Cabin=G/19/S; Destination=TRAPPIST-1e; Age=0; VIP=NaN; RoomService=0; FoodCourt=0; ShoppingMall=0; Spa=0; VRDeck=0 => sum_spend=0
+  - missing_count > 0 (VIP NaN) → imputed_zero_spend_flag
+- Failure chain:
+  1. Pattern not routed to priority_audit: imputed_zero_spend was not enforced as fragile in current gating (or gating enforcement failed).
+  2. n == 1 caused pooled_prior and heuristics to dominate, moving model decision toward negative class.
+  3. Variance model lacked missingness penalty → se_combined artificially small.
+  4. Ensemble agreement gating for zero patterns either not present or not enforced → overconfident auto-decision.
+  5. Missing per-record provenance (missing_count, imputed_flag, batch_snapshot_id) slowed triage and delayed corrective logging.
+
+Minimum signals to capture per-record (must persist)
+- n_batch
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile_by_channel, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, missing_count, per_channel_missing_flags
+- imputed_zero_flag (sum_spend == 0 AND missing_count > 0), true_zero_flag (sum_spend == 0 AND missing_count == 0)
+- Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components: μ_global, μ_channel, μ_subslice, μ_spend_bucket; τ components
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- novelty_score
+- applied_logit_shift components
+- p_after_logit_shift, p_final_mean, p_final_uncertainty (sd/p10/p90), se_combined
+- gating_decision + gating_reasons, batch_snapshot_id, scoring_version, feature_snapshot_hash, record_id, label & label_source
+
+Revised pattern definitions (v3.8.0 additions; make first-class)
+- true_zero_spend_flag: sum_spend == 0 AND missing_count == 0
+- imputed_zero_spend_flag: sum_spend == 0 AND missing_count > 0
+- micro_concentrated_flag: 0 < sum_spend ≤ S_low AND top1_share ≥ T_mc AND num_nonzero_channels ≤ 2
+- concentrated_topK_flag: top1_share ≥ T_mc AND num_nonzero_channels ≤ K_thresh
+- mid_concentrated_high_spend_flag: top1_share ≥ T_mc_mid AND sum_spend ≥ S_mid
+- concentrated_high_spend_flag: concentrated_topK_flag AND (spend_zscore ≥ Z_high OR sum_spend ≥ S_high)
+- spend_outlier_flag: spend_zscore ≥ 3 OR spend_percentile ≥ 99
+Rationale: imputed_zero needs separate handling (higher novelty) vs true_zero.
+
+POOLING / pooled_prior (updated & spend- & missing-aware)
+- pooled_prior = (τ_pattern * μ_global + τ_channel * μ_channel + N_subslice * μ_subslice + τ_spend_bucket * μ_spend_bucket + τ_missing * μ_missing_bucket) / (τ_pattern + τ_channel + N_subslice + τ_spend_bucket + τ_missing)
+- Add a μ_missing_bucket / τ_missing so records with high missingness have their own prior signal reducing global overwrite.
+- τ_pattern defaults (v3.8.0): {K1:100, K2:160, K3:220, zero:320, micro:340, mid_concentrated:200, concentrated_high:280}
+- τ_missing default: 140
+Rationale: increase τ for zero pattern and add missingness prior to avoid pooling small n imputed-zero records into the global prior.
+
+DIRECTION-AWARE logit_shift (compressed; safe for zeros)
+- Keep compressed sum_damp (log scaling) to prevent moderate sums from applying large shifts; zeros produce sum_damp ≈ 0.
+- Also add missingness damping: if missing_count > 0, limit magnitude of any pattern δ application (pattern_shift_frac_missing = 0.5).
+- Final logit_shift pipeline (sketch):
+  - raw_sum = log(1 + sum_spend)
+  - sum_damp = clamp(raw_sum / log(1 + S_damp), ε, 1.0)
+  - polarity = 2 * pooled_prior − 1
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - missing_damp = (missing_count > 0 ? missing_shift_frac : 1.0)
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp * missing_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- pattern_shift_frac and δ_pattern tuned per pattern; for imputed_zero apply extra clamp (missing_shift_frac = 0.5).
+Rationale: prevent spurious large shifts on fragile records, and specifically limit shifts for imputed/missing records.
+
+VARIANCE / SE MODEL (explicit, add missingness)
+- New missingness term:
+  - var_missingness = κ_missing * (missing_count / M_scale)^2 * (1 + (1 − spend_entropy))
+    - κ_missing default 0.06, M_scale default 3.0
+- var_spend_extremity as before:
+  - var_spend_extremity = κ_spend * (spend_zscore / Z_scale)^2 * (1 + (1 − spend_entropy))
+    - κ_spend default 0.04, Z_scale = 3.0
+- var_prior, var_ens, var_slice, var_channel, var_pattern, var_novelty_cond as prior spec
+- Combine:
+  - var_combined = var_prior + var_ens + var_novelty_cond + β_slice*var_slice + β_pattern*var_pattern + β_channel*var_channel + var_spend_extremity + var_missingness
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- SE floors (v3.8.0 initial):
+  - trusted_slice_floor = 0.02
+  - true_zero_nontrusted_floor = 0.15
+  - imputed_zero_nontrusted_floor = 0.20
+  - concentrated_nontrusted_floor = {micro:0.15, mid_concentrated:0.12, concentrated_high:0.15}
+  - extreme_novelty_floor = 0.14
+Rationale: explicitly increase uncertainty for missingness-driven novelty (0108_03).
+
+DECISION GATING (updated pseudocode)
+- Definitions:
+  - ensemble_agreement = max_fraction_of_models_predicting_top_class
+  - model_disagreement = 1 − ensemble_agreement
+- thresholds:
+  - agreement_threshold_general = 0.98
+  - accept_se_max = 0.06
+  - pattern_agreement_thresholds (v3.8.0):
+    - zero_true: 0.995
+    - zero_imputed: 0.999 (must audit when n==1)
+    - micro: 0.999
+    - mid_concentrated: 0.995
+    - concentrated_high: 0.998
+- Pseudocode (high-level):
+  1. If Trusted_subslice and p_final_mean ≥ accept_threshold_trusted and se_combined ≤ accept_se_max → auto_accept.
+  2. Else if n == 1 AND pattern_type ∈ fragile_patterns AND NOT Trusted_subslice:
+       - If pattern_type == imputed_zero_spend: → priority_audit (stopgap)
+       - Else (true_zero or other fragile):
+         - Allow auto_accept/auto_reject only if:
+           - ensemble_agreement ≥ pattern_agreement_threshold AND
+           - se_combined ≤ accept_se_max AND
+           - |logit_shift| ≤ δ_pattern*pattern_shift_frac
+         - Otherwise → priority_audit
+  3. Else (general case): apply z-adjusted threshold on p_final_mean using se_combined; route to audit if uncertainty or model_disagreement high.
+Rationale: imputed_zero is high-novelty — immediate audit for single-record untrusted cases.
+
+CALIBRATOR & GLM_FALLBACK (retrain plan)
+- GLM_fallback interactions to include:
+  - zero_true × Age × Cabin_deck × HomePlanet
+  - imputed_zero × missing_count × channel_missing_flags
+  - mid_concentrated × top1_channel × sum_spend_bucket × Age_bucket
+  - concentrated_high × similar interactions
+- Calibrator:
+  - Model: quantile-capable calibrator (LightGBM quantile ensemble or small Bayesian NN) producing p10/p50(p_mean)/p90 and sd.
+  - Grouped CV by (time, top1_channel_id, sum_spend_bucket, missing_bucket) to prevent leakage.
+  - Input features (minimal): p_after_logit_shift, pattern_type, imputed_zero_flag, missing_count, top1_share, spend_zscore, sum_spend_bucket, spend_entropy, novelty_score, pooled_prior, N_subslice, N_channel, ensemble_agreement, CryoSleep, Age_bucket, HomePlanet, Cabin_deck, Destination, per-channel missing_flags
+  - Output: p_final_mean, p_final_uncertainty (sd, p10, p90)
+- Retrain targets & sampling:
+  - Upweight imputed_zero contradictions, true_zero contradictions and mid_concentrated contradictions.
+  - Add targeted active learning label collection for imputed_zero and mid_concentrated slices.
+Rationale: calibrator must internalize missingness and zero interactions to avoid overconfident misses.
+
+MONITORING, METRICS & ALERTS (what to add)
+- New slice monitoring canaries:
+  - imputed_zero_spend contradictions: ECE, Brier, FN rate, FP rate.
+  - true_zero_spend contradictions likewise.
+  - mid_concentrated_high_spend: existing canary.
+  - n==1: fraction auto_accepted, auto_rejected, routed_to_audit; FN/FP rates.
+  - ensemble_agreement histogram & model_disagreement; per-batch audit routing rate.
+- Alerts:
+  - imputed_zero FN rate > 20% above baseline for 24h → immediate block on auto decisions for imputed_zero + urgent triage.
+  - true_zero FN rate > 20% above baseline → block auto_reject for true_zero until investigated.
+  - n==1 audit routing fraction falling below expected threshold → alert.
+  - missing per-record provenance or batch_snapshot mismatches → alert.
+Rationale: detect regressions on fragile slices quickly.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- New CI tests (minimum):
+  - M1..M4 from v3.7.1 preserved (true_zero, micro, concentrated_top1, concentrated_high).
+  - M5 (new): 0108_02 (mid_concentrated_high_spend, n==1, untrusted) → priority_audit
+  - M6 (new): 0108_03 (imputed_zero_spend, n==1, untrusted) → priority_audit
+  - Trusted subslice variations → allow calibrated auto-decisions
+- Validation experiments:
+  - Retrain calibrator & GLM_fallback with grouped CV; test on held-out historical contradictions including imputed_zero and mid_concentrated.
+  - Shadow deploy updated scorer (imputed_zero gating + compressed sum_damp + raised floors) for 2 weeks; measure audit queue, per-slice FN/FP and ECE.
+- Acceptance targets (relative to baseline v3.7.x):
+  - imputed_zero contradictions: ≥40% relative reduction in contradictions on historical data.
+  - true_zero contradictions: ≥30% relative reduction.
+  - mid_concentrated contradictions: ≥30% reduction (as before).
+  - overall FN increase ≤3 percentage points (aim ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+Rationale: measurable reductions on fragile slices while limiting audit overload.
+
+OPERATIONAL ACTIONS (0–72 hours) — prioritized
+1. Engineering (immediate, 0–24h):
+   - Implement imputed_zero and true_zero detectors; compute missing_count and per-channel missing flags.
+   - Persist missing_count, imputation_flags, batch_snapshot_id, scoring_version, feature_snapshot_hash per record.
+   - Enforce imputed_zero single-record stopgap: route to priority_audit.
+2. Scoring engine (stopgap shadow, 24–48h):
+   - Enforce strict n==1 gating for fragile patterns (imputed_zero, true_zero, micro_concentrated, mid_concentrated, concentrated_high).
+   - Add var_missingness to variance calculation and raise SE floors for imputed_zero.
+   - Replace any linear sum_damp with log-compressed sum_damp; apply missingness dampening on δ application.
+   - Persist per-record provenance into audit logs (required for triage).
+   - Shadow this scorer and validate CI tests (including 0108_03).
+3. ML (24–72h):
+   - Retrain GLM_fallback + calibrator including zero/imputed_zero interactions and missingness terms; calibrator must return uncertainty/quantiles.
+   - Start active learning labeling for imputed_zero and mid_concentrated contradictions.
+4. Ops & Monitoring (24–72h):
+   - Deploy new dashboards & canaries for imputed_zero, true_zero and mid_concentrated slices; add alerts.
+   - Block full live rollout until shadow meets acceptance criteria for at least 72h.
+5. Product / Audit (24–72h):
+   - Create fast-label workflows for imputed_zero contradictions to accelerate slice trust growth and reduce audit backlog.
+   - Triage pipeline: escalate suspected label/record mismatches and batch_snapshot issues.
+
+PER-RECORD PROVENANCE TO LOG (must persist)
+- batch_snapshot_id, scoring_version, passenger_id, record_id
+- pattern_type (true_zero/imputed_zero/micro/mid_concentrated/concentrated_high/etc.)
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, missing_count, per-channel_missing_flags
+- Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components (global, channel, subslice, spend_bucket, missing_bucket) + final pooled_prior
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- applied_logit_shift: {polarity, δ_pattern, sum_damp, missing_damp, dis_damp, novelty_scale, logit_shift_value}
+- p_after_logit_shift, p_final_mean, p_final_uncertainty (sd/p10/p90), se_combined
+- gating_decision and gating_reasons (audit/auto_accept/auto_reject + checks)
+- label and label_source (if available)
+- feature_snapshot_hash, run_timestamp
+
+HYPERPARAMETERS (v3.8.0 initial; sweepable)
+- S_low = 50
+- T_mc = 0.75
+- T_mc_mid = 0.60
+- S_mid = 500
+- S_high = 1000
+- Z_mid = 2.0
+- Z_high = 3.0
+- S_damp = 200 (log scaling denom)
+- τ_pattern (v3.8.0): {K1:100, K2:160, K3:220, zero:320, micro:340, mid_concentrated:200, concentrated_high:280}
+- τ_channel = 120
+- τ_spend_bucket = 80
+- τ_missing = 140
+- δ_logit_pattern = {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40, mid_concentrated:0.50, concentrated_high:0.45}
+- imputed_zero_nontrusted_floor = 0.20
+- true_zero_nontrusted_floor = 0.15
+- agreement_thresholds (v3.8.0): zero_true:0.995, zero_imputed:0.999, micro:0.999, mid_concentrated:0.995, concentrated_high:0.998
+- w_dis = 0.80
+- κ_spend = 0.04, Z_scale = 3.0
+- κ_missing = 0.06, M_scale = 3.0
+
+CI TESTS (explicit expected outcomes, include 0108_03)
+- 0103_02 (true_zero_spend, untrusted, n==1) → priority_audit
+- 0103_01 (micro_concentrated, untrusted, n==1) → priority_audit
+- 0102_01 (concentrated_top1, untrusted, n==1) → priority_audit
+- 0107_01 (concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_02 (mid_concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_03 (imputed_zero_spend, untrusted, n==1) → priority_audit (new)
+- Trusted subslice variations → allow calibrated auto-decisions
+- Preserve earlier regression tests
+
+MONITORING & ALERTING (exact triggers)
+- imputed_zero FN rate > 20% above baseline for 24h → block auto_reject/auto_accept and alert triage
+- true_zero FN rate > 20% above baseline for 24h → block auto_reject and alert
+- mid_concentrated FN rate > 20% above baseline → block auto_* for that slice
+- n==1 audit routing fraction < expected threshold → alert
+- mismatch between batch_snapshot_id and per-record provenance → alert
+
+ACCEPTANCE CRITERIA (post-deploy shadow -> live)
+- imputed_zero contradictions: ≥40% relative reduction
+- true_zero contradictions: ≥30% reduction
+- mid_concentrated contradictions: ≥30% reduction
+- concentrated_high_spend contradictions: ≥30–40% reduction
+- overall FN increase ≤3% absolute (aim ≤1%)
+- Audit queue ≤1.5× baseline for first 2 weeks, trending back to baseline
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.8.0) implementing:
+   - imputed_zero & true_zero detection + missing_count computation
+   - symmetric n==1 gating for fragile patterns and immediate stopgap for imputed_zero
+   - compressed sum_damp + missingness dampening + reduced δ for fragile patterns
+   - var_missingness & raised SE floors for zero/imputed_zero
+   - mandatory per-record provenance logging + snapshotable config
+2. Minimal CI test suite extending v3.7.1 with 0108_02 and 0108_03 expectations.
+3. Updated slice_trust_table seeding script with per-channel + spend_bucket + missing_bucket aggregation.
+4. GLM_fallback + calibrator retrain plan & grouped CV validation report (including quantile outputs).
+5. Dashboards & canary configuration for imputed_zero, true_zero, mid_concentrated slices.
+6. Active learning labeling plan for imputed_zero & mid_concentrated contradictions.
+
+One-line summary
+v3.8.0: Treat imputed_zero as first-class fragile pattern (auto-audit n==1 untrusted), broaden fragile-pattern gating (include true_zero/mid_concentrated), add explicit missingness-driven variance and missing-bucket priors, compress spend-driven logit shifts, require stricter ensemble consensus for single-record fragile cases, enforce per-record provenance, retrain calibrator to return uncertainty, and shadow-deploy to eliminate errors like 0108_03 and 0108_02.
+
+Recommended immediate artifact to prepare first
+- Produce the deterministic scorer skeleton + updated CI test suite (includes 0108_02 and 0108_03 expectations). Rationale: this change is lightweight to implement, shadowable, and provides immediate protection (imputed_zero stopgap + strict n==1 gating + required provenance logging) while the calibrator / GLM retraining proceeds.
+
+If you’d like I can:
+- prepare the deterministic scorer skeleton + CI test updates now (recommended), or
+- prepare the slice_trust_table seeding + aggregation script in parallel.
+
+Which should I prepare first?
+
+============================================================

@@ -1,0 +1,124 @@
+PREDICTIVE METRICS - ITERATION 2
+============================================================
+
+Of course. As an adaptive learning system, I have integrated the feedback from the prediction error for Passenger 0020_01. This single error is highly informative and necessitates a significant recalibration of our predictive framework.
+
+### **Analysis of the Prediction Error**
+
+**1. What specific patterns in the current metrics led to this prediction error?**
+The error was directly caused by the over-reliance and over-confidence placed on **Rule 1: The CryoSleep Rule**. The initial analysis, based on a small sample of 20 passengers, observed a 100% correlation (`5 out of 5`) between `CryoSleep=True` and `Transported=True`. This led to a "Very High" (98%) confidence level and a prediction of `True` for any passenger in cryosleep. Passenger 0020_01, who was in cryosleep but was not transported, is a definitive counterexample that disproves this absolute rule. The initial model failed to account for potential confounding variables or edge cases that could break this correlation.
+
+**2. How should the decision rules be modified to prevent similar errors?**
+The hierarchy must be modified to no longer treat CryoSleep as a standalone, absolute rule. Instead, it must be integrated into a more nuanced, probabilistic framework that checks for exceptions. The key modification is the introduction of a **CryoSleep Override Rule** that precedes the main CryoSleep rule. This new rule will check for specific conditions that, even if CryoSleep is True, indicate a high probability of *not* being transported.
+
+**3. What new insights does this error reveal?**
+This error reveals several critical, previously hidden insights:
+*   **CryoSleep is not a guarantee:** The transport mechanism is more complex than simply "asleep = transported, awake = not." There are underlying factors that can prevent transport even for passengers in stasis.
+*   **Age is a critical modifier:** The passenger in question is an infant (`Age=1.0`). This suggests that **very young passengers in CryoSleep** might be part of a special case, perhaps related to safety protocols, biological incompatibility with long-term stasis transport, or family group dynamics we have not yet decoded.
+*   **Cabin location may hold a key:** The cabin is `E/0/S`. This specific location (Deck E, Side S) might be significant. Our initial analysis noted Deck F/G and Side S were common in transported passengers, but this error shows that exceptions exist on other decks. The cabin number `0` is also highly unusual and warrants investigation as a potential outlier or error flag.
+
+**4. How should confidence levels be recalibrated?**
+All confidence levels must be significantly reduced to reflect the inherent uncertainty in a small, evolving dataset. A single error on a sample of 20 reduces the accuracy of our strongest rule from 100% to 95% (19/20), but realistically, our confidence should be much lower as we've discovered a new class of exception. Confidence scores will now reflect a **Bayesian** perspective, starting with a lower prior and being more cautious until patterns are confirmed with more data.
+
+**5. What adjustments are needed for better consistency?**
+The system must move from a rigid "first rule that fires" hierarchy to a **weighted scoring system**. Instead of a binary True/False based on one rule, each passenger will accumulate evidence (a score) for and against transport. The final prediction will be based on a threshold applied to this score. This allows multiple weak signals to outweigh a single strong-but-not-absolute signal like CryoSleep.
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT**
+
+**Report Objective:** To provide an adaptive, probabilistic predictive framework that learns from errors. This update integrates the critical failure case of Passenger 0020_01, moving from rigid rules to a weighted evidence model.
+
+**Analysis Basis:** Initial training sample of 20 passengers, plus 1 high-value error case. Confidence levels are now calibrated with higher uncertainty.
+
+---
+
+### **1. Revised Decision Logic: Weighted Evidence System**
+
+The system will assign a **Transport Score** between 0 (Certainly Not Transported) and 10 (Certainly Transported). A score >= 6 predicts `Transported = True`.
+
+**Evidence Rules (Apply all relevant rules and sum the modifiers):**
+
+*   **Rule CR-1: CryoSleep Evidence**
+    *   **Condition:** `CryoSleep == True`
+    *   **Score Modifier:** **+4**
+    *   **Confidence:** **High**. Still a very strong indicator, but not absolute.
+
+*   **Rule CR-1-OVERRIDE: CryoSleep Exception Rule (NEW)**
+    *   **Condition:** `CryoSleep == True` AND `Age < 5`
+    *   **Score Modifier:** **-6** (This directly counteracts and overrides the CryoSleep evidence)
+    *   **Confidence:** **Medium**. Based on a single data point, but it's a critical one. This rule ensures infants in cryo are predicted False.
+    *   **Rationale:** The error case 0020_01. Must be investigated further.
+
+*   **Rule S-1: Zero-Spend Evidence**
+    *   **Condition:** `TotalSpend == 0` (NaNs imputed to 0)
+    *   **Score Modifier:** **+2**
+    *   **Confidence:** **Medium-High**.
+
+*   **Rule S-2: High-Spend Evidence**
+    *   **Condition:** `TotalSpend > 1000`
+    *   **Score Modifier:** **-3**
+    *   **Confidence:** **Medium**.
+
+*   **Rule D-1: Demographic Evidence**
+    *   **Condition:** `Age < 25` AND `HomePlanet` IN `['Earth', 'Mars']`
+    *   **Score Modifier:** **+1**
+    *   **Confidence:** **Low**.
+    *   **Condition:** `Age > 40` AND `HomePlanet == 'Europa'`
+    *   **Score Modifier:** **-1**
+    *   **Confidence:** **Low**.
+
+*   **Rule C-1: Cabin Location Evidence (PRELIMINARY - NEW)**
+    *   **Condition:** `CabinSide == 'S'`
+    *   **Score Modifier:** **+1**
+    *   **Confidence:** **Very Low**. Noted pattern, but the error occurred on Side S.
+    *   **Condition:** `CabinDeck` IN `['F', 'G']`
+    *   **Score Modifier:** **+1**
+    *   **Confidence:** **Very Low**.
+
+**Default Prior Probability:**
+*   **Base Score:** **+1** (Reflecting the historical base rate of ~65%, now represented as a slight positive bias in the scoring system).
+
+---
+
+### **2. Updated Probability Estimates & scoring Examples**
+
+| Passenger Profile | Applied Rules | Total Score | Prediction | Calculated Probability |
+| :--- | :--- | :--- | :--- | :--- |
+| Standard CryoSleep | CR-1 (+4), Base (+1) | 5 | **True** (Leaning) | ~70% |
+| **Error Case: Infant CryoSleep** | **CR-1 (+4), CR-1-OVERRIDE (-6), Base (+1)** | **-1** | **False** | **~15%** |
+| Zero-Spend, Awake | S-1 (+2), Base (+1) | 3 | **False** (Leaning) | ~45% |
+| High-Spender, Europa | S-2 (-3), D-1 (-1), Base (+1) | -3 | **False** | ~25% |
+| Earth, Young, Zero-Spend | S-1 (+2), D-1 (+1), Base (+1) | 4 | **False** (Neutral) | ~55% |
+
+---
+
+### **3. Recalibrated Confidence Levels**
+
+| Rule / Component | Revised Confidence | Rationale |
+| :--- | :--- | :--- |
+| **CryoSleep (CR-1)** | **80%** | Downgraded from 98% due to proven exception. |
+| **CryoSleep Override** | **60%** | Based on a single critical data point. High impact, medium confidence. |
+| **Spending Rules** | **70%** | Remains relatively stable, but overall model uncertainty increases. |
+| **Demographic Rules** | **50%** | Essentially a guess; used for minor score adjustments only. |
+| **Overall Model** | **65%** | Expected accuracy on new data, based on initial performance and error. |
+
+---
+
+### **4. Strategic Recommendations for Batch Prediction Accuracy**
+
+1.  **Implement Weighted Scoring:** Immediately transition the batch prediction system from a hierarchical rule system to the weighted evidence scoring system outlined above. This is the most critical change to prevent similar errors.
+
+2.  **Enhanced Error Logging & Analysis:** For every prediction error, log the passenger's feature set AND the breakdown of their transport score. This will allow us to see which specific rule contributed to the error and adjust its weight or add new override rules.
+
+3.  **Age-based Exception Handling:** Formalize the treatment of age extremes. Create a new feature `AgeGroup` (e.g., Infant: 0-4, Child: 5-12, etc.). The system should be particularly cautious about applying strong rules to outliers like infants and the very elderly.
+
+4.  **Dynamic Confidence Adjustment:** Design the system so that the weight (score modifier) of each rule is automatically adjusted based on its recent accuracy. A rule that consistently contributes to errors should have its impact reduced.
+
+5.  **Improved Missing Data Handling:** For categorical features like `HomePlanet` and `Destination`, imputing with the mode is insufficient. Create a "Unknown" category and assign it a neutral score modifier (0). This is more honest than guessing and allows the model to rely on other, more complete features.
+
+6.  **Batch-level Sanity Checking:** After processing a batch, run a check for predictions that are high-confidence but violate the new exception rules (e.g., any CryoSleep=True and Age<5 predicted as True). Flag these for immediate human review before finalizing the batch output.
+
+This updated framework is more robust, probabilistic, and explicitly designed to learn from its mistakes. It reduces overconfidence and provides a clear pathway for continuous integration of new data and error feedback.
+
+============================================================

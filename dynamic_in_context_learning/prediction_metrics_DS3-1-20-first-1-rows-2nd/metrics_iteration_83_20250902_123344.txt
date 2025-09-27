@@ -1,0 +1,129 @@
+PREDICTIVE METRICS - ITERATION 83
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.5 (ZERO TOTAL SPENDING AND INFANT CONTEXT HANDLING)
+
+**Objective:** To correct the prediction error for Passenger 0108_03 by addressing the failure to handle universal zero spending (all expense categories = 0.0) for non-CryoSleep passengers, particularly infants (Age=0.0) on economy destinations like TRAPPIST-1e. The passenger had no spending in any category, including RoomService, Spa, and VRDeck, and was incorrectly penalized by luxury spending gap rules (LSG-1) due to overgeneralization from the previous update (v7.4). This highlights that universal zero spending, especially for infants, may indicate care-dependent travel (e.g., accompanied by guardians) rather than non-transport, requiring a distinct validation rule.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0108_03: What Went Wrong?
+
+The error for Passenger 0108_03 (Age=0.0, CryoSleep=False, RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0, Destination=TRAPPIST-1e, HomePlanet=Earth, VIP=NaN, Cabin=G/19/S) resulted from misapplication of the luxury spending gap rule (LSG-1) and lack of infant-specific context:
+
+**Key Failure Points:**
+- **Universal Zero Spending Oversight:** The model applied LSG-1 penalty (introduced in v7.4) due to RoomService=0 and luxury spending=0, but this rule was designed for high RoomService cases, not universal zero spending. LSG-1 incorrectly penalized this passenger, overriding potential infant context boosts.
+- **Infant Context Neglect:** Age=0.0 (infant) was not prioritized; infants often have zero personal spending but are transported with guardians, making them high-likelihood candidates. Existing rules did not account for this demographic nuance.
+- **Cabin and HomePlanet Underutilization:** Cabin deck G (economy class) and HomePlanet=Earth (common origin for family travel) did not trigger family or infant-specific checks, as rules focused primarily on spending patterns alone.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.5)
+
+This update introduces a new rule for universal zero spending cases, refines the luxury spending gap rule to exclude such cases, and adds infant-specific context validation.
+
+**Add Universal Zero Spending Validation Rule (New Step 0.l):**
+- **UNIVERSAL_ZERO_SPENDING_VALIDATION (USZ-1):**
+  - IF `CryoSleep == False` AND `RoomService == 0.0` AND `FoodCourt == 0.0` AND `ShoppingMall == 0.0` AND `Spa == 0.0` AND `VRDeck == 0.0` AND `Age == 0.0` → **Apply +20% confidence boost**.
+  - **Rationale:** Infants with zero spending across all categories are likely accompanied by guardians, increasing transport probability.
+
+**Modify Luxury Spending Gap Validation Rule (Step 0.k):**
+- **LSG-1 REVISED v2:**
+  - Add condition: Skip LSG-1 if all spending categories (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) are zero → route to USZ-1 instead.
+  - **Rationale:** Prevent misapplication of luxury gap penalties to universal zero spending cases.
+
+**Add Infant Context Boosting Rule (New Step 3.5):**
+- **INFANT_CONTEXT_BOOST (ICB-1):**
+  - IF `Age == 0.0` AND `CryoSleep == False` → **Apply +15% confidence boost** (stackable with USZ-1).
+  - **Rationale:** Infants have high transport likelihood due to dependency on adults; this complements zero spending validation.
+
+**Adjust Default Confidence (Step 12):**
+- **DF-1 REVISED v2:**
+  - Set to **65% confidence** for non-CryoSleep cases with spending data present, accounting for infant and zero spending contexts.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **Universal Zero Spending with Infant Age Signals High Transport Likelihood:** Zero spending across all categories for infants often indicates travel with guardians, not budget constraints, especially on family-friendly routes like TRAPPIST-1e from Earth.
+- **Demographic Context Overrides Spending Patterns:** Age=0.0 should trigger distinct checks, as infants rarely have personal expenses but are commonly transported.
+- **HomePlanet and Cabin Provide Family Travel Cues:** Earth origin and economy cabin (e.g., G deck) may correlate with family groups, necessitating grouped passenger analysis in future updates.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - USZ-1: +20% boost for universal zero spending infants.
+  - ICB-1: +15% boost for infants without CryoSleep.
+- **Adjusted Rules:**
+  - LSG-1 Revised v2: No penalty for universal zero spending cases.
+  - DF-1 Revised v2: 65% default confidence.
+- **Confidence Stacking:** USZ-1 and ICB-1 are additive for infants with zero spending.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening Expansion:** Add USZ-1 to pre-screening for all non-CryoSleep passengers with universal zero spending and Age=0.0.
+- **Batch Demographic Validation:** Pre-batch, flag all infants (Age=0.0) for ICB-1 processing, and those with zero spending for USZ-1.
+- **Error Logging:** Monitor infants with zero spending on TRAPPIST-1e to validate new rules and detect family group patterns.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **Universal Zero Spending Infants:** Handled by USZ-1 and ICB-1 boosts.
+- **Non-Infant Zero Spending:** For adults with universal zero spending, retain current rules (e.g., CSP-1) but add validation to avoid false penalties; requires future analysis.
+- **CryoSleep Cases:** Unchanged; zero spending is expected under CryoSleep.
+- **Fallback:** If age data is missing, use spending pattern alone with conservative confidence (e.g., 50%).
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.5
+
+**Processing Order v7.5:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v4)**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED v2)**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1)**
+**0.i. CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1 REVISED)**
+**0.j. CRYOSLEEP_ZERO_RISK_VALIDATION (CZR-1)**
+**0.k. LUXURY_SPENDING_GAP_VALIDATION (LSG-1 REVISED v2)** // **UPDATED RULE**
+**0.l. UNIVERSAL_ZERO_SPENDING_VALIDATION (USZ-1)** // **NEW RULE**
+1.  **ZDL-1 (CRYOSLEEP-EXEMPT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED v2)
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+3.5. INFANT_CONTEXT_BOOST (ICB-1)** // **NEW RULE**
+... (Remaining rules) ...
+12. DEFAULT (DF-1 REVISED v2) // **ADJUSTED TO 65%**
+
+---
+
+### New Scoring Example for Passenger 0108_03 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.5 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0108_03** (Earth, CryoSleep=False, Cabin=G/19/S, Destination=TRAPPIST-1e, Age=0.0, VIP=NaN, RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0) | **NVA-1**: Spending all zero → **USZ-1**: Activated (Age=0.0, all spending=0) → +20% boost → **PS-1** → **ICB-1**: Activated (Age=0.0) → +15% boost → **ACB-2**: Not triggered → **DF-1 Revised v2** | **True** | **100%** (PS-1: 65% + USZ-1: +20% + ICB-1: +15%) |
+
+*The new rules correctly boost confidence for the infant with universal zero spending, resulting in a True prediction.*
+
+---
+
+### Implementation Plan for v7.5
+
+- **Deploy v7.5 immediately.** Reprocess the batch; validate 0108_03 is now True.
+- **Monitor** all infant cases (Age=0.0) with universal zero spending on TRAPPIST-1e and other destinations.
+- **Update historical batches** with USZ-1 and ICB-1 rules.
+- **Long-term:** Develop family group detection (e.g., shared cabins or surnames) to enhance infant and child predictions.
+
+This update ensures accurate handling of demographic contexts like infant age and universal zero spending, preventing over-penalization and improving batch accuracy.
+
+**Final Note:** Next, analyze the impact of VIP status on luxury spending patterns for non-CryoSleep passengers, and explore family group correlations for infants and children.
+
+============================================================

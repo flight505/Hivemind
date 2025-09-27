@@ -1,0 +1,45 @@
+PREDICTIVE RULES - ITERATION 5
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. Compute total_onboard_spend = (RoomService + FoodCourt + ShoppingMall + Spa + VRDeck) treating missing/NaN as 0; compute food_spend = (RoomService + FoodCourt) and treat missing as 0.
+
+2. CryoSleep zero‑spend primary rule: If CryoSleep is True AND total_onboard_spend == 0 then:
+   a) If Destination == "PSO J318.5-22" then Predict Transported = False.
+   b) Else if any cabin mate (same deck/number/side) has non‑zero total_onboard_spend then Predict Transported = False.
+   c) Else if HomePlanet is Europa OR HomePlanet is Mars OR Destination in {"TRAPPIST-1e","55 Cancri e"} then Predict Transported = True.
+   d) Otherwise Predict Transported = True.
+
+3. CryoSleep with activity: If CryoSleep is True AND total_onboard_spend > 0 then Predict Transported = False.
+
+4. Strong negative VR / extreme spend signals: If VRDeck >= 5000 OR total_onboard_spend >= 10000 then Predict Transported = False.
+
+5. Spending composition overrides (positive): If (FoodCourt + ShoppingMall) >= 1500 AND (HomePlanet == "Europa" OR Destination == "55 Cancri e") then Predict Transported = True.
+
+6. Spending composition overrides (negative): If food_spend >= 3000 AND HomePlanet == "Earth" then Predict Transported = False.
+
+7. VR dominance negative signal: If VRDeck >= 0.6 * total_onboard_spend AND VRDeck >= 2000 then Predict Transported = False (VR‑dominated heavy users are much less likely transported).
+
+8. Age extremes positive signals: If Age <= 10 then Predict Transported = True; if Age >= 55 then Predict Transported = True.
+
+9. Child/guardian propagation: If 3 <= Age <= 17 AND there is at least one cabin mate aged >= 18 who is predicted Transported = True by any strong rule (CryoSleep zero‑spend TRUE per rule 2c, Age extremes, or rule 5) then Predict Transported = True (children follow guardians).
+
+10. VIP handling (moderate): If VIP is True AND (CryoSleep is True OR total_onboard_spend == 0) then Predict Transported = True. Do NOT automatically set VIP with non‑zero spend to False; apply spending/homeplanet/destination rules instead.
+
+11. HomePlanet × Destination context: Use HomePlanet and Destination jointly before deciding on borderline spending cases — specifically, favor Transported = True for high food/shopping spend when HomePlanet == Europa or Destination == "55 Cancri e", and favor Transported = False for very high food spend when HomePlanet == Earth (rules 5 and 6 above are concrete embodiments).
+
+12. Cabin group consistency with strong signal propagation: For passengers sharing the same Cabin identifier, assign the same Transported outcome to all cabin mates by resolving as follows:
+    a) If any cabin mate triggers a "strong True" condition (CryoSleep zero‑spend with Europa/Mars or TRAPPIST/55 rule 2c, Age <=10, Age >=55, or rule 5) then Predict Transported = True for entire cabin.
+    b) Else if any cabin mate triggers a "strong False" condition (rule 4 or rule 7 or rule 6) then Predict Transported = False for entire cabin.
+    c) Else use the majority of individual signals (from the other rules) for the cabin; if tied, go to fallback.
+
+13. Mixed‑signal resolution priority: When rules conflict, apply priorities: (1) strong negative signals (rule 4, rule 7), (2) CryoSleep zero‑spend with clear planetary/destination support (rule 2c), (3) Age extreme signals (rule 8), (4) HomePlanet×spend positive signals (rule 5), (5) remaining moderate spending rules (rule 6). Higher priority wins.
+
+14. Missing or ambiguous data: When Age is missing, rely more heavily on cabin propagation (rule 12), HomePlanet × Destination context (rule 11), and spending composition (rules 4–7) rather than defaulting on CryoSleep alone.
+
+15. Preserve conservative defaults: Only label non‑transported (False) on clear negative evidence (strong VR dominance or extreme total spend or Earth‑high‑food pattern); avoid marking False solely because of moderate non‑zero spending when other positive signals (child, senior, Europa/Mars origin, 55 Cancri e destination, or coherent cabin signals) are present.
+
+16. Default fallback: If none of the above rules applies or information is insufficient to trigger a higher‑priority rule, Predict Transported = False.
+
+============================================================

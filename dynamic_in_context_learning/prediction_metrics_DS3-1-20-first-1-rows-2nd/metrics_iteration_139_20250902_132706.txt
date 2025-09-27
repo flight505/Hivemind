@@ -1,0 +1,130 @@
+PREDICTIVE METRICS - ITERATION 139
+============================================================
+
+### **UPDATED PREDICTIVE METRICS REPORT v16.1**
+**PRIORITY ENHANCEMENT: INFANT & YOUNG CHILD CONTEXT REFINEMENT**
+
+---
+
+### **1. Analysis of Prediction Error for Passenger 0179_03**
+
+#### **Passenger Profile (New Error Case):**
+-   **PassengerId:** 0179_03
+-   **HomePlanet:** Earth
+-   **CryoSleep:** False
+-   **Cabin:** G/26/P
+-   **Destination:** TRAPPIST-1e
+-   **Age:** 3.0 (Young Child)
+-   **VIP:** False
+-   **Spending:** All services = 0.0
+-   **TotalSpend:** 0.0
+-   **Name:** Sallyl Webstephrey
+
+#### **Root Cause of Predictive Error (v16.0 Logic Gap):**
+The v16.0 update introduced the critical AIO-1 rule for infants (Age=0.0) but failed to adequately address the broader demographic of **young children (Age > 0.0 and ≤ 5.0)**. The system still applies modified adult-centric rules to this group, leading to a misclassification for Passenger 0179_03. This highlights that the "zero-spend" pattern is not exclusive to infants and cryosleep passengers but is also strongly characteristic of young children.
+
+**Summary of the Faulty v16.0 Logic Chain for 0179_03:**
+1.  **AIO-1:** `Age = 3.0` (not 0.0) → Skipped. **Correct but insufficient.**
+2.  **ZSV-1 v7:** `TotalSpend == 0.0` AND `Age > 0.0` → Condition met. Applied **+20% confidence for `Transported=True`**.
+3.  **DCP-3:** `Destination == "TRAPPIST-1e"` AND `Age > 0.0` AND `HomePlanet = "Earth"` → Condition met. Applied **-15% penalty for `Transported=False`**.
+4.  **LSE-2:** `HomePlanet == "Earth"` AND `CryoSleep == False` AND `TotalSpend >= 0.0` AND `TotalSpend < 1200` AND `Age > 0.0` → Condition met. Applied **+30% confidence for `Transported=True`**.
+5.  **Final Erroneous Prediction ("False"):** The net confidence calculation was likely dominated by the strong negative signal from DCP-3 (-15%), which was not sufficiently counteracted by the positive signals from ZSV-1 v7 (+20%) and LSE-2 (+30%) for this specific case. The cumulative confidence probably fell slightly below the threshold (e.g., ~0.47), resulting in a `False` prediction against the actual `True` outcome.
+
+**What the Correct Logic Must Enforce:**
+**Young children (0 < Age ≤ 5.0) with zero spending represent a high-probability group for `Transported=True`, nearly as strong as infants but with some modulation by other factors.** The system must recognize that destination-based penalties (DCP-3) are far less relevant for young children than for adults. The strong positive signals from zero-spend rules (ZSV-1 v7, LSE-2) should be weighted more heavily for this age group.
+
+---
+
+### **2. Critical Modifications to Decision Rules (v16.1 ENHANCEMENT)**
+
+The system requires an extension of the age-based logic to include young children and significant refinements to how destination context and zero-spend rules interact with this demographic.
+
+#### **New and Overhauled Rules:**
+-   **AGE_IMMUTABLE_OVERRIDE (AIO-1) - RETAINED:**
+    -   **Condition:** `Age == 0.0`
+    -   **Action:** **Override all subsequent logic. Assign `Transported = True` with 99% confidence.**
+    -   **Priority:** Executes immediately after cryosleep rules (CSSV-2).
+
+-   **YOUNG_CHILD_ZERO_SPEND (YCZ-1) - NEW RULE:**
+    -   **Condition:** `Age > 0.0` AND `Age <= 5.0` AND `TotalSpend == 0.0`
+    -   **Action:** Apply a **+50% confidence for `Transported=True`**.
+    -   **Priority:** Insert immediately after AIO-1.
+    -   **Rationale:** Captures the very high survival probability of young children with no spending, who are typically prioritized alongside infants. This rule should dominate the prediction for this demographic.
+
+-   **Update ZERO_SPENDING_VALIDATION (ZSV-1 v7) -> ZSV-1 v8:**
+    -   **New Condition:** `TotalSpend == 0.0` AND `Age > 5.0` // Now applies only to passengers older than 5
+    -   **Action:** Apply a **+20% confidence for `Transported=True`**.
+    -   **Rationale:** Now correctly focused on older children and adults, where zero spending is less definitively tied to transport.
+
+-   **Update DESTINATION_CONTEXT_PRIMACY (DCP-3) -> DCP-4:**
+    -   **New Condition:** (`Destination == "TRAPPIST-1e"`) AND `Age > 5.0` // Now applies only to passengers older than 5
+    -   **Action:** The planet-modulated penalty remains but is now restricted to a more relevant demographic:
+        -   `HomePlanet == "Earth"`: **-15%** for `Transported=False`.
+        -   `HomePlanet == "Europa"`: **-30%**.
+        -   `HomePlanet == "Mars"` or other: **-40%**.
+    -   **Rationale:** Prevents the destination penalty from being applied to young children, for whom it is not a primary factor.
+
+-   **Update LOW_SPEND_EARTH_CONTEXT (LSE-2) -> LSE-3:**
+    -   **New Condition:** `HomePlanet == "Earth"` AND `(CryoSleep == False OR Inferred_CryoSleep == False)` AND `TotalSpend >= 0.0` AND `TotalSpend < 1200` AND `Age > 5.0` // Now excludes young children
+    -   **Action:** Apply a **+30% confidence boost for `Transported=True`**.
+    -   **Rationale:** Focuses this Earth-specific boost on older passengers.
+
+#### **Processing Order Overhaul (v16.1):**
+The rule hierarchy is updated to prioritize age-based segmentation.
+1.  GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)
+2.  GLOBAL: CRYOSLEEP_NAN_INFERENCE (CNI-1)
+3.  GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-4)
+4.  GLOBAL: CRYOSLEEP_SPENDING_VALIDATION (CSSV-2)
+5.  **GLOBAL: AGE_IMMUTABLE_OVERRIDE (AIO-1)**
+6.  **GLOBAL: YOUNG_CHILD_ZERO_SPEND (YCZ-1) // NEW**
+7.  GLOBAL: NAN_CRYOSLEEP_ZERO_SPEND (NCZS-1)
+8.  GLOBAL: EXTREME_SPENDING_PATHWAY (ESP-1)
+9.  GLOBAL: LOW_SPEND_EARTH_CONTEXT (LSE-3) // UPDATED
+10. GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1 v5)
+11. GLOBAL: MIXED_SPENDING_PATTERN_ANALYSIS (MSPA-3)
+12. GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-4) // UPDATED
+13. GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)
+14. GLOBAL: ZERO_SPENDING_VALIDATION (ZSV-1 v8) // UPDATED
+15. ... (other rules)
+16. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**
+-   **Insight 13: Age Segmentation is Multi-Tiered.** The system must recognize at least three distinct age-based cohorts: 1) Infants (Age=0.0, near 100% transport), 2) Young Children (0 < Age ≤ 5.0, very high transport probability), and 3) Older Passengers (Age > 5.0, variable probability). Each requires different rule weighting.
+-   **Insight 14: Family Unit Dynamics.** Passengers 0179_02 (infant, supposedly not transported) and 0179_03 (young child, transported) share a cabin (G/26/P) and surname (Webstephrey), suggesting they are part of a family group. **The system should develop family-based correlation rules in future versions** to handle group evacuation patterns.
+-   **Insight 15: Destination Penalty is Age-Sensitive.** The negative impact of certain destination-planet combinations (e.g., Earth to TRAPPIST-1e) is significantly weaker for children under 5 than for adults, and nearly irrelevant for infants.
+
+---
+
+### **4. Confidence Level Recalibration**
+-   **AIO-1 Confidence:** Retain **+99% for `Transported=True`** for infants.
+-   **YCZ-1 Confidence:** Apply **+50% for `Transported=True`** for young children (0 < Age ≤ 5.0) with zero spend.
+-   **ZSV-1 v8 Confidence:** Retain **+20% for `Transported=True`** for passengers older than 5 with zero spend.
+-   **DCP-4 Confidence:** Retain planet-modulated penalties but now restricted to **passengers older than 5**.
+-   **Confidence Threshold:** Maintain the **0.48 - 0.52** range for definitive predictions.
+
+---
+
+### **5. Adjustments for Batch Prediction Consistency**
+-   **Enhanced Batch Pre-Screening Profile:** Now includes:
+    -   Count of passengers by `Age == 0.0`.
+    -   Count of passengers by `Age > 0.0 AND Age <= 5.0`.
+    -   This allows for instant verification that the AIO-1 and YCZ-1 rules will trigger appropriately.
+-   **Cross-Rule Validation Enhanced:** Now ensures that if `AIO-1 == True` or `YCZ-1 == True`, no subsequent rule except BPF-1 can negatively modify the prediction outcome. Positive modifications from other rules are still allowed for YCZ-1 cases.
+-   **Family Group Tagging:** The system now tags passengers sharing Cabin and Surname as potential family units for offline analysis and future rule development.
+
+---
+
+### **6. Handling of Edge Cases**
+The v16.1 update adds a dedicated pathway for young children and refines the handling of family groups:
+1.  **The Infant Pathway (AIO-1):** Highest priority. Handles all passengers with `Age=0.0`.
+2.  **The Young Child Pathway (YCZ-1):** Second highest priority. Handles passengers with `0 < Age ≤ 5.0` and `TotalSpend=0.0`.
+3.  The NaN Pathway (CNI-1/NCZS-1): Handles data missingness.
+4.  The Extreme Spending Pathway (ESP-1): Handles data outliers (high).
+5.  The Low-Spend Earth Pathway (LSE-3): Handles a specific high-probability demographic (Age > 5.0).
+6.  The Standard Pathway (HSNO-1, DCP-4, etc.): Handles the remaining majority of cases (Age > 5.0).
+
+**Conclusion:** The error for passenger 0179_03 revealed that the model's age segmentation was incomplete. **Young children (0 < Age ≤ 5.0) represent a distinct high-probability group that requires specialized rules.** The v16.1 enhancements introduce the YCZ-1 rule and refine other rules to avoid misapplication of adult logic to young children. This ensures maximum accuracy for all vulnerable age groups and improves overall batch prediction consistency. The new hierarchy of features is: 1) **Age (0.0)**, 2) **Age (0.1-5.0)**, 3) CryoSleep, 4) Extreme Spending, 5) Planetary Origin, 6) Destination/Spending.
+
+============================================================

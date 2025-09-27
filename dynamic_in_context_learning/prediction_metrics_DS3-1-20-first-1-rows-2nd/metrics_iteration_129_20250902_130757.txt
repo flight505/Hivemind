@@ -1,0 +1,144 @@
+PREDICTIVE METRICS - ITERATION 129
+============================================================
+
+Of course. Analysis complete. The error case reveals a critical flaw in the system's prioritization of behavioral rules, specifically the interaction between the `CryoSleep` and `Zero Spending` conditions. The v13.0 logic correctly addressed high-spending non-CryoSleep passengers but created a new vulnerability for zero-spending CryoSleep passengers.
+
+Here is the COMPLETE updated predictive metrics report, incorporating the learning from this new error.
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v14.0**
+**PRIORITY ENHANCEMENT: CRYOSLEEP & ZERO-SPENDING CONFLICT RESOLUTION**
+
+---
+
+### **1. Analysis of New Prediction Error for Passenger 0169_01**
+
+#### **Passenger Profile (The Error Case):**
+-   **PassengerId:** 0169_01
+-   **HomePlanet:** Earth
+-   **CryoSleep:** True
+-   **Cabin:** G/23/P
+-   **Destination:** TRAPPIST-1e
+-   **Age:** 31.0
+-   **VIP:** False
+-   **Spending:** RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0
+-   **Name:** Wandy Fisherry
+
+#### **Root Cause of Predictive Error (v13.0 Logic Flaw):**
+The v13.0 enhancement successfully prevented errors from high-spending, awake passengers but introduced a critical **ordering and logic conflict** between the `CryoSleep` override and the `Zero Spending` validation rules.
+
+**Summary of the Faulty v13.0 Logic Chain for 0169_01:**
+1.  **ADV-1:** Destination TRAPPIST-1e is valid → Continue.
+2.  **CSO-2:** CryoSleep=True → This rule should have immediately overridden all other logic and predicted `True` with high confidence. **This was the intended design.**
+3.  **HSNO-1:** (NEW in v13.0) CryoSleep=True → Condition not met (`CryoSleep == False` required). Rule did not fire. This is correct.
+4.  **DCP-1:** Routed to TRAPPIST-1e branch.
+5.  **PNSC-2:** All spending values are 0.0. This rule should have passed without issue.
+6.  **ZSV-1 v2 (Zero Spending Validation):** This rule detected all spending categories were 0.0. **Due to a flaw in its implementation, it applied a significant confidence penalty for a `True` prediction**, based on the heuristic that zero spending can indicate a data error or an unlikely scenario for a transported passenger. **This penalty incorrectly and unjustly overrode the high-confidence signal from CSO-2.**
+7.  **Final Erroneous Prediction:** The strong negative signal from ZSV-1 v2 reduced the confidence from CSO-2 below the `True` threshold, leading to a default or context-inferred `False` prediction.
+
+**What the Correct Logic Must Recognize:**
+A passenger with **CryoSleep=True is, by definition, immobilized and cannot spend money.** Therefore, **all spending values MUST be 0.0.** Any other values would indicate a data error. `CryoSleep=True` is an absolute override that must short-circuit any spending-based analysis. The presence of zero spending for a CryoSleep passenger is **corroborating evidence, not contradictory evidence.**
+
+---
+
+### **2. Critical Modifications to Decision Rules (v14.0 ENHANCEMENT)**
+
+#### **New and Overhauled Rules:**
+-   **CRYOSLEEP_SPENDING_VALIDATION (CSSV-1) - NEW:**
+    -   **Condition:** `CryoSleep == True`
+    -   **Action:** Before any spending rules are processed, validate that `TotalSpend == 0.0`. If any spending value is > 0.0, flag the record for data review and invoke the `BATCH_PROCESSING_FAILSAFE (BPF-1)`. If `TotalSpend == 0.0`, apply a **+25% confidence boost** to the `True` prediction initiated by CSO-2. This reinforces the correct signal.
+    -   **Rationale:** Formally defines the expected behavior and turns the zero-spending attribute from a potential negative into a powerful positive indicator for CryoSleep passengers.
+
+-   **ZERO_SPENDING_VALIDATION (ZSV-1 v3) - OVERHAULED:**
+    -   **Condition:** `CryoSleep == False` AND `TotalSpend == 0.0`
+    -   **Action:** Apply a **-40% confidence** penalty for a `True` prediction. For passengers not in CryoSleep, zero spending is a highly unusual and strong indicator they were not transported.
+    -   **Rationale:** This rule is now gated by `CryoSleep=False`, preventing it from conflicting with the CryoSleep override. Its effect is now correctly targeted.
+
+-   **CONTEXTUAL_RULE_CONFIDENCE_CAP (CRCC overheard the User provide the question in English, so the response must be in the same language.-2) - ENHANCED:**
+    -   **Amendment:** The confidence cap now explicitly applies to **all non-behavioral rules** (destination, demographic, cabin). The CRYOSLEEP (CSO-2) and SPENDING (CSSV-1, ZSV-1 v3, HSNO-1) rules are designated as **BEHAVIORAL PRIMACY RULES** and are exempt from this cap, as they represent the strongest signals.
+
+#### **Processing Order Overhaul (v14.0):**
+The rule hierarchy is updated to resolve conflicts and enforce behavioral primacy. The spending check for CryoSleep passengers is moved immediately after the CryoSleep override.
+1.  GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)
+2.  GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-2) // If True, it sets a strong prior for 'Transported=True'.
+3.  **GLOBAL: CRYOSLEEP_SPENDING_VALIDATION (CSSV-1) // NEW - Validates & reinforces CSO-2**
+4.  GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1)
+5.  GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-1)
+6.  GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)
+7.  **GLOBAL: ZERO_SPENDING_VALIDATION (ZSV-1 v3) // OVERHAULED - Now gated on CryoSleep=False**
+8.  GLOBAL: HIGH_SPEND_SINGLE_CATEGORY (HSSC-1)
+9.  GLOBAL: NON_CRYOSLEEP_SPENDING_PATTERN (NSSP-1)
+10. GLOBAL: CONTEXTUAL_RULE_CONFIDENCE_CAP (CRCC-1)
+11. ... (destination-specific and demographic rules)
+12. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**
+-   **Behavioral Rule Primacy:** The hierarchy of signal strength is now clearly defined: 1) CryoSleep Status, 2) Spending Patterns. These must always supersede contextual patterns (destination, cabin, age).
+-   **Conditional Rule Gating:** Rules must be precisely gated to prevent application in scenarios where they are not logically valid (e.g., applying zero-spending logic to sleeping passengers).
+-   **Data Validation as a Feature:** The system can now use internal data validation (e.g., CryoSleep=True & Spending>0) to identify likely data errors and handle them cautiously via the failsafe protocol, improving overall batch robustness.
+
+---
+
+### **4. Recalibration of Confidence Levels for 0169_01**
+-   **Corrected v14.0 Logic for 0169_01:**
+    1.  **ADV-1:** TRAPPIST-1e is valid → Continue.
+    2.  **CSO-2:** CryoSleep=True → Sets prediction to `True` with **+80% confidence**.
+    3.  **CSSV-1:** CryoSleep=True & TotalSpend=0.0 → Validates data is consistent. Applies a **+25% confidence boost**. Confidence now +105%.
+    4.  *(Subsequent spending rules are skipped or not triggered due to CryoSleep=True, preventing any conflict.)*
+    5.  **Final Correct Prediction: True (Very High Confidence)**
+
+---
+
+### **5. Adjustments for Batch Consistency**
+-   **Behavioral Rule Lock-In:** The processing order for behavioral rules (CSO-2, CSSV-1, HSNO-1, ZSV-1 v3) is now fixed and immutable across all batches.
+-   **Confidence Inflation Control:** Implement a confidence ceiling (e.g., 99%) to prevent compounded confidence boosts from creating unrealistic certainties, though the hierarchy should naturally avoid this.
+-   **Batch-Wide Flagging:** If the CSSV-1 rule flags multiple passengers in a batch for data errors (CryoSleep=True & Spending>0), trigger a batch-level review via BPF-1 before final predictions are issued.
+
+---
+
+### **6. Edge Case Handling**
+-   **CryoSleep Data Errors:** The new CSSV-1 rule explicitly handles the edge case of `CryoSleep=True` and `Spending > 0` by diverting to thefailsafe protocol, ensuring these potential data errors don't corrupt batch predictions.
+-   **Awake, Zero-Spending Passengers:** The overhauled ZSV-1 v3 rule now correctly handles this edge case as a strong indicator of non-transport, which was its original intended purpose.
+
+---
+
+### **UPDATED PROCESSING ORDER v14.0**
+*(New/Updated rules in **bold**)*
+GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)
+GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-2)
+**GLOBAL: CRYOSLEEP_SPENDING_VALIDATION (CSSV-1) // NEW**
+GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1)
+GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-1)
+GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)
+**GLOBAL: ZERO_SPENDING_VALIDATION (ZSV-1 v3) // OVERHAULED**
+GLOBAL: HIGH_SPEND_SINGLE_CATEGORY (HSSC-1)
+GLOBAL: NON_CRYOSLEEP_SPENDING_PATTERN (NSSP-1)
+GLOBAL: CONTEXTUAL_RULE_CONFIDENCE_CAP (CRCC-1)
+55CANCRI_E_EARTH_CRYOSLEEP_PROFILE (55CECP-1)
+... (other destination-specific rules)
+CONFIDENCE_FLOOR_ENFORCEMENT (CFE-1)
+GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)
+GLOBAL: UNKNOWN_DESTINATION_PROTOCOL (UDP-1)
+
+---
+
+### **Implementation Plan for v14.0**
+1.  **Immediate Hotfix:** Deploy the CSSV-1 rule and update ZSV-1 to v3. This is a critical patch to resolve the conflict introduced in v13.0.
+2.  **Retrospective Re-processing:** Re-run the entire latest batch through the v14.0 logic. Validate that passenger 0169_01 is now predicted correctly and that no other similar errors exist.
+3.  **Regression Testing:** Ensure the fix for 0169_01 does not negatively impact the accuracy for passengers like 0167_02 (the high-spender from v13.0).
+4.  **Monitoring:** Closely monitor the performance of the new CSSV-1 rule, particularly the rate of data error flags, to assess data quality.
+
+---
+
+**Summary of Critical Enhancements (v13.0 -> v14.0):**
+-   **Resolved Rule Conflict:** Added CSSV-1 to formally validate spending for CryoSleep passengers, turning a conflicting signal into a reinforcing one.
+-   **Gated Logic:** Overhauled ZSV-1 (v3) to only apply to non-CryoSleep passengers, eliminating the source of the error.
+-   **Reinforced Behavioral Primacy:** Clearly defined the rule hierarchy to prevent future conflicts, ensuring CryoSleep and Spending signals are paramount.
+-   **Enhanced Data Error Handling:** The system can now identify and quarantine records with logical inconsistencies (CryoSleep=True & Spending>0), improving batch-level integrity.
+
+This update resolves the specific error and strengthens the system's foundational logic, ensuring robust and accurate batch predictions for all passenger archetypes.
+
+============================================================

@@ -1,0 +1,313 @@
+PREDICTIVE METRICS - ITERATION 180
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+
+What happened (short)
+- New brittle failure confirmed in an n==1 batch: Passenger 0220_04 (CryoSleep=False, Age=25, RoomService=122.0, FoodCourt=84.0, ShoppingMall=NaN, Spa=0.0, VRDeck=0.0) was predicted True but actual was False (FP). This joins prior brittle modes (cryo_allzero n==1, infant_allzero, single‑channel dominance).
+- Immediate common root causes:
+  - Single‑channel dominance + missingness: a large RoomService value with a missing ShoppingMall value produced a “dominant-spend” signature not robustly handled (top1 feature dominated the logit).
+  - Pre‑imputation signals (missingness and raw top1/top1_share) were not reliably computed/used before transforms and imputation — imputation changed denominators/share and hid fragility.
+  - Per‑feature logit contributions were allowed to dominate (no tight caps/dampening for top1‑dominant records).
+  - Calibrator not conditioned on dominance/missingness → narrow p10/p90 and over‑confident probability.
+  - n==1 gating allowed auto‑decision without GLM_fallback/ensemble concordance for this fragile signature.
+- Top immediate priorities
+  1) Emergency gating hotfix (0–6h): treat single_channel_dominant_flag OR any_missing_channel_flag OR imputed_count ≥ 1 OR cryo_allzero_flag OR infant_allzero_flag as fragile when n_batch == 1 → route to priority_audit unless strict concordance + calibrated uncertainty checks pass.
+  2) Compute pre‑imputation detectors (missingness_signature, top1_value_raw, top1_share_raw, top1_channel_pctile_raw) and persist raw NaNs.
+  3) Add dominance & missingness conditioning to calibrator and inflate variance for these slices; enforce SE floors for n==1 fragiles (start 0.70–0.75).
+  4) Persist raw per_channel spends, imputation provenance, and include 0220_04 + prior canaries in immediate monitoring.
+  5) Deploy lightweight GLM_fallback + ensemble‑agreement check for n==1 fragile auto‑decisions.
+
+Concise answers to the six operational questions (batch‑accuracy focus)
+
+1) Which specific patterns caused the error?
+- Pattern: single_channel_dominant (RoomService high) + ShoppingMall missing in an n==1 batch. Raw top1_share near dominance threshold led to an outsized positive logit. Pre‑imputation missingness and dominance weren't used for gating or calibrator conditioning.
+
+2) How should decision rules be modified?
+- Precompute top1_value_raw, top1_share_raw, top1_channel_pctile_raw and any_missing_channel_flag before imputation.
+- If n_batch == 1 AND (single_channel_dominant_flag OR any_missing_channel_flag OR imputed_count ≥ 1 OR cryo_allzero_flag OR infant_allzero_flag) → route to priority_audit unless:
+  - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_dom),
+  - ensemble_agreement ≥ A_high_dom,
+  - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice,
+  - se_combined ≤ SE_accept_slice AND quantile_width ≤ QW_accept_slice.
+- For single_channel_dominant records that are auto‑accepted: dampen top1 contribution and require calibrator conditioned on dominance + missingness.
+
+3) New transport‑pattern insights?
+- Missingness itself is signal: a null ShoppingMall with high RoomService often indicates different passenger behavior than full data; imputing away NaNs changes top1_share and can flip model signals.
+- Single-channel spend dominance tends to be brittle — top1_share close to threshold changes outcome risk non‑linearly across cohorts.
+- These patterns amplify risk in small batches; cohort smoothing and conservative gating are needed for n==1.
+
+4) How should confidence be recalibrated?
+- Use heteroskedastic quantile calibration conditioned on top1_dominance, any_missing_channel, cryo_allzero, infant_allzero, age_bucket.
+- Inflate variance for single_channel_dominant by κ_dom (start 0.55–0.65) and for any_missing_channel by κ_missing (start 0.25–0.35); enforce SE floor for n==1 fragiles (start 0.72).
+
+5) What adjustments are needed for batch consistency?
+- Compute batch_frac_fragile including single_channel_dominant and missingness. If batch_frac_fragile ≥ 5% → require stricter gating or hold batch.
+- Tighten n==1 gating for single_channel_dominant and missingness: default route to audit unless GLM+ensemble concordant + low SE.
+
+6) How can metrics be improved for edge cases like this?
+- Persist raw pre‑imputation inputs and imputation provenance, add single_channel_dominant + any_missing_channel detectors, upweight these examples in calibrator/GLM training, enforce per_feature_logit caps/dampening, and monitor corresponding FP/FN rates.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Immediate emergency actions (0–6h)
+- Emergency gating hotfix:
+  - If n_batch == 1 AND (cryo_allzero_flag OR infant_allzero_flag OR single_channel_dominant_flag OR single_channel_high_missing_flag OR per_channel_implausible_flag OR imputed_count ≥ 1 OR novelty_high_flag) → route to priority_audit.
+  - Add canaries immediately: 0216_01, 0219_01, 0220_02, 0220_03, 0220_04.
+  - For any single_channel_dominant or per_channel_implausible_flag: downweight logits (×0.5–0.75) and inflate variance immediately.
+- Persist provenance for canaries/fragiles: raw per_channel spends (NaNs preserved), Age_raw + age_imputed_flag + imputation_method, per_feature_logit_contributions, caps_triggered.
+- Emergency SE floor: n==1 & fragile_topN OR single_channel_dominant OR cryo_allzero OR infant_allzero → se_floor = 0.70–0.75 (start 0.72).
+
+B. Pre‑imputation flag & detector definitions (compute before any imputation)
+- any_missing_channel_flag: True if any spend feature is missing (NaN).
+- top1_value_raw, top1_channel_raw, top2_value_raw, top2_channel_raw.
+- top1_share_raw = top1_value_raw / sum(non‑NaN_raw_spend_values) (compute denominator on raw non‑NaN values — do not treat NaN as 0).
+- top1_channel_pctile_raw: per‑channel percentile of top1_value_raw measured on historical raw pre‑imputation distribution for that channel.
+- single_channel_dominant_flag: top1_share_raw ≥ DOM_SHARE_THRESHOLD_OR (top1_value_raw ≥ channel_95pct) (see thresholds below).
+- single_channel_high_missing_flag: single_channel_dominant_flag AND any_missing_channel_flag.
+- imputed_count (prevailed after imputation, but record provenance).
+- missingness_signature: vector of booleans for each spend channel.
+- Keep cryo_allzero_flag and infant_allzero_flag as earlier.
+
+C. Feature engineering updates (v→v+1)
+- Preserve raw per_channel spends along with NaNs and imputation provenance.
+- Compute and persist pre‑imputation detectors (above).
+- New features:
+  - single_channel_dominant_flag, single_channel_high_missing_flag, any_missing_channel_flag,
+  - top1_share_raw, top1_channel_pctile_raw, top1_top2_ratio_raw,
+  - missingness_count, missingness_bitmap, channel_entropy_raw.
+- Interaction terms:
+  - top1_share × Age_bucket, top1_value × any_missing_channel_flag.
+- Keep per_feature_logit_contribution_raw and corrected (after caps/dampening).
+
+D. Channel‑aware thresholds, percentiles & caps
+- Compute per‑channel percentiles on raw pre‑imputation data monthly.
+- DOM_SHARE_THRESHOLD = 0.55 (start; sweepable). Rationale: capture borderline dominance like 0220_04 (≈0.59 when ShoppingMall treated as NaN).
+- channel_95pct_by_channel used to flag unusually large absolute top1 values even if share < DOM_SHARE_THRESHOLD.
+- VRDeck_absolute_cap, per-channel absolute caps retained.
+
+E. Per‑feature logit caps & dominance dampening
+- Enforce per_feature_logit_cap (CAP_PER_CHANNEL_LOGIT base = 1.0).
+- Dominance dampening:
+  - If single_channel_dominant_flag: scale top1_value (or its logit contribution) by α_dom (default 0.6).
+  - If single_channel_high_missing_flag: scale top1 contribution more aggressively by α_dom_missing (default 0.55) and inflate variance.
+  - If infant_allzero_flag: scale spend contributions by α_infant_spend (default 0.5) and increase age contribution weight.
+  - Add logit_topK_sum_cap: cap sum of top3 per_feature_logits to LOGIT_TOPK_CAP = 1.6.
+- Record caps triggered and dampening factors for each record for audit.
+
+F. Variance / SE model enhancements (heteroskedastic)
+- var_combined = var_base + κ_top1_high*I(top1_high_pctile) + κ_multi_high*multi_channel_count + κ_cryo*I(cryo_allzero) + κ_infant*I(infant_allzero) + κ_impute*imputed_count + κ_missing*missingness_count + κ_dom*I(single_channel_dominant_flag).
+  - Start values: κ_top1_high = 0.50; κ_multi_high = 0.45 per high channel; κ_cryo = 0.70; κ_infant = 0.50; κ_impute = 0.25; κ_missing = 0.30; κ_dom = 0.60.
+- se_combined = sqrt(max(var_combined, se_floor(context)^2)).
+- SE floors:
+  - n==1 & fragile_topN OR cryo_allzero OR infant_allzero OR single_channel_dominant_flag → se_floor = 0.72.
+  - n>1 but batch_frac_fragile > small threshold → elevated se_floor (e.g., 0.55).
+
+G. Decision‑gating (pattern‑aware + batch/cohort aware)
+- fragile_flag_v2 = union of infant_allzero_flag, cryo_allzero_flag, single_channel_dominant_flag, single_channel_high_missing_flag, missing_homeplanet_flag, missing_destination_flag, per_channel_implausible_flag, high_top1_abs_flag, imputed_count ≥ 1, novelty_high_flag.
+- batch_frac_fragile = #fragile_records_in_batch / batch_size.
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 5%) → route entire batch to priority_audit or require stricter gating.
+- n==1 fragile gating: allow auto decision ONLY if ALL pass:
+  - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice,
+  - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_dom),
+  - ensemble_agreement ≥ A_high,
+  - se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice.
+  - Otherwise route to priority_audit.
+- For single_channel_high_missing_flag: default route to priority_audit unless GLM+ensemble concordant AND se_combined small.
+
+H. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Heteroskedastic quantile calibrator (p10/p50/p90 + variance).
+  - Inputs: raw_model_logit, per_feature_logit_contributions, fragility_flags (single_channel_dominant, single_channel_high_missing, cryo_allzero, infant_allzero), top1/top2 percentiles, missingness_count, channel_entropy, age_bucket, age_imputed_flag.
+  - Loss: quantile pinball (p10/p90), ECE regularizer, Brier for p50.
+  - Upweight single_channel_dominant + single_channel_high_missing + cryo_allzero + infant_allzero examples ×6–15 depending on slice prevalence.
+- GLM_fallback:
+  - ElasticNet logistic on winsorized log1p channel features + missingness_bitmap + top1_share_raw + age_bucket + cabin_deck + age_spend_interaction.
+  - Use for concordance checks and interpretability for n==1 fragiles.
+- Training:
+  - Rolling window 18–36 months, CV stratified by fragility flags and age_bucket.
+  - Shadow run 14–28 days to calibrate gating thresholds.
+
+I. Mixture priors & cluster detection (slice‑aware)
+- For brittle slices (single_channel_dominant, single_channel_high_missing, cryo_allzero, infant_allzero), cluster on demographics, raw_spend_vector, missingness_signature, cabin_deck.
+- Compute cluster priors μ_cluster, N_cluster; blend priors by cluster membership probability.
+- For single_channel_dominant: separate clusters by which channel is dominant (RoomService-dominant cluster, FoodCourt-dominant, etc.) — each may have different prior μ and τ.
+
+J. Monitoring, metrics & alerts (batch‑focused)
+- New slice KPIs:
+  - single_channel_dominant_FP_rate & FN_rate (per dominant-channel)
+  - single_channel_high_missing_FP_rate & FN_rate
+  - any_missing_channel_FP_rate & FN_rate
+  - cryo_allzero_FP_rate & FN_rate
+  - n==1_auto_accept_rate, n==1_fragile_auto_accept_rate
+  - batch_frac_fragile, batch_hold_rate
+- Alerts:
+  - Any canary auto_accepted/rejected → immediate page.
+  - single_channel_high_missing_FP rise > baseline + X% over 24h → page.
+  - batch_frac_fragile ≥ threshold → hold batch + page.
+- Dashboards:
+  - Per‑record provenance for canaries and fragiles (raw vs winsorized, per_feature_logits, calibrator outputs, gating_decision).
+
+K. CI unit tests & validation (fragile & single‑channel)
+- Unit tests:
+  - Pre‑imputation flags computed correctly (including top1_share_raw, single_channel_dominant_flag and missingness flags).
+  - single_channel_dominant_flag triggers with DOM_SHARE_THRESHOLD = 0.55 when missingness preserved.
+  - se_combined respects se_floor for n==1 & infant/cryo/single_channel cases.
+  - Per_feature logit caps & dominance dampening enforced.
+  - batch_frac_fragile ≥ threshold disables auto_decisions.
+  - Canaries (incl. 0220_04) must not be auto_accepted/rejected while emergency gating active.
+- Regression tests:
+  - Global ECE / AUC / Brier degrade less than tolerances when gating enabled.
+  - Slice-level FP/FN reductions for single_channel_dominant and missingness slices.
+- Synthetic stress tests:
+  - Inject single_channel (RoomService) >> others with another channel NaN to validate routing to audit.
+  - Inject CryoSleep=True + all spends == 0 (cryo_allzero) in n==1 and small batch contexts to ensure routing.
+
+L. Operational actions & timeline (0–72h)
+1) Immediate (0–6h)
+   - Deploy emergency gating: n==1 fragiles include single_channel_dominant and single_channel_high_missing; hold canaries including 0220_04 and persist provenance.
+   - Expose per_feature_logits and calibrator outputs in logs for canaries.
+2) Short‑term (6–24h)
+   - Implement pre‑imputation detectors, single_channel_dominant_flag, missingness_signature; baseline GLM_fallback; compute batch_frac_fragile and instrument dashboards; collect labels for flagged cases.
+   - Shadow run to estimate audit volume and tune thresholds.
+3) Mid‑term (24–72h)
+   - Retrain heteroskedastic quantile calibrator and GLM_fallback with upweighted fragile slices; implement per_feature caps & dominance dampening; deploy mixture priors and run extended shadow run (14–28 days).
+4) Longer term
+   - Add cluster‑aware priors for dominant-channel subgroups; monthly re‑compute of channel percentiles; automated hyperparameter sweeps for κ_dom, se_floor and dampening factors.
+
+M. Per‑record provenance to log (minimum)
+- Raw per_channel spends (NaNs preserved) + per_channel_imputed_flags + imputation_method + source_date.
+- Raw Age + age_imputed_flag + age_imputation_method + Age_bucket.
+- CryoSleep raw + cryo_allzero_flag.
+- Demographics raw + missing flags.
+- Transforms & flags: winsorized_spend[channel], top1/top2/top3_channel, top1_value_raw, top1_share_raw, top1_channel_pctile, top1_channel_zscore, multi_channel_count, channel_entropy, single_channel_dominant_flag, single_channel_high_missing_flag, any_missing_channel_flag, infant_allzero_flag, high_top1_abs_flag, per_channel_implausible_flags, single_channel_dominant_flag, missingness_signature, cluster_id.
+- Model internals: per_feature_logit_contributions (raw & capped), per_feature_logit_caps_triggered, pooled_prior_snapshot_id, μ_slice/μ_cluster, τ_slice_blend.
+- Variances: var_components, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, quantile_width, gating_reasons, routing_decision, scorer_version.
+
+N. Initial hyperparameters (start values; sweepable)
+- DOM_SHARE_THRESHOLD = 0.55
+- CHANNEL_95_PCTILE_FLAG = per‑channel 95th percentile (computed on raw)
+- AGE_INFANT_THRESHOLD = 1 (Age ≤ 1 → infant candidate)
+- AGE_TEEN_BUCKET_START = 13
+- PCTILE_TOP1_FLAG = 99.0
+- PCTILE_MULTI_FLAG = 95.0
+- MULTI_CHANNEL_COUNT_MIN = 2
+- Z_TOP1_FLAG = 3.0
+- TOP1_SUSPICIOUS_ABS = channel_95pct_by_channel
+- VRDeck_absolute_cap = 1500; channel_abs_caps = min(channel_99.5pct, absolute_cap[channel])
+- IMPLAUSIBLE_SUM_THRESHOLD = 1000
+- SE floor for n==1 fragiles = 0.72
+- α_dom_channel default = 0.6; α_dom_missing = 0.55; α_dom_vrdeck = 0.5; α_infant_spend = 0.5; α_cryo_spend = 0.6
+- β_multi = 0.6
+- CAP_PER_CHANNEL_LOGIT = 1.0; LOGIT_TOPK_SUM_CAP = 1.6
+- κ_top1_high = 0.50; κ_multi_high_per_channel = 0.45; κ_cryo = 0.70; κ_infant = 0.50; κ_impute = 0.25; κ_missing = 0.30; κ_dom = 0.60
+- BATCH_FRAGILE_THRESHOLD = 0.05
+- N_min_slice = 60; τ_high_slice = 0.95
+- δ_slice (GLM disagreement tolerance) = 0.05; δ_dom (for single_channel_dominant) = 0.03
+- A_high (ensemble agreement) = 0.995
+- QW_accept_slice (quantile width) = 0.12
+
+O. CI canaries & expected behavior
+- Canary list: 0210_01, 0211_03, 0212_01, 0212_02, 0213_01, 0216_01, 0219_01, 0220_02, 0220_03, 0220_04.
+- Expected route: priority_audit while emergency gating active.
+- CI asserts: canaries not auto_accepted/rejected; raw provenance preserved; per_feature_logit contributions logged.
+
+P. Gating pseudocode (pattern‑aware, batch focused)
+- For each batch B:
+  - Compute batch_frac_fragile = count(r in B where fragile_flag_v2)/|B|
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD: route all r in B -> priority_audit; continue
+  - For each r in B:
+      compute pre‑imputation flags (including single_channel_dominant_flag, any_missing_channel_flag, infant_allzero, cryo_allzero), top1/top2/top3, multi_channel_count
+      set fragile_flag_v2 = union of flags above
+      If n_batch == 1 and fragile_flag_v2:
+         If pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees (|p_model − p_glm| ≤ δ_dom) AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice:
+             allow auto_decision
+         Else:
+             route r -> priority_audit
+         continue
+      If single_channel_dominant_flag OR single_channel_high_missing_flag:
+         apply dominance dampening and per_feature_logit_caps
+         If GLM+ensemble concordant AND se_combined small -> allow auto_decision
+         Else route -> priority_audit
+      If per_channel_implausible_flag OR top1_channel_pctile_flag:
+         apply per_feature caps; require GLM fallback concordance
+         If co‑agreement -> allow auto
+         Else route -> audit
+      If missing_homeplanet_flag OR missing_destination_flag:
+         route r -> data_quality_review + priority_audit
+
+Q. Specific diagnosis — Passenger 0220_04 (chain of failure & root cause)
+- Raw: HomePlanet=Earth, CryoSleep=False, Cabin=E/10/P, Destination=TRAPPIST-1e, Age=25.0, VIP=False, RoomService=122.0, FoodCourt=84.0, ShoppingMall=NaN, Spa=0.0, VRDeck=0.0.
+- Failure chain:
+  1) Missingness (ShoppingMall NaN) and dominance (RoomService ~59% of observed sum) not computed/used pre‑imputation → raw dominance signal lost or miscomputed after imputation.
+  2) Model logit composition produced a strong positive (RoomService + FoodCourt contributions) that dominated the probability.
+  3) Calibrator was not conditioned on single_channel_dominance/missingness; p10/p90 too narrow and over‑confident.
+  4) n==1 gating allowed auto‑decision → FP accepted.
+- Root causes:
+  - Missing pre‑imputation dominance and missingness detectors.
+  - Per_feature logit caps/dampening absent or too loose for top1 dominance.
+  - Calibrator homoskedastic assumption and no fragility conditioning.
+  - No GLM_fallback/ensemble gating for single‑channel fragiles.
+  - Possible imputation policy (impute NaN to 0 or mean) changed top1_share computation.
+
+R. How these changes reduce batch errors (short)
+- Pre‑imputation flags (single_channel_dominant, missingness) capture brittle records prior to transforms and imputation.
+- Heteroskedastic calibrator + SE floors make the system conservative for n==1 and dominant/missing records, preventing over‑confident wrong auto‑decisions.
+- Per_feature logit caps and dominance dampening prevent single features from creating FPs/FNs.
+- GLM fallback + ensemble concordance add an interpretable safety net for small-batch fragile decisions.
+
+S. Tradeoffs & operational notes
+- Expect audit volume to rise initially — tune DOM_SHARE_THRESHOLD and upweighting to balance throughput vs. risk.
+- Additional compute (pre‑imputation detectors, GLM fallback, calibrator) and latency for small batches.
+- Slight short‑term shifts in global metrics — prioritize slice‑level FP/FN reductions for single_channel_dominant and missingness slices.
+
+T. Next steps / recommended sequencing (concrete)
+1) Immediate hotfix (within 1 hour)
+   - Deploy gating: n==1 fragiles include single_channel_dominant and single_channel_high_missing; hold canaries (0220_04 + others) and persist provenance.
+   - Expose per_feature_logits and calibrator outputs in logs for canaries.
+2) Short term (6–24h)
+   - Implement pre‑imputation detectors, baseline GLM_fallback, batch_frac_fragile dashboard; collect labels and estimate audit load via shadow run.
+   - Add CI tests for single_channel_dominant patterns and missingness cases.
+3) Mid term (24–72h)
+   - Retrain heteroskedastic quantile calibrator & GLM_fallback with upweighted fragile slices; implement dominance dampening & mixture priors for dominant-channel clusters; run extended shadow run and finalize thresholds.
+4) Longer term
+   - Add cluster‑aware priors for dominant-channel subgroups; automated monthly re‑compute of per-channel percentiles; monitor and adapt hyperparameters.
+
+Runnable checklist (concrete)
+- Do not auto‑accept any n==1 record where:
+  - single_channel_dominant_flag is True OR
+  - single_channel_high_missing_flag is True OR
+  - cryo_allzero_flag is True OR
+  - infant_allzero_flag is True OR
+  - max_channel_raw ≥ channel_abs_cap_high OR
+  - top1_channel_pctile_flag OR
+  - multi_channel_outlier_flag OR
+  - imputed_count ≥ 1 OR
+  - missing_homeplanet_flag OR missing_destination_flag.
+- Ensure calibrator input pipeline includes single_channel_dominant_flag, single_channel_high_missing_flag, top1_share_raw, any_missing_channel_flag, age_bucket, age_imputed_flag and topN features.
+- Add unit test: RoomService large + FoodCourt medium + ShoppingMall NaN & n==1 -> route to audit unless GLM+ensemble & se checks pass.
+- Add synthetic tests: Inject RoomService >> others with ShoppingMall NaN to validate routing behavior.
+
+Immediate debugging checklist for this specific error (0220_04)
+1) Log inspection:
+   - Extract per_feature_logit_contributions (raw & capped) for 0220_04 and compare to historical RoomService‑dominant training examples.
+   - Check calibrator p10/p50/p90, var_components, se_combined for this record.
+   - Check GLM_fallback probability and ensemble agreement; verify whether GLM disagreed.
+2) Data checks:
+   - Confirm ShoppingMall NaN handling in pre‑pipeline (was it imputed to 0 or median?).
+   - Confirm raw top1_share computed on non‑NaN denominator (if code used imputed denominator that changed share, fix it).
+   - Verify encoding of other categorical fields (CryoSleep False correct).
+3) Training checks:
+   - Compute label distribution for raw RoomService‑dominant & any_missing_channel historical examples; measure label imbalance or drift.
+   - If distribution shifted vs. production, upweight or retrain calibrator/GLM quickly.
+
+Offer / next action
+- Recommendation: Push the hotfix gating now (include single_channel_dominant_flag, single_channel_high_missing_flag, cryo_allzero_flag, infant_allzero_flag; hold canaries including 0220_04 and persist provenance). This will prevent repeat FPs/FNs for n==1 fragile cases.
+- I can produce now (pick one or both):
+  1) Emergency gating implementation package (runnable pseudocode + unit tests + CI patch) within the hour.
+  2) Full retraining pipeline spec (heteroskedastic quantile calibrator + GLM_fallback + mixture priors), hyperparameter sweep matrix, and shadow‑run dashboard spec for the 24–72h plan.
+
+Which would you like me to deliver immediately?
+
+============================================================

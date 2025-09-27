@@ -1,0 +1,133 @@
+PREDICTIVE METRICS - ITERATION 85
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.6 (CONTRADICTORY SPENDING PATTERNS AND CONTEXT HANDLING)
+
+**Objective:** To correct the prediction error for Passenger 0110_02 by addressing the failure to detect contradictory spending patterns—specifically, zero luxury spending (RoomService=0.0, Spa=0.0, VRDeck=1687.0 is non-luxury skew) combined with non-zero basic spending (FoodCourt=331.0) for a non-CryoSleep adult passenger from Europa on TRAPPIST-1e. The model incorrectly applied luxury spending gap rules and over-relied on aggregate spending, missing that VRDeck spending at 1687.0, while high, is not luxury-class aligned (as Spa=0.0 and RoomService=0.0 suggest budget constraints), leading to a false positive. This error highlights the need for finer-grained spending category analysis and contextual cues like HomePlanet economy biases.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0110_02: What Went Wrong?
+
+The error for Passenger 0110_02 (HomePlanet=Europa, CryoSleep=False, Cabin=B/5/P, Destination=TRAPPIST-1e, Age=40.0, VIP=False, RoomService=0.0, FoodCourt=331.0, ShoppingMall=0.0, Spa=0.0, VRDeck=1687.0) resulted from misapplication of luxury spending validation and insufficient context integration:
+
+**Key Failure Points:**
+- **Contradictory Spending Pattern Oversight:** The model likely triggered rules like AGGREGATE_SPENDING_OVERRIDE (AS-1) or MODERATE_DISTRIBUTED_SPENDING_CHECK (MDS-1) due to total spending >0 (RoomService + FoodCourt + ShoppingMall + Spa + VRDeck = 0+331+0+0+1687=2018.0), boosting confidence for transport. However, it failed to recognize that zero luxury spending (RoomService=0, Spa=0) combined with high VRDeck (often non-luxury entertainment) and FoodCourt spending indicates a budget-conscious passenger from Europa, who may opt out of transport for cost reasons.
+- **Luxury Spending Gap Rule Misapplication:** LSG-1 (Revised v2) was not designed to handle cases where VRDeck is high but other luxury categories are zero; it primarily focuses on RoomService gaps. VRDeck=1687.0 alone did not trigger luxury checks, but the model overvalued aggregate spending.
+- **HomePlanet Context Neglect:** Europa passengers often exhibit frugal travel behaviors; high VRDeck spending might reflect pre-trip entertainment rather than luxury indulgence, but this economic bias was not incorporated into spending rules.
+- **Cabin and VIP Underutilization:** Cabin deck B (mid-class) and VIP=False did not trigger economy-specific validations to counter luxury assumptions.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.6)
+
+This update introduces a new rule for contradictory spending patterns, refines luxury spending validation to include category-specific checks, and enhances HomePlanet context integration.
+
+**Add Contradictory Spending Pattern Rule (New Step 0.m):**
+- **CONTRADICTORY_SPENDING_VALIDATION (CSV-1):**
+  - IF `CryoSleep == False` AND `RoomService == 0.0` AND `Spa == 0.0` AND (`VRDeck > 500.0` OR `FoodCourt > 300.0`) → **Apply -25% confidence penalty**.
+  - **Rationale:** Zero luxury spending (RoomService, Spa) with high basic or entertainment spending (FoodCourt or VRDeck) suggests budget constraints, reducing transport likelihood, especially for economy HomePlanets like Europa.
+
+**Modify Luxury Spending Gap Validation Rule (Step 0.k):**
+- **LSG-1 REVISED v3:**
+  - Expand to check all luxury categories: IF `RoomService > 0.0` OR `Spa > 0.0` OR `VRDeck > 1000.0` (luxury threshold) → apply LSG-1 logic; else skip.
+  - **Rationale:** Ensure VRDeck is treated as luxury only above a threshold, avoiding misclassification of moderate VRDeck spending.
+
+**Enhance HomePlanet Context Rule (Step 3.6, New):**
+- **HOMEPLANET_ECONOMY_BIAS_VALIDATION (HEB-1):**
+  - IF `HomePlanet == Europa` AND `CryoSleep == False` AND total spending < 2500.0 → **Apply -10% confidence penalty**.
+  - **Rationale:** Europa passengers are often budget-conscious; moderate spending may not indicate transport commitment.
+
+**Adjust Aggregate Spending Override (Step 0.c):**
+- **AS-1 REVISED v3:**
+  - Add condition: Skip AS-1 boost if CSV-1 is triggered (contradictory spending) or HEB-1 applies.
+  - **Rationale:** Prevent over-boosting for passengers with spending patterns that indicate non-transport.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **Contradictory Spending Signals Low Transport Likelihood:** Zero luxury spending (RoomService, Spa) with high non-luxury spending (e.g., VRDeck, FoodCourt) often indicates passengers prioritizing onboard amenities over transport, especially from frugal HomePlanets like Europa.
+- **VRDeck Spending Context Matters:** VRDeck is not always luxury; values <1000.0 may be recreational, not indulgent, requiring category-specific thresholds.
+- **HomePlanet Economic Biases Are Predictive:** Europa origin correlates with higher opt-out rates for expensive transport options, necessitating spending pattern adjustments.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - CSV-1: -25% penalty for contradictory spending.
+  - HEB-1: -10% penalty for Europa economy bias.
+- **Adjusted Rules:**
+  - LSG-1 Revised v3: Luxury threshold for VRDeck set to 1000.0.
+  - AS-1 Revised v3: Conditional application based on CSV-1 and HEB-1.
+- **Confidence Stacking:** CSV-1 and HEB-1 penalties are additive for applicable cases.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening Expansion:** Add CSV-1 to pre-screening for all non-CryoSleep passengers with RoomService=0.0 and Spa=0.0.
+- **Batch HomePlanet Validation:** Pre-batch, flag all Europa passengers for HEB-1 processing if spending is moderate.
+- **Error Logging:** Monitor cases with RoomService=0.0, Spa=0.0, and VRDeck >500.0 or FoodCourt >300.0 to validate CSV-1 and refine thresholds.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **Contradictory Spending with VRDeck Focus:** Handled by CSV-1 penalty.
+- **Europa Passengers with Moderate Spending:** Handled by HEB-1 penalty.
+- **CryoSleep Cases:** Unchanged; spending patterns are irrelevant under CryoSleep.
+- **Fallback:** If spending data has NaN, use NVA-1 alone with conservative confidence.
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.6
+
+**Processing Order v7.6:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v4)**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED v3)** // **UPDATED RULE**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1)**
+**0.i. CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1 REVISED)**
+**0.j. CRYOSLEEP_ZERO_RISK_VALIDATION (CZR-1)**
+**0.k. LUXURY_SPENDING_GAP_VALIDATION (LSG-1 REVISED v3)** // **UPDATED RULE**
+**0.l. UNIVERSAL_ZERO_SPENDING_VALIDATION (USZ-1)**
+**0.m. CONTRADICTORY_SPENDING_VALIDATION (CSV-1)** // **NEW RULE**
+1.  **ZDL-1 (CRYOSLEEP-EXEMPT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED v2)
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+3.5. INFANT_CONTEXT_BOOST (ICB-1)
+3.6. HOMEPLANET_ECONOMY_BIAS_VALIDATION (HEB-1)** // **NEW RULE**
+... (Remaining rules) ...
+12. DEFAULT (DF-1 REVISED v2) // 65% confidence
+
+---
+
+### New Scoring Example for Passenger 0110_02 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.6 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0110_02** (Europa, CryoSleep=False, Cabin=B/5/P, Destination=TRAPPIST-1e, Age=40.0, VIP=False, RoomService=0.0, FoodCourt=331.0, ShoppingMall=0.0, Spa=0.0, VRDeck=1687.0) | **NVA-1**: Spending not all zero → **CSV-1**: Activated (RoomService=0, Spa=0, VRDeck>500) → -25% penalty → **AS-1 Revised v3**: Skipped due to CSV-1 → **HEB-1**: Activated (HomePlanet=Europa, total spending=2018<2500) → -10% penalty → **PS-1** → **DF-1 Revised v2** | **False** | **30%** (PS-1: 65% + CSV-1: -25% + HEB-1: -10%) |
+
+*The new rules correctly penalize confidence for contradictory spending and Europa bias, resulting in a False prediction.*
+
+---
+
+### Implementation Plan for v7.6
+
+- **Deploy v7.6 immediately.** Reprocess the batch; validate 0110_02 is now False.
+- **Monitor** all cases with RoomService=0.0, Spa=0.0, and VRDeck >500.0 or FoodCourt >300.0, especially from Europa.
+- **Update historical batches** with CSV-1 and HEB-1 rules.
+- **Long-term:** Analyze spending category correlations with HomePlanet and develop dynamic thresholds for VRDeck luxury classification.
+
+This update ensures accurate handling of contradictory spending patterns and economic biases, preventing false positives and improving batch accuracy.
+
+**Final Note:** Next, investigate VIP status interactions with luxury spending for non-CryoSleep passengers, and refine Cabin deck classifications for economy bias detection.
+
+============================================================

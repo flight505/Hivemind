@@ -1,0 +1,250 @@
+PREDICTIVE METRICS - ITERATION 40
+============================================================
+
+Updated Predictive Metrics Report — v2.9
+Goal: reduce zero‑spend false negatives (like 0064_02) while maintaining the v2.8 gains on high‑spend false positives. Preserve determinism, reproducibility and full per‑prediction provenance.
+
+Executive summary — immediate takeaway and top priorities
+- Immediate problem: 0064_02 (all spends zero/one NaN, CryoSleep=True) was predicted False but actual True. Root cause: model over‑relied on spend signals and under‑weighted strong non‑spend signals (CryoSleep, Cabin/demographics); missingness and none_low (zero‑spend) regime was not routed to the GLM_fallback or assigned sufficient uncertainty, producing an overconfident False (zero‑spend false negative).
+- Impact: zero‑spend examples with strong non‑spend predictors (CryoSleep, VIP, specific cabin decks/segments) are an important separate failure mode. Our prior focus on attenuating high spend extremes left none_low decisions under‑protected.
+- Top priorities (deploy in order):
+  1. Short term (24–72h): add deterministic none_low safeguards — force GLM_fallback for zero‑spend or heavy missingness records, require GLM (or consensus) for positive label when non‑spend signals present, increase min_se_logit for none_low cluster, persist extra diagnostics and route borderline True predictions to audit.
+  2. Medium term (1–14d): train SRM to explicitly model reliability in none_low regime, add per‑cluster priors & covariance, enrich GLM_fallback with missingness & non‑spend features, add coverage‑guard regressor to predict se_logit.
+  3. Long term: continuous retraining with audit labels, segment‑specific priors, and refined two‑stage calibration per cluster.
+
+1) What specific patterns in the current metrics led to 0064_02
+- None_low (zero‑spend) regime mishandling:
+  - Total_spend ≈ 0 (RoomService=0, FoodCourt=0, Spa=0, VRDeck=0; ShoppingMall=NaN) → aggregator had near‑zero spending signal and defaulted negative.
+  - Missingness (ShoppingMall=NaN) not handled as an explicit signal; imputation/aggregation reduced signal fidelity.
+- Over‑reliance on spend features:
+  - Decision logic favored spend deltas and attenuation rules; when spend is absent, few compensating signals were promoted.
+- Inference routing gap:
+  - GLM_fallback or consensus logic only triggered under aggregator positivity or other rules — none_low negatives were not forced to GLM review.
+- Under‑estimated uncertainty:
+  - none_low cluster had too low a min_se_logit / overly optimistic Corr_spend → p_lower too decisive on the negative side.
+- Net effect: real positive (likely due to CryoSleep and segment priors) was lost because the pipeline treated the record as “no evidence” and returned a confident False.
+
+2) Deterministic decision‑rule changes to prevent similar errors
+High‑level principle: treat none_low / heavy missingness as a separate regime with explicit rules that promote GLM review and raise uncertainty; promote non‑spend strong signals (CryoSleep, VIP, Cabin deck, Age_bucket) into decision logic.
+
+New/updated deterministic components and rules (versioned, snapshot):
+- Definition: none_low guard
+  - none_low if total_spend ≤ 1.0 OR (sum(per_channel_nonzero_flags) == 0) OR (proportion_spend_NaN ≥ 0.33).
+  - Persist none_low_flag.
+- None_low routing:
+  - If none_low_flag == True:
+    - Force GLM_fallback.
+    - Enforce min_se_logit_by_cluster (none_low = 0.22).
+    - If any strong non‑spend predictor present (CryoSleep=True OR VIP=True OR Cabin_deck in high_prior_decks OR Age_bucket in high_prior_buckets) then:
+      - Require GLM_p_lower ≥ 0.75 to return True.
+      - If GLM_p_lower in [0.65,0.75): Abstain → audit.
+      - Else return False.
+    - If no strong non‑spend predictor present:
+      - Standard none_low rules: require GLM_p_lower ≥ 0.80 for True (more conservative).
+- Missingness rule:
+  - If per_channel_NaNs ≥ 2 OR ShoppingMall==NaN AND total_spend==0 → force GLM_fallback and set missingness indicators on GLM inputs.
+- Consensus & deterministic thresholds (update to include none_low):
+  - effective_reliability = SRM_score * coherence_factor (as v2.8).
+  - Decision tiers (deterministic):
+    - High reliability (eff_rel ≥ 0.90):
+      - Accept aggregator positive if p_lower_agg ≥ 0.75. GLM persisted for audit.
+    - Medium reliability (0.80 ≤ eff_rel < 0.90):
+      - Force GLM_fallback; require 2/3 agreement among {aggregator_post_att, GLM, SRM_binary}. If no consensus → Abstain & audit.
+    - Low reliability (eff_rel < 0.80) OR none_low:
+      - Force GLM_fallback. Return True only if GLM_p_lower ≥ 0.75 and aggregator non‑contradiction (aggregator_p_lower ≥ 0.60). If contradiction or GLM_p_lower in [0.65,0.75) → Abstain → audit. Else → False.
+- Per‑prediction provenance persisted:
+  - none_low_flag, missingness_counts, per_channel_NaN_flags, GLM_fallback_used, GLM_p / p_lower / CI, SRM_score & bootstrap_se, spend_factor, cluster_id, CSC, min_se_flag, aggregator_p/p_lower, primary_decision_reason, snapshot_id.
+
+3) New insights about passenger transport patterns from this error group
+- Zero‑spend true positives are common and not rare “noise” — many positive labels are driven by non‑spend indicators (CryoSleep, VIP status, cabin/deck/destination priors). Spending absence is not equivalent to “not transported.”
+- Missingness patterns (NaNs) carry signal: e.g., ShoppingMall NaN in combination with CryoSleep may indicate different data collection processes that correlate with positive labels.
+- Segment priors: certain cabins, destinations, or age groups have elevated transported rates independent of spending. These should be explicit priors in none_low decisions.
+- Label noise is concentrated at both tails (extreme spends and zero spends); human audit labels in these tails materially improve models.
+
+4) How confidence levels should be recalibrated
+- Two‑stage calibration retained: global Platt on aggregator logit → per‑cluster/per‑segment Platt offsets where sample size permits.
+- Dynamic z selection (updated thresholds for none_low):
+  - eff_rel ≥ 0.92 → z = 1.28 (90% band).
+  - 0.80 ≤ eff_rel < 0.92 → z = 1.96 (95% band).
+  - eff_rel < 0.80 (or none_low) → z = 2.33 (98% band).
+- se_logit_final:
+  - Compute using cluster‑specific covariance matrices and coverage‑guard regressor predicted_se.
+  - Enforce min_se_logit_by_cluster:
+    - none_low = 0.22 (increased vs v2.8 normal)
+    - balanced = 0.18
+    - single_spike = 0.28
+    - multi_high = 0.35
+  - For none_low with missingness_flags > 0: multiply se by 1.10 (safety margin).
+- Acceptance thresholds (initial; tune on validation):
+  - None_low + strong non‑spend indicator: GLM_p_lower ≥ 0.75 → True; GLM_p_lower in [0.65, 0.75) → Abstain (audit); else False.
+  - None_low without strong non‑spend signals: GLM_p_lower ≥ 0.80 required.
+  - Regular high‑spend rules per v2.8 remain unchanged (single_spike handling retained).
+- Rationale: widen uncertainty band and require GLM agreement for zero‑spend positives to reduce FNs and misclassification due to absent spend features.
+
+5) Adjustments needed for better consistency across batch predictions
+- Snapshot & provenance (mandatory per batch): winsor quantiles per channel/cluster, cluster centroids & covariances, GLM/SRM versions, calibration maps, seeds, and thresholds. Persist snapshot_id.
+- Batch precommit checks (new/updated):
+  - fraction_none_low > baseline * 1.25 → alert & hold (if ↑ markedly).
+  - fraction_missingness > baseline * 1.25 → alert.
+  - fraction_GL M_fallback_used > baseline * 1.5 → alert (indicates regime shift).
+  - median_total_spend shift > 1.5× baseline MAD → block + manual review.
+- Audit queue triggers (deterministic):
+  - none_low & predicted True
+  - SRM_score < 0.80 AND predicted True
+  - GLM_fallback_used
+  - contradiction_flag (aggregator positive / GLM negative OR aggregator negative / GLM positive) and eff_rel < 0.92
+  - top_contrib_share extremes and any predicted True
+- Deterministic seeding & reproducible bootstraps: store seeds & bootstrap maps in snapshot.
+
+6) How the metrics/models should be improved to handle edge cases like 0064_02
+- Diagnostics to persist per prediction (expanded):
+  - cluster_id, none_low_flag, missingness_counts & per_channel_NaN_flags, CSC, SRM_score & bootstrap_se, GLM_p/p_lower/CI, aggregator_p/p_lower/CI, top_contrib_share, per_channel_z & percentiles, winsor_quantiles_used, spend_factor, se_logit_final, min_se_flag, snapshot_id, primary_decision_reason.
+- New/updated models & components:
+  - SpendReliabilityModel (SRM) v2: GBM/logistic enhanced to explicitly predict reliability in none_low regime. Inputs: per_channel_z, missingness indicators, CryoSleep, VIP, Cabin_deck, Destination, Age_bucket, top_contrib_share, prior label rates, CSC.
+  - None_lowPriorModel: a small deterministic prior table for CryoSleep/VIP/Cabin/deck/destination combos (smoothed with Laplace) to be used as fallback when spend is absent.
+  - GLM_fallback v3: enriched features (missingness flags, none_low_flag, CryoSleep*Age interactions, Cabin_deck, Destination priors) + bootstrapped CI. Oversample zero‑spend True cases and audit labels.
+  - Coverage guard regressor: predict expected se_logit; used to set min_se dynamically.
+- Training & data:
+  - Oversample/weight audit cases and known failures (0045_01, 0053_01, 0061_01, 0062_01, 0064_02).
+  - Create a labeled audit set for zero‑spend positives and missingness patterns for targeted validation.
+  - Add explicit missingness features for each spend channel and a total_spend feature.
+- Immediate stop‑gap mitigations (24–72h):
+  - Force GLM_fallback for none_low_flag records and any record with per_channel_NaNs ≥ 2.
+  - Increase none_low min_se_logit = 0.22.
+  - Route any none_low predicted True → audit queue.
+  - Add a deterministic rule: if CryoSleep=True and total_spend==0 → require GLM_p_lower ≥ 0.75 or Abstain.
+- Near term (1–14 days):
+  - Train SRM v2 and GLM_fallback v3; add None_lowPriorModel.
+  - Validate and tune thresholds (GLM_p_lower, z thresholds, min_se).
+  - Run stratified validation by cluster and missingness strata.
+- Medium/long term:
+  - Continuous retraining with audit labels and automated active learning on Abstain cases.
+  - Replace static none_low heuristics with an SRM‑learned policy for routing and dynamic min_se.
+
+Deterministic scoring pipeline — v2.9 (production outline)
+1. Snapshot load (persist snapshot_id): winsor quantiles per channel/cluster, cluster centroids & covariances, GLM/SRM versions, calibration maps, deterministic seeds.
+2. Base priors & Laplace smoothing (unchanged).
+3. SpendPatternClustering: assign cluster_id (none_low, balanced, single_spike, multi_high) deterministically.
+4. none_low detection & missingness flags:
+   - total_spend = sum(winsorized_spends)
+   - none_low_flag = (total_spend ≤ 1.0) OR (sum(nonzero_spend_flags)==0) OR (proportion_NaN ≥ 0.33).
+   - missingness_counts & per_channel_NaN_flags persisted.
+5. If none_low_flag OR per_channel_NaNs ≥ 2 → force GLM_fallback (but continue computing aggregator for diagnostics).
+6. Preprocess spends: per_cluster winsorize; compute per_channel_z & percentiles; compute top_contrib_share.
+7. Aggregator: compute spending contribution logit and se (with per_cluster covariance).
+8. Run SRM v2 (deterministic): SRM_score & bootstrap_se. SRM trained to flag low reliability for both single_spike and none_low regimes.
+9. Dynamic routing & attenuation:
+   - Compute spend_factor = clip(0.40 + 0.60 * SRM_score, 0.40, 1.0) * coherence_factor (as v2.8).
+   - If none_low_flag → override spend_factor = 1.0 (do not attenuate non‑spend signal), but route to GLM_fallback for final decision.
+10. GLM_fallback v3 (if invoked):
+    - Deterministic GLM with enriched features + bootstrap CI.
+11. Aggregate & uncertainties:
+    - Compute logit_final & se_logit_final using cluster covariance + coverage_guard predicted_se; enforce min_se_logit_by_cluster.
+    - Choose z per effective_reliability (updated thresholds).
+    - Two‑stage calibration: global then per_cluster/per_segment offsets.
+12. Decision & provenance:
+    - Apply deterministic consensus rules including none_low rules. Persist full diagnostics and primary_decision_reason. If Abstain or high‑risk True → route to audit.
+13. Post‑batch checks & alerts:
+    - Run precommit checks; issue alerts or block per thresholds.
+
+Concrete initial parameter defaults (tune on validation)
+- none_low detection:
+  - total_spend_threshold = 1.0
+  - proportion_NaN threshold = 0.33
+- min_se_logit_by_cluster:
+  - none_low = 0.22 (new)
+  - balanced = 0.18
+  - single_spike = 0.28
+  - multi_high = 0.35
+- z selection:
+  - eff_rel ≥ 0.92 → z = 1.28
+  - 0.80 ≤ eff_rel < 0.92 → z = 1.96
+  - eff_rel < 0.80 → z = 2.33
+- GLM acceptance thresholds (none_low):
+  - with strong non‑spend indicator (CryoSleep/VIP/Cabin_high_prior): GLM_p_lower ≥ 0.75 → True; [0.65,0.75) → Abstain.
+  - without strong non‑spend: GLM_p_lower ≥ 0.80 → True.
+- Missingness:
+  - per_channel_NaNs ≥ 2 → force GLM_fallback.
+- Targets:
+  - Reduce zero‑spend FNs ≥ 50% on validation vs v2.6/v2.8.
+  - High‑spend FP reduction maintained ≥ 50% vs v2.6.
+  - Abstain fraction ≤ 5–8% after tuning.
+  - Per‑cluster ECE/Brier improved >10% in none_low regime.
+
+Validation experiments (priority)
+- Stratified LOO by cluster and missingness:
+  - Holdouts: none_low with CryoSleep True/False, none_low with missingness, single_spike FoodCourt, multi_high combos.
+  - Metrics: per_cluster accuracy, recall/precision, FP/FN per spend cluster, Brier score, ECE, abstain fraction.
+- SRM v2 validation:
+  - AUC, calibration by cluster; ensure SRM thresholds correspond to actual reliability.
+- GLM_fallback v3 validation:
+  - Bootstrapped CI coverage, performance on zero‑spend positives.
+- Sensitivity sweeps:
+  - total_spend_threshold ∈ {0.5, 1.0, 2.0}, GLM_p_lower thresholds grid, z thresholds, min_se adjustments.
+- Decision ablation:
+  - Compare v2.9 dynamic rules vs earlier logic to quantify FN/FP tradeoffs in none_low and high‑spend regimes.
+
+Monitoring & alerts (per prediction + batch)
+- Persist per prediction:
+  - none_low_flag, missingness_counts, cluster_id, SRM_score, CSC, spend_factor, per_channel_z, aggregator_p/p_lower, se_logit_final, min_se_flag, GLM_p/p_lower & CI, GLM_fallback_used, contradiction_flag, winsor_quantiles_used, top_contrib_share, snapshot_id, primary_decision_reason.
+- Dashboards & alerts:
+  - fraction_none_low: alert if > baseline * 1.25
+  - fraction_missingness: alert if > baseline * 1.25
+  - GLM_fallback fraction per batch: alert if > baseline * 1.5
+  - Zero_spend FN rate: alert if > baseline * 1.10
+  - Per‑cluster ECE & Brier: alert if coverage drops >5% or ECE increases
+- Audit queue:
+  - All none_low predicted True
+  - SRM_score < 0.80 & predicted True
+  - GLM_fallback_used
+  - Contradiction_flag (aggregator/GLM disagreement with low eff_rel)
+
+Case‑level diagnosis — how v2.9 would handle 0064_02
+- Input: 0064_02 — RoomService=0, FoodCourt=0, ShoppingMall=NaN, Spa=0, VRDeck=0, CryoSleep=True, Age=33, Cabin E/3/S.
+- v2.9 deterministic flow:
+  1. Snapshot load and clustering → cluster_id = none_low (total_spend == 0).
+  2. Missingness detection → ShoppingMall==NaN → per_channel_NaNs = 1; none_low_flag = True (total_spend ≤ 1.0).
+  3. Force GLM_fallback due to none_low_flag (and missingness).
+  4. SRM_score computed; in none_low cases SRM designed to reflect reliability of non‑spend signals (likely moderate-to-high since CryoSleep is a strong indicator).
+  5. GLM_fallback v3 receives enriched features (CryoSleep=True, Cabin deck, Age 33, missingness flags). GLM p_lower computed; because CryoSleep is a strong positive predictor, GLM_p_lower likely ≥ 0.75.
+  6. Decision rule for none_low with strong non‑spend indicator: GLM_p_lower ≥ 0.75 → return True. Persist full provenance and route record to audit queue (none_low & True).
+- Net: v2.9 would not have returned a confident False. It would have invoked GLM and likely returned True (matching actual) or at minimum Abstain for human review. This eliminates the FN seen in v2.8 for 0064_02.
+
+Immediate operational actions (24–72 hours)
+1. Implement deterministic none_low detection + missingness flags and force GLM_fallback for these records.
+2. Increase min_se_logit for none_low cluster to 0.22.
+3. Route all none_low predicted True records to human audit queue.
+4. Add 0064_02 and prior failure cases to retraining/audit set and label contexts.
+5. Start quick SRM v2 fitting focusing on none_low reliability and retrain GLM_fallback with missingness features and oversampled zero‑spend positives.
+
+Near term (1–14 days)
+1. Deploy SRM v2 + GLM_fallback v3 + per_cluster covariance and min_se enforcement.
+2. Run validation sweeps and tune none_low thresholds, min_se, and GLM acceptance thresholds.
+3. Adjust batch precommit checks and monitoring dashboards.
+
+Medium/long term
+- Iteratively improve SRM and GLM with labeled audit set, active learning on Abstain cases, and automated policy learning for routing.
+- Move to per‑segment and per‑channel priors and refined calibration maps.
+
+Expected tradeoffs
+- Short term: more GLM_fallback usage, higher audit load and a small increase in latency/compute, but a meaningful reduction in zero‑spend FNs.
+- Medium term: improved calibration and lower FN rate in none_low without sacrificing high‑spend FP gains.
+- Risk: being too permissive on none_low could increase FPs; mitigated by GLM thresholds, abstain path, and audit.
+
+Validation success signals (post‑deployment)
+- Zero_spend FN rate reduced ≥ 50% vs baseline.
+- High_spend FP rate reduction ≥ 50% preserved.
+- Abstain fraction ≤ 5–8% after tuning.
+- Per‑cluster ECE & Brier improved >10% in none_low regime.
+- CI coverage per cluster close to nominal in validation.
+
+Deliverables I can produce next (deterministic, versioned)
+- Deterministic Python scorer skeleton implementing v2.9 (none_low + missingness + SRM v2 stub + GLM_fallback v3 stub + diagnostics).
+- LOO validation report on your labeled set demonstrating behavior for edge cases (0045_01, 0053_01, 0061_01, 0062_01, 0064_02) under v2.9.
+- Unit tests, audit log schema and batch precommit checks for new diagnostics.
+
+One‑line summary: v2.9 adds deterministic none_low/missingness handling, forces GLM review for zero‑spend records with strong non‑spend signals, raises uncertainty for none_low, and persists full provenance — preventing zero‑spend false negatives like 0064_02 while preserving v2.8 improvements for high‑spend failures.
+
+Which deliverable would you like first: the scorer skeleton, the LOO validation run on your labeled set, or both?
+
+============================================================

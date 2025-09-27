@@ -1,0 +1,86 @@
+CYCLE 3 STRATEGIC REFLECTION
+Generated on: 2025-09-09 13:21:54
+Cycle Performance: Best 58.35%, Average 55.20%
+Total Iterations: 10
+
+================================================================================
+
+Strategic reflection
+
+1) Patterns observed
+- C is the dominant driver. Most reliable separations start by segmenting on C (very low, mid, high), with distinct behaviors inside each band.
+- Differences between E and D matter. The single use of ed = E − D was high-yield: large positive ed at low-to-mid C pointed to class 4; large negative or very high E vs low D at high C pointed to class 2.
+- High C with very low D cleanly split classes when paired with E:
+  - High C + very low D + very high E → class 2
+  - High C + very low D + very low E → class 3
+  - High C + low E (even with moderate D) → class 4
+- B is a useful reinforcer for class 2 in mid-to-high C regions; A was only weakly used but A + B high reinforced class 1 defaults.
+- Local “boxes” in C,D,E around (C≈35–40, D≈30–40, E≈25–40) were effective for class 4, suggesting small convex neighborhoods can capture compact modes.
+
+2) Failure analysis
+- Boundary conflicts and rule ordering: Overlaps among high-C rules create brittle behavior (e.g., class 2 vs 4 competition when E is low-to-mid and D is small). Early returns likely mask later, more precise rules.
+- Mid-C ambiguity (C≈30–65) with balanced D and E remains noisy. Defaults to class 1 likely inflate errors here.
+- Sensitivity to thresholds: Off-by-5 around thresholds flips outcomes. No “buffer” logic exists to arbitrate near-boundary inputs.
+- Underutilization of A and B: B is sporadically helpful; A is nearly unused except in A+B≥165. Potential signal is left on the table, especially as tiebreakers in ambiguous regions.
+- Sparse handling of ratios: Only one ed usage; no normalization by C or sums. Scale effects (e.g., “E big relative to D but both small vs large”) aren’t captured.
+
+3) Innovation opportunities
+- Derived features that encode relative relationships, not just raw thresholds: ratios (E/D, D/C, E/C), normalized differences ((E−D)/C, (C−mean(D,E))/C), and max/min constructs.
+- Replace chains of if/else with additive scoring per class (one-vs-rest signals) to reduce order sensitivity and use multiple weak cues simultaneously.
+- Prototype/centroid thinking in a transformed feature space (e.g., [C, E−D, mean(D,E)]), with nearest-prototype selection, then refined by high-confidence overrides.
+- Hysteresis bands around key thresholds to route near-boundary cases to secondary decision logic instead of hard jumps.
+- Systematic tiebreakers using A and B (e.g., B vs mean(D,E), or A+B vs C+E) in mid-C ambiguous zones.
+
+4) Strategic direction for next cycle
+- Prioritize a hybrid decision architecture: top-level gating by C bands, then class scores built from difference/ratio features, with small high-confidence overrides.
+- Expand the ed family: use ed, cd = C−D, ce = C−E, and their normalized versions to capture relative structure consistently.
+- Introduce ratio thresholds with guards (to avoid division pitfalls) for discriminating class 2 vs 4.
+- Add boundary buffers (±5 windows) and use B (and A+B) as tiebreakers within these windows.
+- Consolidate overlapping rules; convert fragile “micro-boxes” into either prototype distances or score contributions so they compose rather than conflict.
+
+Creative planning: specific strategies to test
+
+1) Difference–ratio hybrid features with explicit gates
+- New features: ed = E−D, cd = C−D, ce = C−E, mDE = (D+E)/2, r_ED = E/(D+1), r_eC = (E−D)/(C+1), r_DC = D/(C+1), r_EC = E/(C+1).
+- Class 2 signals: r_ED ≥ 1.8 with C≥55; r_eC ≥ 0.6 with D≤20; B≥85 strengthens class 2 in C∈[45,80].
+- Class 4 signals: r_ED ≤ 0.6 with C≥70 and E≤35; cd ≥ 35 and E≤25; ed ≥ 35 when C≤50.
+- Class 3 signals: C≥70 and D≤10 and E≤12; additionally, C low (≤25) with E≤20 and D in 25–40.
+- Class 1 signals: otherwise; boosted when A+B is high relative to C+E (e.g., A+B ≥ C+E+30).
+- Implement as additive evidence per class to reduce order dependence.
+
+2) One-vs-rest additive scoring with negative evidence
+- For each class k, maintain a score s_k accumulated from:
+  - Strong positive indicators (e.g., high C & very low D & very low E for class 3).
+  - Moderate indicators (e.g., B high with mid/high C for class 2).
+  - Negative evidence (e.g., penalize class 2 if E≤25 and C≥80; penalize class 4 if r_ED≥2.0).
+- Choose argmax s_k; only then apply a tiny set of high-confidence overrides (like “C≥88 & E≤25 → 4”) to keep previous cycle’s strongest wins.
+
+3) Nearest-prototype voting in transformed space
+- Define 3D embedding z = [C, ed, mDE] (optionally add r_ED).
+- Prototypes (initially hand-set from observed strong regions, then refined):
+  - Class 2: high C, high ed, high mDE.
+  - Class 4: high C, high cd and low E (i.e., ed moderately negative to positive but mDE low).
+  - Class 3: high C, very low D and E (low mDE), ed near 0.
+  - Class 1: mid C, balanced D/E, moderate mDE, small |ed|.
+- Distance-weighted vote (with weights emphasizing ed and mDE), then break ties with B or A+B.
+
+4) Boundary smoothing and tie-resolution bands
+- For any threshold T, create a ±5 “gray zone”:
+  - If feature is in gray zone, defer from making a hard assignment and consult secondary cues: ratios, A+B vs C+E, B vs mDE, or prototype distance margin.
+- Example: For “C≥75 & D≤10 & E≤10 → 3,” if C∈[70,75] or D∈(10,15], check r_ED and B to decide between 2 and 3.
+
+5) Systematic use of A and B as tiebreakers
+- When primary signals disagree (scores within 1 point or prototype distances within a small margin):
+  - If B − mDE ≥ 15 or B≥90, bias toward class 2 in C≥45.
+  - If A+B ≥ C+E+30, bias toward class 1.
+  - If B≤70 and E≤25 with mid/high C, bias toward class 4.
+- Add a low-C rule using B and sums: for C≤25, if D+E is small but B is high, prevent false class 4 by steering toward 2 or 1 based on r_ED.
+
+Execution priorities for next cycle
+- First, refactor to a score-based scheme with the difference–ratio feature set, preserving top 3–4 high-confidence overrides that drove the best gains.
+- Second, insert boundary buffers and tiebreakers using B and A+B logic.
+- Third, prototype-space voting as a backstop for mid-C ambiguity.
+- Finally, prune redundant or conflicting micro-rules and re-check coverage on known hard regions (high C with low E vs high E; mid C with balanced D/E; tiny C corner cases).
+
+Expected outcomes
+- Reduced brittleness from rule ordering, better handling of mid-C balanced cases, and improved discrimination between class 2 and 4 via ratio features and smoothed boundaries, with A/B leveraged as consistent tiebreakers.

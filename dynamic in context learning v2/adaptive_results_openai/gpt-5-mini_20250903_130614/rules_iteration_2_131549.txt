@@ -1,0 +1,47 @@
+PREDICTIVE RULES - ITERATION 2
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. Define total_spend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck (treat missing/NaN as 0). Apply cabin‑level aggregation when passengers share the same cabin id: use the same Transported prediction for all cabinmates (apply the rules below at the cabin level and then assign to each cabinmate); when cabinmates' signals conflict, use the majority cabin signal; if tie, fall back to rule ordering below.
+
+2. Age / family rules (highest priority after cabin consensus):
+   - If Age <= 7, Predict Transported = True.
+   - If 8 <= Age <= 17 AND one or more adult (Age >= 18) cabinmates exist who meet transported criteria (e.g., CryoSleep + near‑zero spending, Age >=60, or VIP), Predict Transported = True (children follow guardians).
+   - If Age >= 60, Predict Transported = True.
+
+3. Refined CryoSleep rule:
+   - If CryoSleep == True AND total_spend <= 1 (all amenity spend ≈ 0):
+     - If HomePlanet is Europa or Mars, Predict Transported = True.
+     - If HomePlanet is Earth or unknown, Predict Transported = True only when at least one additional positive signal exists (Age <= 18, VIP == True, or destination is 55 Cancri e); otherwise Predict Transported = False.
+   - If CryoSleep == True AND total_spend > 1 (any non‑zero spending), Predict Transported = False.
+
+4. Strong entertainment/spa negative signal:
+   - If VRDeck >= 2000 OR Spa >= 2000, Predict Transported = False.
+   - If (VRDeck + Spa) >= 0.6 * total_spend AND total_spend >= 2000, Predict Transported = False.
+
+5. Active consumption positive signal:
+   - If (FoodCourt + ShoppingMall) >= 1000 AND (FoodCourt + ShoppingMall) >= (VRDeck + Spa), Predict Transported = True.
+
+6. Large total spending nuance:
+   - If total_spend >= 5000 then:
+     - If VRDeck+Spa >= 0.5 * total_spend, Predict Transported = False.
+     - Else Predict Transported = True (do not treat large totals as automatic "not transported"; composition matters).
+
+7. VIP handling:
+   - If VIP == True AND (CryoSleep == True OR total_spend <= 1), Predict Transported = True (priority/preservation signal).
+   - If VIP == True but spending composition is dominated by entertainment (VRDeck >= 2000 or Spa >= 1000), treat as strong evidence of active use and Predict Transported = False.
+
+8. HomePlanet baseline adjustments:
+   - When signals are ambiguous, bias toward Predict Transported = True for HomePlanet == Europa, bias moderately toward True for HomePlanet == Mars, and require extra positive evidence (Age child/senior, VIP, or strong FoodCourt+ShoppingMall signal) to Predict Transported = True for HomePlanet == Earth.
+
+9. Destination baseline adjustments:
+   - When signals are ambiguous, destinations 55 Cancri e and TRAPPIST-1e bias toward Predict Transported = True for low‑spend or CryoSleep cases; destination PSO J318.5‑22 biases toward Predict Transported = False for CryoSleep cases unless overridden by strong child/senior/VIP signals.
+
+10. Mixed signal resolution (precedence):
+   - Resolve conflicts using the following precedence (higher overrides lower): cabin consensus → Age/family rules → CryoSleep refined rule → entertainment/spa negative signal → active consumption positive signal → VIP → HomePlanet/Destination bias. Use the first applicable rule above to assign the prediction.
+
+11. Missing / insufficient information fallback:
+   - If none of the above rules apply or available information is insufficient to form a confident decision, Predict Transported = False.
+
+============================================================

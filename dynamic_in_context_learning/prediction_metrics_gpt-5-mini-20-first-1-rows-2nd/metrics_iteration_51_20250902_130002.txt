@@ -1,0 +1,246 @@
+PREDICTIVE METRICS - ITERATION 51
+============================================================
+
+Updated Predictive Metrics Report — v3.4.1 (post_0074_01)
+
+Version & goal
+- Version: v3.4.1 (post_0074_01)
+- Goal: correct over‑conservative gating introduced in v3.4.0 that produced false negatives (notably 0074_01) while retaining the reductions in false positives (e.g., 0071_01, 0073_01). Do this by (a) adding a dual-channel posterior (TP-aware + FP-aware) and a principled model/priors combination (p_combined) that automatically trusts ensemble predictions when channel sample counts are low, (b) softening blanket channel bans via dynamic exceptions driven by posterior mean, ensemble consensus and spend-shape, and (c) recalibrating uncertainty so strong ensemble evidence is not over-shrunk by FP penalties.
+
+Executive summary — immediate takeaway and top priorities
+- Immediate failure mode: v3.4.0 tightened FP gating (correctly) but treated medium/near‑extreme concentrated-channel patterns (FoodCourt / ShoppingMall / VRDeck) as uniformly “risky.” That caused over‑attenuation of the aggregator/ensemble in low-sample clusters and produced false negatives (0074_01). Two compounding causes:
+  1. Channel-only FP_risk gating with heavy EB shrinkage and a high global negative prior in certain channels → overrule of strong ensemble evidence in undersampled clusters.
+  2. One‑sided resampling in retraining (negative oversampling for troublesome channels) biased GLM away from true‑positive patterns for those channels.
+- Top priorities (deploy in order):
+  1. 24–72h: compute and expose both posterior_mean (TP-aware) and FP_risk per (channel, cluster, age_bucket); implement p_combined = weighted blend of channel posterior and ensembled model probability with data-driven weight that depends on sample_count; add top2_share and top_channel_percentile_by_demo to preprocessor; add near‑extreme detection (treat near‑95% but top2≈1 as extreme). Shadow-deploy decision rules and rerun the batch that produced 0074_01.
+  2. 1–14d: retrain GLM with balanced oversampling (positives & negatives) for FoodCourt/ShoppingMall/VRDeck and add spend-shape interactions (top2_share, entropy, percentile-by-demo). Implement dual-risk DecisionRisk (AcceptRisk & RejectRisk) and a symmetric audit router.
+  3. Long: weekly active learning loop (priority audit labels feed back weekly), continual reweighting of channel priors, per-channel evolving calibrators.
+
+Answers to the six questions
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Case facts (0074_01):
+  - Spends: RoomService=1, FoodCourt=8,397, ShoppingMall=0, VRDeck=506 → total = 8,904.
+  - top_channel = FoodCourt, top_contrib_share ≈ 8397 / 8904 ≈ 0.9432 (medium band; very near extreme).
+  - top2_share ≈ (8397 + 506) / 8904 ≈ 0.9999 (extremely concentrated top2).
+  - Age = 42, HomePlanet = Europa, CryoSleep = False.
+- How metrics failed:
+  - v3.4.0 applied conservative FP_risk gating for FoodCourt (one of the "risky" channels). Because top_contrib_share was just under the extreme threshold (0.95) the record landed in medium routing and was subject to strict channel FP gating.
+  - ChannelReliabilitySigned/posterior had low sample_count for this (channel, cluster) and was shrunk toward a global negative prior, so posterior_mean was low and FP_risk high; the scorer attenuated aggregator contribution and required high GLM/SRM consensus that was not present (GLM had been biased by negative oversampling).
+  - The ensemble/model evidence (which in many cases was sufficient) was effectively underweighted vs. the channel prior; DecisionRisk logic did not treat "strong ensemble + near‑extreme spend concentration" as a positive exception → model predicted False (FN).
+  - Net: blind reliance on channel-level FP risk + aggressive negative oversampling produced a miss of a genuine transport signal for 0074_01.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+Key principle: combine channel priors and model ensemble probabilistically, and make the prior weight explicit and dependent on sample_count and posterior stability. Introduce symmetric risk detection (AcceptRisk & RejectRisk) and near‑extreme exceptions.
+
+Concrete changes (v3.4.1):
+- Channel posterior (two quantities)
+  - posterior_mean_kC = (TP_kC + s) / (TP_kC + FP_kC + 2*s) — this is the channel/cluster posterior for "P(transport | top_channel=C)". s = 5 Laplace default.
+  - FP_risk_kC = (FP_kC + s) / (TP_kC + FP_kC + 2*s) = 1 − posterior_mean_kC. Keep and expose both values + posterior_se.
+  - Maintain exponential time decay (weekly half-life) for TP/FP counts.
+- Blend channel prior and ensemble (p_combined)
+  - ensemble_mean E = wA * aggregator_p + wG * GLM_p + wS * SRM_p (default weights wA=0.5, wG=0.3, wS=0.2).
+  - posterior_mean P = posterior_mean_kC (if sample_count=0 use global channel prior).
+  - weight on posterior: w_post = sample_count / (sample_count + τ) where τ = 50 (controls how many examples are needed to trust channel posterior).
+  - p_combined = w_post * P + (1 − w_post) * E.
+  - Intuition: if the channel×cluster has many labeled examples, prefer the posterior; if it's undersampled, default to ensemble.
+- Near‑extreme rule (avoid borderline cutoff artifacts)
+  - Treat records with (top_contrib_share ≥ 0.90 AND top2_share ≥ 0.99) as "near‑extreme" and evaluate as if extreme for routing (i.e., they are strong spend-shape evidence).
+- Single_spike band routing (update)
+  - low [0.50–0.70): require 2/3 consensus OR p_combined ≥ 0.80.
+  - medium [0.70–0.95): for risky channels (FoodCourt/VRDeck/ShoppingMall) do not blanket-disable rescue. Instead:
+    - If sample_count_kC ≥ cluster_min_n (default 30): apply FP_risk gating: require p_combined ≥ 0.80 AND aggregator_p_lower ≥ 0.85; else route to audit.
+    - If sample_count_kC < cluster_min_n: rely on ensemble consensus: accept if E ≥ 0.88 OR (E ≥ 0.80 AND top_channel_percentile_by_demo ≥ 0.95 AND top2_share ≥ 0.99). Otherwise route to audit rather than auto-reject.
+  - extreme (≥ 0.95 or near-extreme): allow rescue if p_combined ≥ 0.75 OR (E ≥ 0.85 AND posterior_mean_kC ≥ 0.20). Avoid blanket rejection based solely on channel FP_risk.
+- Symmetric DecisionRisk & audit routing
+  - Compute AcceptRisk and RejectRisk:
+    - AcceptRisk = FP_risk_kC * (1 − E) + 0.25 * spend_extremeness + 0.25 * dir_uncertainty
+    - RejectRisk = (1 − posterior_mean_kC) * E + 0.25 * spend_extremeness + 0.25 * dir_uncertainty
+  - DecisionRisk = max(AcceptRisk, RejectRisk).
+  - Route to audit if DecisionRisk > 0.40 OR if AcceptRisk and RejectRisk are both >0.25 (contradiction).
+  - Rationale: this flags both “dangerous accepts” and “dangerous rejects” and ensures high‑evidence contradictions are audited.
+- Retraining sampling strategy
+  - Replace the previous one‑sided negative oversampling with stratified reweighting: for historically noisy channels, oversample negative examples for model exposure but also upweight recent positives (last 12 weeks) to avoid missing newly emerging transport patterns.
+  - Add targeted synthetic positive augmentation for extreme spend-shape cases (when label distribution supports it) to improve GLM recall on extreme/near‑extreme spends.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Channel semantics strongly interact with cluster/demographics and spend-shape:
+  - Very large single-channel spends (FoodCourt at 94.3% share, top2 ~99.99%) are often highly informative and in some clusters are strong transport indicators — being just under a fixed "extreme" threshold should not cause a different routing decision.
+  - Top2_share ≈ 1 often indicates an event-driven concentrated session (large single merchant + small ancillary spend). In many clusters that is positive evidence (transport), but in some other clusters it's non-transport (marketplace, bulk shopping), so we must consider cluster-specific posteriors and sample counts.
+- Low-sample clusters are risky for prior-based gating: aggressive shrink towards a negative global prior will produce false negatives if the cluster has a different behavior. Models must default to ensemble agreement (and top_channel_percentile) when channel statistics are weak.
+- Operational lesson: channel FP behavior evolves; both FP_risk and TP evidence should be tracked. A single FP-focused correction (negative oversampling) can introduce systematic FNs.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Two-step recalibration (v3.4.1):
+  1. Combine model/priors into p_combined (see above). Compute combined standard error via conservative propagation:
+     - var_combined ≈ w_post^2 * var_post + (1 − w_post)^2 * var_ensemble (ensemble variance from bootstrap SEs).
+     - se_combined = sqrt(max(var_combined, base_min_se^2)).
+  2. Apply FP/TP-aware z-scaling but reduce penalization when ensemble is strong:
+     - base_z = 1.645
+     - ensemble_strength = E
+     - z_adj = base_z * (1 + max(0, FP_risk_kC − posterior_mean_kC)*1.0 + dir_uncertainty*0.6) * (1 − min(0.5, ensemble_strength))
+       - This ensures that as the ensemble gets stronger we do not inflate z excessively.
+     - p_lower = p_combined − z_adj * se_combined
+- Shrinkage rule (avoid over‑shrink when there is strong ensemble/shape evidence):
+  - p_final = p_calibrated / (1 + 0.2 * FP_risk_kC * (1 − ensemble_strength))
+  - This reduces shrinkage when ensemble_strength is high.
+- Calibrators:
+  - Retrain Platt/isotonic calibrators that include covariates: FP_risk_kC, top2_share, spend_entropy, top_channel_percentile_by_demo. Use per-channel calibrators only if channel_count ≥ 150; else use EB-shrunk global calibrator.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persist and version Channel×Cluster tables with fields: TP_count, FP_count, posterior_mean, posterior_se, FP_risk, sample_count, last_update, rescue_allow_override, q_C_k.
+- Precommit/CI checks (new):
+  - Prevent deployments that increase per-channel medium_single_spike_reject_rate > baseline + 10% (avoid surges in FNs).
+  - Also enforce per-channel medium_single_spike_accept_rate not to exceed baseline + 10% (avoid sudden FP surges).
+  - If any channel FP_risk delta > 0.05 in last 24h → block auto-deploy until manual review/staged rollout.
+  - Add canary test: run shadow inference on a stratified sample (including previous false positives and false negatives) and require (a) FP reduction ≥ target or (b) no FN increase > 20% on priority channels.
+- Audit queue & monitoring:
+  - Add priority FN-audit triggers: medium_single_spike rejected AND (E ≥ 0.80 OR top2_share ≥ 0.99) → priority audit.
+  - Dashboard metrics: per_channel × age_bucket FN_rate, FP_rate, p_combined stats, DecisionRisk deltas, sample_count trends, audit latency.
+- Release controls:
+  - Staged rollout for changes to channel priors: 10% shadow → 50% → full, with stop conditions based on FN/FP metrics.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- ChannelReliabilitySigned v3.1:
+  - Keep Beta posterior with s=5 smoothing and weekly time decay. Persist posterior_mean, FP_risk, posterior_se, credible intervals and posterior draws for debug reproducibility.
+  - Expose sample_count and "stability_score" = posterior_mean / posterior_se to gate trust.
+- New metrics to compute per record:
+  - top2_share, spend_entropy, top_channel_percentile_by_demo, num_nonzero_channels, near_extreme_flag (top_contrib_share ≥ 0.90 & top2_share ≥ 0.99), top_channel_conflict_flag (top2 channels disagree on cluster_dir).
+- Model and training:
+  - GLM_fallback v8: include top_channel×Age_bucket, top_channel×Destination, top2_share, spend_entropy, top_channel_percentile_by_demo, channel_FP_risk, and a "near_extreme" feature.
+  - Balanced resampling: for FoodCourt/ShoppingMall/VRDeck use experimental combined oversampling — oversample negatives to reduce FP, but upweight recent true positives to avoid FNs. Target: reduce FP rate by ≥50% on those channels while keeping FN change ≤ 10% in validation.
+  - SRM_v5: return score + SE; incorporate p_combined as a feature for meta-models.
+- Active learning:
+  - Priority audits feed into a high-weight buffer. Retrain models weekly for channels with FP_risk or TP drift > 0.05.
+
+Case diagnosis — 0074_01 (what happened)
+- Numeric recap: top_contrib_share ≈ 0.9432 (medium but very near 0.95), top2_share ≈ 0.9999 (extremely concentrated); total spend ≈ 8,904.
+- Likely path to FN:
+  - v3.4.0: FoodCourt flagged as a risky channel; channel posterior for this cluster had low sample_count → shrink to global negative prior → posterior_mean low and FP_risk high.
+  - Aggregator contribution was attenuated by FP_risk gating. GLM had been biased by negative oversampling (fewer positive FoodCourt examples in training), so ensemble evidence E was not high enough to overcome posterior suppression.
+  - DecisionRisk logic did not flag the contradiction (near‑extreme spend + insufficient ensemble) for audit; system auto-predicted False.
+- Signals that should have triggered caution: near‑extreme spend (top2 ~ 0.9999), top_channel_percentile_by_demo (should be very high), low spend_entropy. Under v3.4.1 those signals would boost ensemble reliance and lead to audit/accept rather than reject.
+
+Decision-rule changes (concrete, v3.4.1)
+- p_combined weighting (implementation formula):
+  - P = (TP_kC + s) / (TP_kC + FP_kC + 2*s)
+  - E = 0.5*aggregator_p + 0.3*GLM_p + 0.2*SRM_p
+  - w_post = sample_count / (sample_count + τ), τ = 50
+  - p_combined = w_post * P + (1 − w_post) * E
+- Single_spike routing:
+  - low [0.50–0.70): accept if p_combined ≥ 0.80 OR 2/3 model consensus; else audit.
+  - medium [0.70–0.95):
+    - If sample_count ≥ cluster_min_n (30): require p_combined ≥ 0.80 AND aggregator_p_lower ≥ 0.85 for risky channels.
+    - If sample_count < cluster_min_n: accept if E ≥ 0.88 OR (E ≥ 0.80 AND top_channel_percentile_by_demo ≥ 0.95 AND top2_share ≥ 0.99); else audit.
+  - extreme (≥0.95 or near‑extreme): accept if p_combined ≥ 0.75 OR E ≥ 0.85; if posterior_mean_kC ≥ 0.05 allow lower ensemble thresholds.
+- Audit gating:
+  - DecisionRisk > 0.40 → audit.
+  - Contradiction flag (AcceptRisk and RejectRisk both > 0.25) → priority audit.
+- Retraining policy:
+  - Replace pure negative oversample with balanced upweighting: for suspected channels, increase weight on both false positives and recent true positives during GLM training by factor 2, while keeping calibration targets.
+
+Calibration adjustments
+- se_combined (propagate from posterior and model SEs), then z_adj and p_lower computed as above.
+- Reduce hard shrink for high ensemble_strength: ensemble_strength reduces FP penalty by up to 50%.
+- Per-channel calibrator trained only if channel_count ≥ 150; otherwise EB‑pooled calibrator.
+
+Consistency & monitoring
+- Versioned tables: Channel×Cluster with TP/FP/posterior_mean/posterior_se/sample_count/rescue_override.
+- Precommit checks:
+  - No release that increases per-channel medium_single_spike_reject_rate_by_channel > baseline + 10%.
+  - No release that increases FN_count on priority channels by > 15% on a stratified holdout set.
+- Audit queue triggers:
+  - medium_single_spike rejected AND (E ≥ 0.80 OR top2_share ≥ 0.99) → priority audit.
+  - top2_share > 0.99 + contradictory cluster_dir_signs → priority audit.
+- Dashboards:
+  - per_channel × age_bucket FN/FP, p_combined distribution, DecisionRisk breakdown, sample_count trend, audit latency.
+
+Model & feature updates
+- ChannelReliabilitySigned v3.1: Beta posterior (s=5) + weekly decay; store draws; compute posterior stability metric.
+- GLM_fallback v8:
+  - New features: top_channel×Age_bucket, top_channel×Destination, top2_share, spend_entropy, top_channel_percentile_by_demo, channel_FP_risk, near_extreme_flag.
+  - Balanced resampling/upweighting for both positives and negatives in historically noisy channels.
+  - Return bootstrap SE.
+- SRM_v5: include channel posteriors & p_combined as features.
+- CoverageGuard retrain: predict SE including FP_risk, TP_support, spend_shape, and model disagreement.
+
+Deterministic scoring pipeline (v3.4.1)
+1. Snapshot load: cluster centroids, channel×cluster posterior table (TP/FP/posterior_mean/posterior_se/sample_count), GLM/SRM versions, calibrators, deterministic RNG seed.
+2. Per-record features: top_channel, top_contrib_share, top2_share, spend_entropy, num_nonzero_channels, top_channel_percentile_by_demo, cluster_id.
+3. EdgeDetector: near_extreme_flag (top_contrib_share ≥ 0.90 & top2_share ≥ 0.99), low_entropy_flag, contradiction_flag.
+4. ChannelReliability lookup: posterior P, FP_risk, sample_count, posterior_se.
+5. Aggregator, GLM, SRM predictions + SEs.
+6. Ensemble E = weighted average.
+7. p_combined = w_post*P + (1 − w_post)*E.
+8. Compute se_combined, z_adj and p_lower.
+9. Compute AcceptRisk & RejectRisk → DecisionRisk. Apply single_spike band routing rules and accept/audit/reject decisions as per v3.4.1 rules.
+10. Persist full provenance (P, FP_risk, E, p_combined, SEs, DecisionRisk, edge flags) and reason_code.
+11. Post-batch checks & alerts (precommit constraints, large FN/FP deltas).
+
+Default parameters (v3.4.1 initial)
+- single_spike thresholds: low 0.50, medium 0.70, extreme 0.95; near_extreme detection: top_contrib_share ≥ 0.90 & top2_share ≥ 0.99.
+- Channel posterior smoothing s = 5; EB shrinkage τ_posterior = 50 for w_post; cluster_min_n = 30.
+- p_accept thresholds: p_combined ≥ 0.80 for medium (sample_count ≥ min_n); E ≥ 0.88 for low-sample medium accept.
+- ensemble weights: aggregator 0.5, GLM 0.3, SRM 0.2.
+- DecisionRisk thresholds: audit if DecisionRisk > 0.40; high-priority audit if > 0.60.
+- Calibration: base_z = 1.645; se_fp_scale = 0.20 but reduced by ensemble_strength factor.
+- per_channel calibrator min_n = 150.
+
+Validation experiments & metrics
+- Holdouts: stratify by cluster, top_channel, Age_bucket; include priority cases: 0069_01 (RoomService TP), 0070_01 (VRDeck FP), 0071_01 (FoodCourt FP), 0073_01 (ShoppingMall FP), 0074_01 (current FN).
+- Metrics:
+  - per_channel_per_cluster FN/FP rates
+  - p_combined calibration: Brier, ECE, CI coverage
+  - audit fraction & latency
+  - rescue_auto_accept fraction and change vs baseline
+- Success criteria for v3.4.1 vs v3.4.0:
+  - Reduce prior FPs (ShoppingMall/FoodCourt/VRDeck medium FPs) by ≥40% vs v3.3 baseline AND
+  - Recover ≥70% of missed true positives like 0074_01 (false negatives) vs v3.4.0,
+  - Keep overall FN increase ≤ 10% and audit fraction within operational capacity.
+- Parameter sweeps:
+  - τ ∈ {25,50,100}
+  - cluster_min_n ∈ {20,30,50}
+  - medium E thresholds ∈ {0.80,0.85,0.88}
+  - DecisionRisk thresholds ∈ {0.35,0.40,0.45}
+- Ablations:
+  - With/without p_combined; with/without near_extreme; different sampling strategies.
+
+Immediate operational actions (24–72 hours)
+1. DataEngineering: compute and persist channel×cluster posterior table (TP/FP/posterior_mean/posterior_se/sample_count) with weekly decay; expose to scorer.
+2. ScoringEngineers: add top2_share, spend_entropy, top_channel_percentile_by_demo, near_extreme_flag to preprocessor; implement p_combined and updated routing rules; run backtest on the batch that produced 0074_01.
+3. ML Team:
+   - Retrain GLM_fallback with balanced oversampling for FoodCourt/ShoppingMall/VRDeck (positives upweighted alongside negatives), ship in shadow.
+   - Retrain calibrators including FP_risk and spend-shape covariates.
+4. Ops/SRE: add precommit checks for FN/FP deltas and push CI tests (stratified canary).
+5. Ops: ensure audit capacity for immediate priority audits; start routing DecisionRisk>0.60 cases to expedited human review.
+
+Expected tradeoffs & mitigations
+- Relaxing blanket channel bans → some increase in audit volume and potential small FP increases.
+  - Mitigation: staged rollouts, targeted retraining, maintain rescue_allow defaults (RoomService lenient) and tune per-channel acceptance thresholds.
+- Balanced resampling increases modeling complexity; require careful validation and LOO checks.
+
+How v3.4.1 would handle 0074_01 (concrete flow)
+1. Feature extraction: top_contrib_share ≈ 0.9432 (near-extreme condition true because top2_share ≈ 0.9999).
+2. Channel posterior lookup: sample_count_kC checked. If sample_count < cluster_min_n, w_post is small → ensemble E dominates.
+3. ensemble E = weighted aggregator/GLM/SRM. Given extremely concentrated spends and model evidence, E is likely high.
+4. p_combined = small_w_post*P + (1 − small_w_post)*E → p_combined ≈ E.
+5. p_combined likely ≥ threshold (0.88 or 0.80 depending on settings) because spend-shape + ensemble strong → accept or route to audit if DecisionRisk high.
+6. Decision: auto-accept (True) or audit priority if contradictions; net effect: avoid the FN that happened under v3.4.0.
+
+Deliverables I will produce next (deterministic & versioned)
+- Deterministic scorer skeleton (Python pseudocode) implementing v3.4.1 rules (p_combined, near_extreme, DecisionRisk) with unit tests and deterministic seeds.
+- Shadow retrain: GLM_fallback v8 with balanced oversampling (positives & negatives) for priority channels; stratified validation report.
+- LOO validation report comparing v3.3, v3.4.0, v3.4.1 with recommended operating points and parameter sweep results.
+- Audit log schema, precommit rule definitions that include FN constraints, and dashboard KPI spec.
+- Prioritized 72‑hour implementation checklist (owners, artifacts).
+
+One-line summary
+v3.4.1 keeps v3.4.0’s FP-risk-aware guards but replaces blanket channel bans with a principled p_combined (posterior + ensemble) weighting, a near‑extreme exception, and symmetric DecisionRisk auditing—restoring true positive recall (e.g., 0074_01) while preserving FP reductions.
+
+Would you like me to:
+- generate the deterministic scorer skeleton (Python pseudocode + unit tests) now, or
+- run the stratified LOO validation (v3.4.0 vs v3.4.1) and return the validation report with recommended operating points?
+
+I recommend starting with the deterministic scorer skeleton and shadow rerun on recent batches (including 0074_01 and previous FPs) so we can validate the rule changes before retraining.
+
+============================================================

@@ -1,0 +1,248 @@
+PREDICTIVE METRICS - ITERATION 55
+============================================================
+
+Updated Predictive Metrics Report — v3.4.4 (post_0081_01)
+
+Version & high‑level goal
+- Version: v3.4.4 (post_0081_01).
+- High‑level goal: extend v3.4.3 by (A) explicitly handling all‑zero spend / missing‑spend edge cases and CryoSleep‑conditional priors, (B) adding small‑batch (including single‑record) conservative gating, and (C) tightening calibration/uncertainty math so records like 0081_01 (all spends = 0, CryoSleep True) do not become unexpected false positives while preserving recall gains from earlier fixes (0074_01 / 0076_01) and FP controls for concentrated spends (0078_01).
+
+Executive summary — immediate takeaway and top priorities
+- Immediate failure mode observed (new batch):
+  - 0081_01 predicted True but actual False.
+    - Features: all channel spends = 0, total_spend = 0; CryoSleep = True; Age 13; HomePlanet = Earth; Cabin = G/13/S.
+  - Root observation: model/ensemble over‑trusted non‑spend signals (or correlated non‑channel features like cabin/cryosleep/age) in the absence of spend evidence. There was no zero_spend prior or batch_size conservative logic to temper the ensemble’s vote when channel evidence was null.
+- High‑priority fixes (deploy in order):
+  1. 0–48h: add zero_spend prior table + CryoSleep conditional priors; add zero_spend_flag and batch_size to preprocessing; implement small‑batch conservative gating and updated p_combined that includes zero_spend/Cryo priors; shadow run on recent batches including 0074_01, 0076_01, 0078_01, 0081_01.
+  2. 2–14d: retrain GLM/SRM to include zero_spend×(CryoSleep, Age_bucket, Cabin_deck) interactions and absolute_spend features; retrain calibrators with new covariates; run stratified validations.
+  3. Weekly: active learning loop prioritizing low‑evidence contradictions (e.g., all‑zero spends with strong ensemble vote) for audit and rapid retraining.
+
+Detailed answers to the six questions (integrated, actionable)
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Numeric recap (0081_01):
+  - RoomService = 0, FoodCourt = 0, ShoppingMall = 0, Spa = 0, VRDeck = 0 → total_spend = 0.
+  - CryoSleep = True; Age = 13; Cabin = G/13/S; HomePlanet = Earth.
+- How the metrics failed:
+  - No zero_spend prior existed: historical posterior for records with all channel spends = 0 was not computed/used. The ensemble (aggregator, GLM, SRM) relied on other features (cabin / cryosleep / age / homeplanet) and agreed — low model_disagreement — producing a confident accept.
+  - Because p_combined in v3.4.3 emphasized channel & pair priors and ensemble fusion, there was still no explicit "zero_spend" term to down‑weight cases with no spend signal. The alpha_post weighting focused on channel/pair counts; when those components are missing or low, the ensemble dominated.
+  - Small‑batch behavior: this record appeared in a 1‑record batch; we lacked a small‑batch conservative rule. With n=1, the scorer should be more conservative (higher uncertainty floor), but default base_min_se and alpha_post were not sufficiently adaptive for tiny batches.
+- Root cause summary:
+  - Missing special‑case prior for zero spends + insufficient small‑batch uncertainty → ensemble over‑trust and FP.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+Key principle: treat no‑spend records as a distinct data slice with their own priors and uncertainty; add small‑batch conservatism; incorporate CryoSleep conditional priors and explicit null‑feature handling.
+
+Concrete rule set (v3.4.4):
+
+- New persisted priors:
+  - Per‑channel (existing): posterior_mean_ch, posterior_se_ch, sample_count_ch.
+  - Per‑channel_pair (existing): posterior_mean_pair, posterior_se_pair, sample_count_pair.
+  - Zero_spend slice (new): TP_zero, FP_zero (decayed), posterior_mean_zero = (TP_zero + s_zero)/(N_zero + 2*s_zero), posterior_se_zero = sqrt(P*(1−P)/(N_zero + 1)), sample_count_zero = N_zero.
+  - Cryo conditional priors (new): posterior_mean_cryo_true, posterior_mean_cryo_false (optionally cross with zero_spend and cluster).
+- Preprocessing flags (must be computed and logged):
+  - zero_spend_flag = (total_spend == 0 OR num_nonzero_channels == 0).
+  - cryo_flag = CryoSleep (True/False/unknown).
+  - batch_size (records in current batch).
+- Hierarchical prior fusion (extend v3.4.3):
+  - Compute component weights:
+    - w_pair = sample_count_pair/(sample_count_pair + τ_pair)
+    - w_ch = sample_count_ch/(sample_count_ch + τ_ch)
+    - w_zero = sample_count_zero/(sample_count_zero + τ_zero)
+    - w_cryo = sample_count_cryo/(sample_count_cryo + τ_cryo)
+  - Normalize over non‑zero components present for the record; if component not applicable (e.g., pair absent) its weight is 0.
+  - P_prior = weighted average of available component posterior_means (pair, channel, zero, cryo, global_prior).
+  - var_prior = weighted sum of corresponding posterior variances (same normalization).
+  - alpha_post_total = (sum of sample_counts_of_present_components) / (sum + τ_total). This drives how much prior vs ensemble to trust.
+  - p_combined = alpha_post_total * P_prior + (1 − alpha_post_total) * E where E is ensemble mean (aggregator/GLM/SRM weighted).
+- Small‑batch conservative gating:
+  - If batch_size < small_batch_min (default small_batch_min = 10) then:
+    - Increase base_min_se = base_min_se_batch (default = 0.03 for n < 10; for n==1 use base_min_se = 0.05).
+    - Reduce alpha_post_total by a batch_shrink factor (make ensemble less dominant or more conservative depending on evidence) — we use a rule that increases se_combined and z_adj so only strong evidence yields auto‑accept.
+  - If zero_spend_flag == True:
+    - Require stronger ensemble evidence: accept only if E ≥ E_zero_high AND model_disagreement ≤ σ_low AND cryo_prior does not indicate accept.
+    - If E in [E_zero_med, E_zero_high) or cryo_prior contradictory or cryo_flag == True: route to priority_audit rather than auto‑accept.
+- Cryo conditional rules:
+  - If cryo_flag True and zero_spend_flag True: use posterior_mean_cryo_true_zero if sample_count_large — otherwise route to audit unless ensemble very high and model_disagreement very low.
+- Contradiction → priority_audit:
+  - If AcceptRisk and RejectRisk both exceed moderate thresholds or if p_combined crosses accept threshold while P_prior_zero_cryo strongly suggests reject, route to priority audit.
+
+Concrete numeric defaults (initial; validate/tune):
+- s_zero = 5; τ_zero = 100; τ_cryo = 80.
+- small_batch_min = 10; base_min_se_batch(n=1) = 0.05; base_min_se_batch(2–9)=0.03.
+- ensemble weights (E): aggregator 0.50, GLM 0.30, SRM 0.20.
+- E_zero_high = 0.92; E_zero_med = 0.85; σ_low = 0.05.
+- sample_count_zero_min = 50 (to make zero_spend prior trusted).
+- audit thresholds: reuse v3.4.3 audit_thresholds but escalate for zero_spend+cryo contradictions.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Zero spend is a meaningful slice:
+  - Many passengers with zero spend historically have markedly different transport rates than spenders; this slice can be either strong negative or positive depending on other covariates (CryoSleep, Cabin deck, Age). Treating zero spend as "no signal" is wrong — it is an informative signal and should have its own posterior.
+- CryoSleep modifies zero_spend meaning:
+  - CryoSleep = True with zero spend often corresponds to different operational outcomes (e.g., not transported) than CryoSleep False. We need cryo conditional priors.
+- Small batches are high risk:
+  - When batch_size is tiny the model can appear over‑confident; production needs a batch_size‑aware uncertainty floor.
+- Operational note:
+  - Previously we fixed concentrated spend FPs and undersampled channel × cluster FNs; this new FP shows that adding priors must also include “null” priors (zero_spend, missingness patterns). Missing or zero channels are a distinct cohort, not merely absence of evidence.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+Two‑stage uncertainty fusion extended to include zero/cryo/batch:
+
+- Variance building blocks:
+  - var_ch = posterior_ch*(1 − posterior_ch) / (N_ch + 1)
+  - var_pair = posterior_pair*(1 − posterior_pair) / (N_pair + 1)
+  - var_zero = posterior_zero*(1 − posterior_zero) / (N_zero + 1)
+  - var_cryo similarly if used.
+- var_prior = weighted sum of applicable component variances (weights = normalized w_*).
+- var_ensemble estimated from per‑model SEs (bootstrap or analytic) — var_ensemble = weighted var across aggregator/GLM/SRM.
+- var_combined = alpha_post_total^2 * var_prior + (1 − alpha_post_total)^2 * var_ensemble.
+- se_combined = sqrt(max(var_combined, base_min_se(batch_size)^2)).
+- z scaling:
+  - base_z = 1.645
+  - z_adj = base_z * (1 + γ1 * combined_FP_risk + γ2 * model_disagreement + γ3 * zero_spend_risk) * (1 − min(0.5, E))
+    - combined_FP_risk = max(FP_channel_risk, FP_pair_risk, FP_zero_risk)
+    - γ1 = 1.0, γ2 = 0.6, γ3 = 0.8 initial.
+  - p_lower = p_combined − z_adj * se_combined.
+- Final shrink:
+  - p_final = p_lower / (1 + β * combined_FP_risk * (1 − E)).
+  - β = 0.2 initial.
+- Calibrators:
+  - Retrain Platt/isotonic calibrator(s) with covariates: combined_FP_risk, top2_share, spend_entropy, spend_percentile_by_demo, zero_spend_flag, cryo_flag, model_disagreement.
+  - Per‑slice calibrators when N_slice ≥ 150; else pooled EB calibrator.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persist and snapshot new priors:
+  - Persist zero_spend posterior table + cryo conditional posterior table with fields: TP, FP, posterior_mean, posterior_se, sample_count, last_update. Snapshot every batch.
+- Small‑batch precommit gating:
+  - For batch_size < small_batch_min, require: either p_final ≥ stricter_accept_threshold (e.g., 0.95) to auto‑accept, or route to audit.
+  - Add unit tests that exercise single‑record and small batches with zero spends, cryo true/false, and cabin edge values.
+- Canary & shadow rules:
+  - Shadow run the new scorer and require no increase in zero_spend FP_rate > 10% in canary data; specifically block deploy if zero_spend_FP_rate increases > 10% absolute vs last stable baseline.
+- Monitoring & dashboards:
+  - Add zero_spend FP/FN by cryo_flag and by cabin_deck, DecisionRisk distribution for zero_spend, small_batch FP_rate, audit queue length for priority audits triggered by zero_spend contradictions.
+- Decision provenance & logging:
+  - Log and persist per‑record reason_code including zero_spend_flag, cryo_flag, batch_size, P_prior components and weights, model_disagreement, p_combined, p_final and final_decision. This enables quick RCA for single‑record batches.
+- Audit triage:
+  - Route contradictions involving zero_spend to priority audit queue; label them high priority for active learning.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- Expose new per‑record metrics to scorer & logs:
+  - zero_spend_flag, sample_count_zero, posterior_mean_zero, posterior_se_zero, cryo_prior_mean, combined_FP_risk, batch_size, spend_entropy, decision_provenance, reason_code.
+- Model & training changes:
+  - GLM_fallback v10:
+    - Add zero_spend × (CryoSleep, Age_bucket, Cabin_deck) interaction terms, absolute_spend, log_total_spend, spend_percentile_by_demo, zero_spend_flag as explicit binary feature, and model_disagreement.
+    - Use stratified sampling to retain representative zero_spend records in both classes; avoid discarding zero_spend negatives.
+    - Synthetic augmentation: create synthetic zero_spend cases for underrepresented positive labels if supported by domain knowledge.
+  - SRM/aggregator:
+    - Return score + per‑model bootstrap SEs and expose them in scoring to compute var_ensemble.
+- Active learning:
+  - Route zero_spend contradictions + small‑batch contradictions to human audit for immediate labeling and weekly retraining.
+  - Give these labels elevated sample weights in retraining to accelerate correction.
+- Robustness:
+  - For small batches, set higher min uncertainty and enforce stricter thresholds or audit routing until calibrators proven reliable for small‑n inference.
+- Tests & CI:
+  - Add deterministic unit tests for the following cases (automated):
+    - Single record with zero_spend + cryo_true + ensemble moderate -> audit/reject.
+    - Single record with nonzero concentrated spend + noisy_pair -> audit/reject.
+    - Single record with nonzero concentrated spend + clean_pair + ensemble high -> accept.
+    - Batch of > 50 with mixed cases -> standard logic.
+
+Updated deterministic scoring pipeline (v3.4.4)
+1. Snapshot load: channel table, channel_pair table, zero_spend table, cryo conditional table, model versions, calibrators, deterministic RNG seed.
+2. Preprocess per record: compute total_spend, num_nonzero_channels, zero_spend_flag, spend_entropy, top_channel, second_channel, channel_pair_id, top2_share, spend_percentile_by_demo, log_total_spend, cryo_flag, cabin_deck/cabin_num, batch_size (current batch).
+3. Lookup priors: posterior_mean_ch & se, posterior_mean_pair & se, posterior_mean_zero & se (if zero_spend_flag), posterior_mean_cryo & se (if cryo_flag).
+4. Model inference: aggregator_p + SE, GLM_p + SE, SRM_p + SE.
+5. Compute E, component weights (w_pair, w_ch, w_zero, w_cryo), P_prior, alpha_post_total, p_combined.
+6. Compute var_combined, se_combined; adjust base_min_se by batch_size.
+7. Calibrate: compute z_adj including combined_FP_risk, model_disagreement, zero_spend_risk; compute p_lower and p_final; pass p_final + covariates through calibrator(s).
+8. Decision gating:
+   - If zero_spend_flag True: apply zero_spend special gating (E thresholds, cryo checks, batch‑size checks). Otherwise apply standard single_spike / noisy_pair logic from v3.4.3.
+   - If contradiction or DecisionRisk > audit_threshold -> priority_audit.
+   - Else choose Accept/Reject per thresholds.
+9. Output decision + full provenance; persist logs.
+10. Post‑batch: aggregate metrics, update priors once human labels come in (decayed counts), and snapshot priors.
+
+Default hyperparameters (v3.4.4 initial)
+- Channel smoothing s_ch = 5; pair smoothing s_pair = 8.
+- Zero smoothing s_zero = 5.
+- τ_ch = 50; τ_pair = 75; τ_zero = 100; τ_cryo = 80; τ_total = 80.
+- cluster_min_n = 30; cluster_min_n_pair = 15; sample_count_zero_min = 50.
+- Ensemble weights: aggregator 0.5, GLM 0.3, SRM 0.2.
+- single_spike bands: low 0.50–0.70, medium 0.70–0.95, extreme ≥ 0.95.
+- concentrated_top2_flag threshold: top2_share ≥ 0.98.
+- E_high = 0.88; E_zero_high = 0.92; E_zero_med = 0.85.
+- model_disagreement σ_low = 0.05; σ_high = 0.15.
+- small_batch_min = 10; base_min_se_batch(n==1) = 0.05; base_min_se_batch(2–9) = 0.03; base_min_se_global = 0.01.
+- audit_threshold = 0.40; priority_audit_threshold = 0.60.
+- Calibration: base_z = 1.645; β = 0.2, γ1 = 1.0, γ2 = 0.6, γ3 = 0.8.
+- per_slice calibrator min_n = 150.
+
+Validation experiments & acceptance criteria
+- Holdout & stratified LOO:
+  - Stratify by slice: zero_spend × cryo_flag, cluster, cabin_deck, top_channel, channel_pair; include priority test cases: 0069_01, 0070_01, 0071_01, 0073_01, 0074_01, 0076_01, 0078_01, 0081_01.
+- Metrics to evaluate:
+  - Per_slice FP/FN rates (zero_spend × cryo), Brier score, ECE, CI coverage, audit precision/recall, audit queue size/latency.
+- Success criteria vs v3.4.0/v3.4.2:
+  - Reduce zero_spend FP rate by ≥ 60% vs v3.4.2 OR not degrade more than 5% vs baseline on other slices.
+  - Maintain or improve previous recovery for undersampled FNs: recover ≥ 70% of previously missed TPs like 0074_01 & 0076_01 vs v3.4.0.
+  - Reduce concentrated-pair FP (0078_01) by ≥ 50% vs v3.4.2.
+  - Overall FN increase ≤ 10%; audit load within operations capacity.
+- Parameter sweeps:
+  - τ_zero ∈ {50, 100, 200}, s_zero ∈ {3,5,8}, small_batch_min ∈ {5,10,20}, base_min_se_batch(n=1) ∈ {0.03,0.05,0.08}, E_zero_high ∈ {0.90,0.92,0.95}.
+- Ablations:
+  - with/without zero_spend prior; with/without cryo conditioning; varying small_batch_min.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+   - Compute and persist zero_spend posterior table (TP/FP/posterior_mean/posterior_se/sample_count) and cryo conditional posterior table; add zero_spend_flag + cryo_flag to feature store.
+2. Scoring engineers:
+   - Implement p_combined with zero_spend & cryo priors; implement batch_size conservative adjustments and zero_spend gating; add logging of full provenance; run shadow inference on recent batches (must include 0074_01, 0076_01, 0078_01, 0081_01).
+   - Add unit tests for single‑record batches and zero_spend cases.
+3. ML:
+   - Retrain GLM_fallback v10 including zero_spend×(cryo, age_bucket, cabin_deck) interactions; retrain calibrators with new covariates; produce shadow model.
+4. Ops/SRE:
+   - Add CI checks for zero_spend FP_rate canary and small‑batch gating; implement staged rollout controls.
+5. Product/ops:
+   - Define human audit instructions for zero_spend + cryo contradictions (what signals to look for).
+6. Monitoring:
+   - Add dashboard panels for zero_spend FP/FN by cryo_flag, small_batch performance, and priority_audit backlog.
+
+How v3.4.4 would handle 0081_01 (concrete flow)
+1. Feature extraction: zero_spend_flag = True (total_spend = 0); cryo_flag = True; Age 13; cabin_deck = G.
+2. Lookup priors: posterior_mean_zero and posterior_mean_cryo_true checked. If sample_count_zero and sample_count_cryo sufficient, P_prior will give weight to zero_spend and cryo components.
+3. Ensemble: E computed from models (may have been high in original run).
+4. alpha_post_total computed: if zero_spend & cryo sample counts reasonable, alpha_post_total gives meaningful weight to P_prior (likely low if historically zero_spend false positives are high).
+5. Because batch_size = 1 (< small_batch_min), base_min_se raised (0.05) and z_adj increased; p_lower / p_final will be more conservative.
+6. Decision rules:
+   - If P_prior_zero_cryo indicates low transport probability OR if sample_count_zero ≥ sample_count_zero_min and posterior_mean_zero low → p_combined shifts toward reject; if conflicting signals (ensemble high vs prior low) → priority_audit.
+   - If posterior_zero absent/low_sample_count and ensemble E ≥ E_zero_high (0.92) with model_disagreement ≤ σ_low, then accept; otherwise audit.
+7. Net effect: 0081_01 would be routed to priority_audit or rejected rather than auto‑accept (reducing FP probability).
+
+Expected tradeoffs & mitigations
+- Tradeoffs:
+  - Additional priors (zero_spend, cryo) and small‑batch conservatism will increase audit volume (priority queue) and may slightly reduce recall in some rare real positive zero_spend cases.
+- Mitigations:
+  - Active learning to convert audits into labels and retrain weekly to reduce audit load over time.
+  - Staged rollout and canary thresholds to block regressions.
+  - Targeted retraining for zero_spend positives (if legitimate) to improve discrimination.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudocode + unit tests implementing v3.4.4 rules: zero_spend priors, cryo priors, small_batch gating, p_combined adjustments.
+- zero_spend & cryo posterior table generation script and retention/decay process.
+- Shadow retrain: GLM_fallback v10 (zero_spend interactions) + stratified validation report.
+- LOO validation comparing v3.3…v3.4.4 with operating points and parameter sweeps.
+- Audit log schema and CI precommit rules for zero_spend canary and small_batch tests.
+- 72‑hour implementation checklist (owners, artifacts, canary criteria).
+
+One‑line summary
+v3.4.4 augments v3.4.3 with explicit zero_spend and CryoSleep priors plus small‑batch conservative gating and recalibrated uncertainty — preventing FPs like 0081_01 while preserving earlier gains on concentrated spends and undersampled slices.
+
+Recommended immediate next action
+- I can either:
+  1) produce the deterministic scorer skeleton (Python pseudocode) + unit tests for v3.4.4 now (recommended), OR
+  2) run the shadow rerun across last N batches (include 0074_01, 0076_01, 0078_01, 0081_01) and return stratified validation output + suggested operating point.
+Which would you like me to do first?
+
+If you want, I can include the concise pseudocode for the new scorer and a minimal unit test matrix in my next message.
+
+============================================================

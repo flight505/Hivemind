@@ -1,0 +1,243 @@
+PREDICTIVE METRICS - ITERATION 46
+============================================================
+
+Updated Predictive Metrics Report — v3.3 (post‑0069_01)
+Goal: fix false negatives like 0069_01 (RoomService single_spike True → predicted False) without re‑opening the RoomService false positive family (e.g., 0067_03). Preserve determinism, full per‑prediction provenance and reproducibility.
+
+EXECUTIVE SUMMARY — immediate takeaway and top priorities
+- Immediate problem summary: 0069_01 (RoomService=887, total ≈902, top_contrib_share ≈0.983, Age=42, CryoSleep=False) was a false negative. Earlier mitigation efforts (v3.2) successfully reduced RoomService FPs by attenuating aggregator influence for RoomService overall, but that attenuation became over‑conservative for some subsegments where RoomService is a valid positive signal. The result: under‑accepting genuine high RoomService single_spikes.
+- Top short causes:
+  1. ChannelReliabilitySigned was evaluated mostly at the global channel level and used aggressive attenuation for RoomService; cluster/subsegment (Age/CryoSleep/Cabin) effects were not sufficiently incorporated or used for decision gating.
+  2. Decision gating required directional credible evidence at thresholds that favored preventing FPs, but had insufficient pathways to rescue true positives when cluster evidence or model consensus supported transported=True.
+  3. GLM/SRM did not include enough top_channel × demographic/cabin interactions; when aggregator was downweighted, GLM/SRM often lacked signal to overrule.
+  4. No quick per‑cluster or hierarchical shrinkage for channel posteriors; sparse cluster counts produced unstable directionality assessments.
+- Immediate priorities (deploy in order):
+  1. Short (24–72h): implement hierarchical (clustered) ChannelReliabilitySigned, with empirical‑Bayes shrinkage from cluster → channel → global; relax RoomService attenuation for clusters with positive evidence; quick GLM retrain with top_channel×Age/CryoSleep/Cabin interactions deployed in shadow.
+  2. Medium (1–14d): retrain SRM and GLM with enriched interactions, fit per_channel×cluster calibration maps, add extreme_single_spike rules, and run stratified validation.
+  3. Long: active learning loop on audit/Abstain labels, per‑channel evolving hierarchical priors, and a learned routing policy.
+
+A. Case diagnosis — what happened (0069_01)
+- Data snapshot (computed):
+  - RoomService = 887, ShoppingMall = 9, Spa = 6 → total ≈902.
+  - top_contrib_share = 887/902 ≈ 0.983 (extreme single_spike).
+  - Features: Age 42, CryoSleep=False, Cabin F/16/S, HomePlanet=Earth, VIP=False.
+- Likely model path to error:
+  - Aggregator originally produced a strong positive logit from the RoomService spike.
+  - v3.2 applied channel attenuation for RoomService based on ChannelReliabilitySigned (global or recent snapshot posterior) which was negative or ambiguous and therefore reduced aggregator influence below decision thresholds.
+  - GLM/SRM either (a) were not yet retrained with top_channel×demographic interactions and therefore did not provide strong supporting evidence; or (b) disagreed with aggregator (or returned moderate p) — leading routing rules to abstain/reject rather than accept.
+  - Net result: conservatively turned a legitimate transported=True example into False (FN).
+- Key numeric indicator for the example: extreme top_contrib_share (≥0.98) but model withheld acceptance because cluster‑level positive evidence was not recognized/used.
+
+B. Specific patterns in the current metrics that caused the error
+(Answer to Question 1)
+- Global channel sign vs cluster sign mismatch: global ChannelReliabilitySigned for RoomService leaned negative after previous FPs; but in several clusters (Age 30–50, CryoSleep=False, certain cabin decks) RoomService correlates positively with transported=True. The lack of cluster modeling caused mistaken global attenuation.
+- Over‑aggressive attenuation caps: up/down multipliers were asymmetric and stronger on downweighting; this prevented aggregator from contributing enough evidence for extreme single_spikes.
+- High top_contrib_share not handled as a special case: v3.2 used conservative consensus instead of an "extreme single_spike" pathway that checks cluster evidence strongly and GLM interactions.
+- GLM/SRM lacked adequate channel×demographic interactions and oversampled training for single_spikes; when aggregator was attenuated they could not compensate.
+
+C. Decision‑rule modifications to prevent similar errors
+(Answer to Question 2 — v3.3 rules summary)
+Core principle: require directional, sample‑size aware, and consensus‑aware evidence — but allow an explicit, conservative rescue pathway for extreme single_spikes when cluster/subsegment evidence or model consensus supports positive direction.
+
+1) ChannelReliabilitySigned v2 (hierarchical + shrinkage)
+- Compute per (channel C, cluster k) counts: successes_kC, failures_kC where top_channel==C and top_channel_spend>q_C_k.
+- Use empirical‑Bayes shrinkage: cluster_post_mean_kC = (N_kC/(N_kC+τ)) * raw_cluster_mean + (τ/(N_kC+τ)) * global_channel_mean
+  - Suggested τ (shrinkage) = 50 (tuneable).
+- Compute Beta posterior samples using (alpha = prior_strength * global_prior + successes_kC, beta = prior_strength*(1−global_prior)+failures_kC), then shift/shrink toward cluster_post_mean_kC when N_kC low.
+- From samples compute posterior_logodds_samples, then posterior_logodds_lower/mean/upper, and sample_count N_kC and effective_n.
+- Use cluster posterior for decisions when N_kC ≥ cluster_min_n (default 30); otherwise use shrunk global→cluster posterior.
+
+2) Directional gating (hierarchical-aware)
+- Upweight/rescue allowed when:
+  - cluster_posterior_logodds_lower > 0
+  - AND cluster_sample_count ≥ cluster_min_n (default 30)
+  - AND cluster_posterior_mean ≥ upweight_mean_threshold_cluster (default 0.88)
+- If cluster_sample_count < cluster_min_n but global_posterior_logodds_lower > 0 with global_sample_count ≥ global_min_n (default 50) AND cluster_posterior_mean≥0.85 → allow conservative upweight (multiplier cap ≤1.03) but require stronger model consensus (GLM or SRM).
+- Downweight allowed only when cluster_posterior_logodds_upper < 0 AND cluster_sample_count ≥ min_down_n (default 20).
+
+3) Aggregator attenuation (less aggressive + cluster aware)
+- multiplier = 1.0 base
+- If cluster_dir_positive (strong) → multiplier = 1 + clamp(0.30*(cluster_mean − global_prior), 0.00, 0.07) (max +7%)
+- If cluster_dir_negative (strong) → multiplier = 1 + clamp(0.6*(cluster_mean − global_prior), −0.35, −0.01) (min ~0.65)
+- If ambiguous → multiplier = 0.95 (slight dampening) rather than heavy attenuation. This avoids flipping strong aggregator evidence to zero.
+
+4) Single_spike routing (explicit extreme pathway)
+- Define:
+  - single_spike: top_contrib_share ≥ 0.50
+  - extreme_single_spike: top_contrib_share ≥ 0.95
+- Routing:
+  - If extreme_single_spike:
+    - If cluster_dir_positive strong (posterior_logodds_lower > 0 AND cluster_N ≥ 30):
+      - Accept True if aggregator_p_lower ≥ 0.70 AND (GLM_p_mean ≥ 0.55 OR SRM_score ≥ 0.75). Persist provenance.
+      - If aggregator_p_lower ≥ 0.82 and SRM_score ≥ 0.88 and cluster_posterior_mean ≥ 0.90 → auto‑accept (rare).
+    - If cluster_dir_ambiguous but GLM_p_mean ≥ 0.70 (and GLM training has top_channel×demographic interactions) → accept.
+    - Otherwise → route to priority audit (do not auto‑reject).
+  - If single_spike (50–95%):
+    - Require 2/3 consensus among aggregator, GLM, SRM OR cluster_dir_positive (as above) → accept.
+    - If disagreement → audit/abstain.
+
+5) Consensus weighting & counterfactual checks
+- When aggregator was heavily attenuated and decision becomes False, compute counterfactual score (aggregator without attenuation) and DecisionRisk:
+  DecisionRisk = w1*(disagreement_count/3) + w2*(dir_uncertainty) + w3*(spend_extremeness)
+  - If DecisionRisk > threshold → route to audit instead of False.
+  - Suggested weights: w1=0.5, w2=0.3, w3=0.2; threshold tuneable.
+
+D. New insights about passenger transport patterns from this error
+(Answer to Question 3)
+- RoomService is heterogeneous: some subsegments (e.g., middle‑age non‑CryoSleep passengers in certain cabins) show positive correlation with transported=True, opposite to global RoomService trend in other subsegments.
+- Very high top_contrib_share alone is an important signal but not definitive — combining top_contrib_share with cluster directional evidence, spend percentile and spend entropy provides better discrimination.
+- GLM interactions (top_channel × Age/CryoSleep/Cabin_deck) are critical — channel effect flips frequently across demographic/cabin clusters.
+- Per‑channel decision behavior must be hierarchical and dynamic to handle snapshot drift and sparse cluster counts.
+
+E. How confidence levels should be recalibrated
+(Answer to Question 4)
+- Two‑stage calibration remains: global Platt + per_cluster/per_channel offset, but with improved shrinkage and per‑cluster minimum n:
+  - Fit per_channel offsets only when sample_count ≥ per_channel_calib_min (default 150); otherwise use cluster offset (min 100) and shrink toward global.
+- se_logit_final (final SE of aggregator logit) update includes directional uncertainty penalty:
+  - Compute base_predicted_se = CoverageGuard(record)
+  - base_min_se = min_se_by_cluster[cluster_id]
+  - dir_uncertainty_penalty = if posterior_logodds_lower <= 0 and posterior_logodds_upper >= 0 then 0.15 else if posterior_logodds_lower > 0 then max(0, 0.25*(0.95 − posterior_mean)) else max(0, 0.35*(posterior_mean − 0.05))
+  - anomaly_scale = {none:0.0, medium:0.10, high:0.25}
+  - se_logit_final = max(base_predicted_se, base_min_se * (1 + anomaly_scale) * (1 + dir_uncertainty_penalty))
+- z selection:
+  - If effective_reliability high (cluster_dir_positive and cluster_N≥30 and SRM_bootstrap_SE low) → allow smaller z (less conservative).
+  - If ambiguous or anomalous → increase z.
+- Calibrated probability uses global Platt first, then per_cluster/per_channel offset; offsets are regularized (L2) and only applied when sample counts suffice.
+
+F. Adjustments for better consistency across batch predictions
+(Answer to Question 5)
+- Persist and version per‑snapshot ChannelReliabilitySigned table at (channel,cluster) granularity: alpha0/beta0, posterior_mean, posterior_CI, posterior_logodds_lower/upper/mean, sample_count, q_C_k.
+- Batch precommit checks (new/additional):
+  - per_channel_per_cluster FN_rate and FP_rate vs baseline; fail if > baseline*1.10.
+  - sudden shifts in cluster_posterior_mean/logodds for any (channel,cluster) when Δ > 0.10 → block auto‑accept decisions for that (channel,cluster) until validated.
+  - fraction_extreme_single_spike routed to False (per channel) → alert if > expected.
+- Audit queue triggers:
+  - extreme_single_spike predicted False where any cluster_posterior_mean ≥ 0.80 → immediate priority audit.
+  - single_spike predicted False where aggregator_p_lower ≥ 0.65 and any posterior_logodds_lower ≥ 0.80 → audit.
+  - all rescue candidates where GLM disagrees by >0.25 → priority audit.
+- Stability guard: any rule involving a channel must pass a staged deployment if that channel’s posterior moved by Δ>0.10 in the last two snapshots.
+
+G. How metrics/models should be improved to handle edge cases like this one
+(Answer to Question 6 — model & data changes)
+1) ChannelReliabilitySigned v2:
+   - Hierarchical per‑channel × cluster posteriors with empirical‑Bayes shrinkage (τ default 50).
+   - Persist cluster-level posteriors and use cluster posterior for routing when cluster_N ≥ 30.
+2) GLM_fallback v5:
+   - Add top_channel one‑hot, top_channel×Age_bucket, top_channel×CryoSleep, top_channel×Cabin_deck interactions.
+   - Add top2_share, spend_entropy, num_nonzero_channels, per_channel_percentiles.
+   - Oversample single_spike positives and negatives stratified by channel and cluster.
+   - Use class weights and calibrate outputs with bootstrap SE.
+3) SRM v3:
+   - Include channel_posterior features, top2_share, spend_entropy.
+   - Output SRM_score plus bootstrap SE and per_cluster adjustment.
+4) CoverageGuard & Calibration:
+   - Retrain CoverageGuard to predict SE with direction_uncertainty feature.
+   - Two‑stage calibration with regularized per_cluster/per_channel offsets and minimum n thresholds.
+5) Edge detectors:
+   - Spend‑plausibility detector: top_channel_spend percentile within passenger segment (HomePlanet, Age_bucket, Cabin_deck). If above 99.9th percentile, mark "extreme" and require consensus/audit.
+   - Spend shape features: top2_share, spend_entropy, num_nonzero_channels used for routing and anomaly penalties.
+6) Training & data:
+   - Dedicated single_spike by channel training sets; oversample rare patterns (RoomService high spend & Age 30–50 & CryoSleep=False).
+   - Add 0069_01, 0067_02, 0067_03 and known families to targeted audit training sets.
+7) Active learning:
+   - Route ambiguous/priority cases to human labelers; feed labels back to update cluster posteriors and retrain GLM/SRM monthly or more frequently for high‑variance channels.
+
+H. Deterministic scoring pipeline — v3.3 (production outline)
+1. Snapshot load: winsor quantiles, cluster centroids & covariances, ChannelReliabilitySigned (channel×cluster) table (alpha0/beta0 & posterior summaries), GLM/SRM versions, per_channel calibration maps, deterministic seeds.
+2. Per_record features: top_channel, top_contrib_share, top2_share, num_nonzero, spend_entropy, per_channel_percentiles, cluster_id via deterministic k‑means/assignment.
+3. AnomalyDetector: Mahalanobis anomaly_score & flag.
+4. ChannelReliability lookup: cluster_posterior_mean, posterior_CI, posterior_logodds_lower/upper/mean, sample_count.
+5. Direction flags:
+   - dir_positive_cluster = posterior_logodds_lower > 0 AND sample_count ≥ 30
+   - dir_positive_global = global_posterior_logodds_lower > 0 AND global_N ≥ 50
+   - dir_negative_cluster = posterior_logodds_upper < 0 AND sample_count ≥ 20
+6. Aggregator: compute aggregator_logit/SE; apply cluster‑aware channel_reliability_multiplier per rules above.
+7. SRM v3 predict (includes channel posterior features).
+8. GLM_fallback v5 predict (always available in scoring path; deterministic bootstrap CI).
+9. Dynamic routing for single_spike:
+   - If extreme_single_spike (≥0.95): follow extreme pathway (cluster_dir positive → accept with consensus; else audit).
+   - Else single_spike: require consensus or cluster_dir positive to accept; else audit.
+10. Uncertainty & calibration:
+   - predicted_se via CoverageGuard; se_logit_final includes dir_uncertainty_penalty & anomaly_scale.
+   - z selection per effective_reliability.
+   - Two‑stage calibration: global Platt → per_cluster/per_channel offset (if n sufficient).
+11. Decision & provenance:
+   - Final decision, reason_code, and all diagnostics persisted.
+12. Post‑batch checks & alerts fired.
+
+I. Concrete default parameters (v3.3 initial)
+- single_spike threshold = 0.50; extreme_single_spike threshold = 0.95
+- Beta prior_strength = 10; shrinkage τ = 50
+- cluster_min_n (for cluster posterior usage) = 30; global_min_n = 50; min_down_n = 20
+- upweight_mean_threshold_cluster = 0.88; conservative cluster allow threshold = 0.85
+- aggregator_p_lower rescue threshold (extreme pathway) = 0.70 (and GLM>=0.55 or SRM>=0.75)
+- aggregator auto‑accept (rare) = aggregator_p_lower≥0.82 AND SRM≥0.88 AND cluster_posterior_mean≥0.90 AND N≥50
+- attenuation caps: up to +7% multiplier; down to min 0.65
+- per_channel calibration min_n = 150; per_cluster calibration min_n = 100
+
+J. Validation experiments (priority)
+- Stratified LOO by cluster and top_channel; specific holdouts: single_spike positives/negatives for RoomService, ShoppingMall, FoodCourt, VRDeck.
+- Include families 0067_02, 0067_03, 0069_01 and 0066_01 in holdout and audit label sets.
+- Metrics: per_channel_per_cluster FN/FP, Brier, ECE, CI coverage, audit fraction, abstain fraction, rescued_auto_accept fraction.
+- Parameter sweeps:
+  - τ ∈ {20,50,100}
+  - cluster_min_n ∈ {20,30,50}
+  - extreme_single_spike threshold ∈ {0.90,0.95,0.98}
+  - aggregator rescue thresholds
+  - per_channel_calib_min ∈ {100,150,200}
+- Key ablation: v3.3 vs v3.2; aim: reduce single_spike FNs ≥50% vs v3.0 while keeping RoomService FP increase ≤20% (business tradeoff tunable).
+
+K. Monitoring & alerts (per batch + per prediction)
+- Persist diagnostics: channel_posterior_mean (cluster & global), posterior_CI, posterior_logodds_mean/lower/upper, sample_count, top_contrib_share, top2_share, spend_entropy, SRM_score, GLM_p_mean/CI, aggregator_p_lower, decision_reason_code.
+- Dashboards:
+  - per_channel_per_cluster FN_rate & FP_rate, rescue_accept_rate
+  - fraction_extreme_single_spike_by_channel and decisions
+  - fraction_aggregator_vs_GLM disagreement
+  - posterior shifts Δ per snapshot
+- Precommit checks:
+  - extreme_single_spike_pred_False when cluster_posterior_mean ≥ 0.80 → fail build
+  - per_channel_FP_rate (RoomService, ShoppingMall) > baseline*1.10 → block auto‑accept for channel
+  - Δ posterior_logodds > 0.10 for any (channel,cluster) → staged deployment
+- Audit queue prioritized: extreme_single_spike False where cluster evidence positive; rescue candidates with GLM disagreement.
+
+L. Immediate operational actions (24–72 hours)
+1. Implement hierarchical ChannelReliabilitySigned (cluster-level posteriors + shrinkage) and persist table.
+2. Relax RoomService attenuation: set multipliers to ambiguous case = 0.95 instead of heavier attenuation; enable cluster-level positive overrides when cluster_N≥30.
+3. Retrain GLM_fallback quick job with top_channel×Age/CryoSleep/Cabin interactions; deploy in shadow.
+4. Add 0069_01, 0067_02, 0067_03 to targeted training/audit sets.
+5. Add precommit rule: extreme_single_spike False with cluster_posterior_mean≥0.80 → build fail / manual review.
+6. Log/persist full per‑prediction diagnostics for triage.
+
+M. Expected tradeoffs & risk mitigation
+- Relaxing attenuation and adding cluster pathways increases chance to recover true positives (reducing FNs), but can reintroduce FPs if cluster counts are sparse — mitigated by:
+  - cluster_min_n gating,
+  - hierarchical shrinkage,
+  - requiring model consensus for acceptance,
+  - audit queue for ambiguous/extreme cases.
+- Use staged rollouts and threshold sweeps to find operating point acceptable to business.
+
+N. How v3.3 would handle 0069_01 (concrete flow)
+1. Identify single_spike (top_contrib_share ≈ 0.983 → extreme_single_spike).
+2. Lookup ChannelReliabilitySigned at (RoomService, cluster_id derived from Age=42, CryoSleep=False, Cabin_deck=F): if cluster_N ≥ 30 and cluster_posterior_logodds_lower>0 and cluster_posterior_mean≥0.88 → cluster_dir_positive strong.
+3. Aggregator_p_lower likely high (if aggregator logit strong) — multiplier may be slight upweight rather than attenuation since cluster_dir_positive.
+4. If aggregator_p_lower≥0.70 AND GLM_p_mean≥0.55 or SRM_score≥0.75 → accept → True (persist reason_code: extreme_single_spike_rescue_by_cluster_and_consensus).
+5. If cluster_N < 30 but global evidence positive and GLM/SRM agree → conservative accept (multiplier cap ≤1.03).
+6. If no model supports positive despite aggregator → route to priority audit instead of False.
+Net: v3.3 gives a path to accept 0069_01 rather than false reject, preventing FN while retaining audit safety.
+
+O. Deliverables I will produce next (deterministic, versioned)
+- Deterministic Python scorer skeleton implementing v3.3 rules (ChannelReliabilitySigned hierarchical, extreme_single_spike pathway, consensus router), with unit tests.
+- Stratified LOO validation run comparing v2.9, v3.0, v3.1, v3.2 and v3.3 focusing on families 0066_01, 0067_02, 0067_03 and 0069_01.
+- Parameter sweep notebooks and tuned default parameters.
+- Audit log schema, precommit checks definitions, and dashboard KPIs.
+
+One‑line summary:
+v3.3 makes ChannelReliability hierarchical (channel×cluster with shrinkage), relaxes overly aggressive RoomService attenuation, adds an explicit extreme_single_spike rescue pathway that requires cluster evidence and model consensus, retrains GLM/SRM with channel×demographic interactions, and increases per‑prediction provenance and batch checks — reducing FNs like 0069_01 while keeping FPs manageable.
+
+If you want, I can (pick one or both):
+- produce the deterministic scorer skeleton (v3.3) now (Python pseudocode + unit tests), or
+- run the stratified LOO validation (v3.3 vs v3.2) focusing on the RoomService/ShoppingMall families and produce a report with selected operating points.
+
+Which would you like first?
+
+============================================================

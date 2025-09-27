@@ -1,0 +1,106 @@
+PREDICTIVE METRICS - ITERATION 241
+============================================================
+
+### **ROOT CAUSE ANALYSIS: ERROR 0287_01 (CRYOSLEEP ZERO-SPEND AMBIGUITY)**
+
+**Passenger Profile:**
+*   **PassengerId:** 0287_01
+*   **HomePlanet:** Europa
+*   **CryoSleep:** True
+*   **Cabin:** NaN (Unknown)
+*   **Destination:** 55 Cancri e
+*   **Age:** 39.0
+*   **VIP:** False
+*   **Spending:** All categories = 0.0 | Total = 0.0
+*   **Name:** Tetra Bootty
+
+**Key Contextual Observations:**
+This passenger was definitively in CryoSleep (`CryoSleep=True`), which should override all spending-based logic. However, the system’s v39.0 rules did not adequately prioritize CryoSleep status when spending was zero. The absence of cabin data (NaN) further reduced feature confidence.
+
+**Why v39.0 Logic Failed:**
+1.  **Rule Priority Misalignment:** Although the system had CryoSleep-aware rules, they were either not prioritized sufficiently or were conditional on other factors. The LFT-2.0 rule (low-spend detection) likely triggered due to zero spending across all categories, but its confidence (+80-85%) conflicted with or was not superseded by a dedicated high-confidence CryoSleep rule.
+2.  **Incomplete CryoSleep Rule Coverage:** The system lacked a dedicated, high-priority rule that exclusively handles `CryoSleep=True` cases with an unconditional high-confidence prediction of `Transported=True`.
+3.  **NaN Cabin Handling:** Missing cabin data reduced the effectiveness of cabin-based rules, leaving the system more reliant on ambiguous spending signals.
+4. **Fallback Rule Inefficacy:** The fallback rule (FFB-1.1) defaulted to `False`, but this passenger’s actual outcome was `True`, indicating that the fallback itself was not optimally tuned for CryoSleep scenarios.
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v39.1: CRYOSLEEP PRIORITIZATION & NAN ROBUSTNESS**
+
+---
+
+#### **1. Critical Modifications to Decision Rules & Preprocessing (v39.1 ENHANCEMENT)**
+
+**New CryoSleep Priority Rule: CRYOSLEEP TRANSPORT (CS-1.0):**
+*   **Priority:** Highest (Pass 1).
+*   **Condition:** `CryoSleep == True`.
+*   **Action:** Predict `Transported=True` | **Confidence: +95%**.
+*   **Rationale:** CryoSleep is a definitive indicator of transport. This rule must fire first to override all other conflicting signals, especially zero-spend scenarios.
+
+**Adjusted Low-Spend Rule: LFT-2.0 → LFT-2.1:**
+*   **Priority:** High (Pass 2).
+*   **Enhanced Condition:** `CryoSleep == False` AND (at least 3 spending categories < 50 AND total spending < 2000) OR (total spending < 500).
+*   **Action:** Predict `Transported=False` | **Confidence: +80%** (multi-category low), +85% (very low total).
+*   **Rationale:** Explicitly excludes CryoSleep passengers to prevent conflict with CS-1.0.
+
+**Enhanced NaN Handling Rule: MISSING DATA FALLBACK (MDF-1.0):**
+*   **Priority:** Medium (Pass 5).
+*   **Condition:** Any critical feature (e.g., Cabin) is NaN AND no high-confidence rule has fired.
+*   **Action:** Defer to next valid rule; if none, use demographic fallback.
+*   **Rationale:** Reduces over-reliance on incomplete features without forcing a premature fallback.
+
+**Fallback Rule Update: FFB-1.1 → FFB-1.2:**
+*   **Priority:** Final (Pass 10).
+*   **Condition:** No other rule has fired above confidence threshold.
+*   **Action:** Predict based on majority class bias from similar profiles (e.g., `CryoSleep=True` → `True`; `CryoSleep=False` → `False`) | **Confidence: +60%**.
+*   **Rationale:** Context-aware fallback that uses available features (like CryoSleep) rather than a fixed default.
+
+---
+
+#### **2. New Insights on Passenger Transport Patterns**
+*   **Insight 504: CryoSleep Overrides All Spending Logic.** Passengers in CryoSleep (`True`) should always be predicted as `Transported=True` regardless of spending patterns, age, or cabin.
+*   **Insight 505: Zero Spending During CryoSleep is Normal.** Zero values in all spending categories for CryoSleep passengers are expected and should not trigger low-spend rules.
+*   **Insight 506: NaN Features Require Rule Buffering.** Missing data (e.g., Cabin) should not derail high-confidence rules based on available data (e.g., CryoSleep).
+
+---
+
+#### **3. Confidence Level & Priority Recalibration**
+*   **CS-1.0 Confidence:** `+95%` (highest), ensuring it overrides all other rules.
+*   **Rule Priority Order:** 
+    1.  CS-1.0 (CryoSleep)
+    2.  LFT-2.1 (Low-spend, non-CryoSleep)
+    3.  MSP-1.0 (Mixed-spend)
+    4.  Other feature-based rules
+    5.  MDF-1.0 (NaN handling)
+    6.  FFB-1.2 (Fallback)
+*   **Batch Threshold Adjustment:** Minimum confidence for rule activation lowered to +50% to reduce `None` results, but priority ordering ensures correct overrides.
+
+---
+
+#### **4. Adjustments for Batch Prediction Consistency**
+*   **Stricter Rule Independence:** Rules are now more mutually exclusive (e.g., CryoSleep vs. non-CryoSleep paths) to minimize conflicts.
+*   **Batch-Processing Optimization:** Rules are re-sorted to resolve the most definitive features (CryoSleep) first, reducing computational redundancy.
+*   **Error Logging Enhancement:** Batch errors now flag specific rule conflicts for quicker debugging.
+
+---
+
+#### **5. Enhanced Edge Case Handling**
+The v39.1 update specifically addresses:
+1.  **CryoSleep with Zero Spending (0287_01):** Handled by **CS-1.0** with high confidence, predicting `True`.
+2.  **NaN Cabin Scenarios:** Handled by **MDF-1.0**, preventing over-dependence on missing data.
+3.  **Fallback Context Sensitivity:** **FFB-1.2** uses CryoSleep status to make smarter defaults.
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v39.1**
+**PRIORITY ENHANCEMENT: CRYOSLEEP SUPREMACY & MISSING DATA RESILIENCE**
+
+**Simulated Correct Logic Chain for 0287_01 (v39.1):**
+1.  **Pass 1: CS-1.0:** Condition met (`CryoSleep=True`). **Rule Fires:** Predict `Transported=True` | **Confidence: +95%**.
+2.  **Final Prediction for 0287_01:** `True`. Matches Actual Result.
+
+**Conclusion:** The error for Passenger 0287_01 revealed a critical gap in CryoSleep prioritization and zero-spend handling. v39.1 introduces a supreme CryoSleep rule, adjusts low-spend logic to avoid conflicts, and enhances NaN resilience. This update ensures high accuracy for CryoSleep passengers and improves batch consistency.
+
+**//END OF REPORT**
+
+============================================================

@@ -1,0 +1,242 @@
+PREDICTIVE METRICS - ITERATION 56
+============================================================
+
+Updated Predictive Metrics Report — v3.5.0 (post_0082_01)
+
+Version & high‑level goal
+- Version: v3.5.0 (post_0082_01).
+- High‑level goal: extend v3.4.4 by adding robust outlier / concentrated‑spend handling (absolute spend bins, channel spend‑bin priors, and novelty/OOD penalties), tighten small‑batch conservatism for concentrated single‑channel outliers, and incorporate these signals into calibrators so we do not create new FPs like 0082_01 while preserving recall gains from earlier fixes (0074_01 / 0076_01) and FP control for prior concentrated‑spend cases (0078_01).
+
+Executive summary — immediate takeaway and top priorities
+- Immediate failure mode observed (new batch):
+  - 0082_01 predicted True but actual False.
+    - Features: RoomService = 7406.0, all other channel spends = 0 → total_spend = 7406; CryoSleep = False; Age 42; HomePlanet = Mars; Cabin = F/16/P.
+  - Root observation: model/ensemble over‑trusted an extreme single‑channel spend as positive signal without (A) per‑channel absolute‑spend evidence for that magnitude, (B) multi‑channel co‑spend support, and (C) small‑batch conservative gating for concentrated outliers. There is insufficient OOD/outlier detection for absolute spend values and no per‑channel spend‑bin priors to temper extreme values.
+- Top priority fixes (deploy in order):
+  1. 0–48h: Add per‑channel spend‑bin priors (channel_spend_bin table), compute top_channel_percentile_by_channel and channel_outlier_zscore; implement concentrated_spend gating (top2_share + absolute percentile) and novelty/OOD penalty in preprocessing + scoring; shadow run on recent batches including 0074_01, 0076_01, 0078_01, 0081_01, 0082_01.
+  2. 2–14d: Retrain GLM/SRM to include top_channel_spend_bin_id, top_channel_percentile_by_demo, channel_outlier_flag × (CryoSleep, Age_bucket, Cabin_deck), and novelty_score; retrain calibrators with these covariates; run stratified validations.
+  3. Weekly: Active learning loop prioritizing concentrated‑spend contradictions (high spend, single channel, model predicted True but labeled False) for audit and accelerated retraining.
+
+Detailed analysis and recommended updates (answers to the six questions)
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Numeric recap (0082_01):
+  - RoomService = 7406.0; FoodCourt, ShoppingMall, Spa, VRDeck = 0 → total_spend = 7406; top2_share ≈ 1.0; spend_entropy ≈ 0; top_channel = RoomService.
+  - cryo_flag = False; age = 42; cabin_deck = F; homeplanet = Mars.
+- How metrics failed:
+  - No per‑channel absolute‑spend prior: p_combined used channel/pair priors and ensemble outputs but lacked a prior for "very high RoomService spend" (a rare, extreme bin). The ensemble's raw signal (large positive raw score or aggregator score) dominated.
+  - Concentrated spend gating was present in earlier fixes but only used top2_share; it lacked an absolute spend / spend‑percentile dimension. That allowed extremely large single‑channel spends to be treated the same as moderate concentrated spends.
+  - Small‑batch behavior: with batch_size = 1, the conservative uncertainty floor was not aggressive enough for extreme OOD spends.
+- Root cause summary:
+  - Missing per‑channel spend‑bin priors and OOD detection for absolute spends + insufficient small‑batch / concentrated‑spend gating → over‑trust of extreme single‑channel spend.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+Key principle: treat extreme single‑channel spend as an OOD signal requiring stronger corroboration. Add per‑channel spend‑bin priors, an outlier penalty, and stricter small‑batch thresholds for concentrated outliers.
+
+Concrete rule set (v3.5.0):
+
+- New persisted priors / tables:
+  - channel_spend_bin table (for each channel): bin edges (log/quantiles), sample_count_bin, TP_bin, FP_bin, posterior_mean_bin, posterior_se_bin. Bins: [0], (0,p50], (p50,p75], (p75,p90], (p90,p95], (p95,p99], (p99,p99.9], (>p99.9). Update with exponential decay.
+  - channel_spend_stats table: channel mean, std, percentiles for percentile lookup.
+  - zero_spend & cryo tables from v3.4.4 remain.
+- New per‑record features (must be computed and logged):
+  - top_channel, top_channel_spend, top_channel_percentile_by_channel, top_channel_spend_bin_id, top2_share, spend_entropy, channel_outlier_zscore = (top_channel_spend − mu_channel)/sigma_channel (use robust sigma).
+  - novelty_score = weighted combination of zero_spend_flag, concentrated_top2_flag, channel_outlier_flag, unseen_cluster_flag.
+- Concentrated-spend + outlier gating:
+  - Define concentrated_top2_flag = (top2_share ≥ 0.98).
+  - Define extreme_absolute_flag = (top_channel_percentile_by_channel ≥ extreme_percentile_threshold). Default extreme_percentile_threshold = 0.995 (99.5th); allow tuning to 0.999 if data sparsity allows.
+  - Define outlier_bin_low_support = True if channel_spend_bin sample_count < bin_min_n (default bin_min_n = 30).
+  - If concentrated_top2_flag AND extreme_absolute_flag:
+    - If channel_spend_bin posterior_mean_bin reliably supports transport (sample_count_bin ≥ bin_min_n and posterior_mean_bin ≥ bin_support_threshold), allow normal scoring.
+    - Else require stricter acceptance: E ≥ E_extreme_high AND model_disagreement ≤ σ_low AND (cry0_prior does not contradict) for auto‑accept; otherwise route to priority_audit or apply outlier penalty.
+  - Outlier penalty (soft): if channel_outlier_zscore > z_outlier_threshold (default 4.0) OR top_channel_percentile ≥ 0.999:
+    - In logit space: logit(p_combined) := logit(p_combined) − δ_logit_outlier (default δ_logit_outlier = 0.8).
+    - Alternatively multiplicative: p_combined := p_combined * (1 − δ_mult_outlier) (default δ_mult_outlier = 0.25). Use logit penalty as preferred for stable calibration.
+- OOD shrink for small batches:
+  - If batch_size < small_batch_min then raise base_min_se (as v3.4.4) and if novelty_score > novelty_threshold require E ≥ E_conservative_high (default 0.95) AND model_disagreement ≤ σ_low to auto‑accept; otherwise audit.
+- Integrate channel_spend_bin prior into prior fusion:
+  - Add w_bin = sample_count_bin/(sample_count_bin + τ_bin). Compute P_prior including channel_spend_bin posterior_mean if available.
+  - This allows extreme bin evidence (if enough samples) to pull p_combined up; otherwise the bin pushes p_combined down via the outlier penalty.
+
+Concrete numeric defaults (initial; validate/tune)
+- channel_spend_bin_min_n = 30; extreme_percentile_threshold = 0.995; top2_share_concentrated = 0.98.
+- δ_logit_outlier = 0.8; z_outlier_threshold = 4.0; δ_mult_outlier = 0.25 (not both used simultaneously; prefer logit shift).
+- bin smoothing s_bin = 5; τ_bin = 150.
+- small_batch_min = 10; base_min_se_batch(n==1) = 0.07 (increase vs v3.4.4); base_min_se_batch(2–9) = 0.035.
+- E_extreme_high = 0.95; E_conservative_high (small batch extreme) = 0.975.
+- model_disagreement σ_low = 0.05; σ_high = 0.15.
+- novelty_score weights: concentrated_top2 0.35, extreme_absolute 0.4, channel_outlier_zscore_norm 0.2, unknown_cluster 0.05; novelty_threshold = 0.6.
+- per-channel percentile computation: use robust quantiles from training footprint, update daily.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Absolute magnitude matters, not just concentration: a very large single‑channel spend is not necessarily the same as moderate concentrated spend; many very large single‑channel spends are rare and historically have different label distribution.
+- Rarity = uncertainty: extreme absolute values often have low sample counts so priors must be smoothed and treated as weak evidence unless bin counts are sufficient.
+- Over‑reliance on aggregate ensemble score for OOD points leads to confident but wrong decisions; model must detect novelty and increase uncertainty accordingly.
+- The interaction of concentrated spend with other features (CryoSleep, cabin_deck, age, homeplanet) must be modeled; e.g., a huge RoomService charge may be less predictive in certain cabin decks or on certain homeplanets.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Expand variance/uncertainty modeling to include spend‑bin uncertainty and novelty:
+  - var_bin = posterior_bin*(1 − posterior_bin)/(N_bin + 1).
+  - var_prior now includes var_bin (weighted).
+  - var_combined = alpha_post_total^2 * var_prior + (1 − alpha_post_total)^2 * var_ensemble + var_novelty, where var_novelty is an extra term that increases with novelty_score: var_novelty = κ * novelty_score^2 (κ default = 0.015).
+  - se_combined = sqrt(max(var_combined, base_min_se(batch_size)^2)).
+- z scaling: increase z_adj when novelty_score > threshold:
+  - z_adj = base_z * (1 + γ1 * combined_FP_risk + γ2 * model_disagreement + γ3 * novelty_score).
+  - This widens the lower bound p_lower for novel records.
+- Post‑penalty calibration:
+  - After applying outlier logit penalty, pass p into calibrator that is trained on both normal and novel/ODD labeled samples to avoid miscalibration.
+  - Retrain Platt/isotonic calibrators with covariates: novelty_score, top_channel_percentile, top2_share, spend_entropy, zero_spend_flag and model_disagreement.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persist new priors and snapshots:
+  - Persist channel_spend_bin table + channel_spend_stats; snapshot daily; log updates.
+- Small‑batch deterministic gating:
+  - For batch_size < small_batch_min, require stronger evidence to auto‑accept if novelty_score high or concentrated_top2_flag True. Unit tests for n=1 edge cases must be required in CI.
+- Decision provenance & logging:
+  - Log top_channel_spend_bin_id, top_channel_percentile_by_channel, novelty_score, reason_code, p_combined_before_penalty, logit_shift_applied, p_final, and model_disagreement.
+- Canary & shadow rules:
+  - Shadow new scorer against current production scorer; block deploy if concentrated_spend_FP_rate increases > 10% relative or if zero_spend FP regressions occur > 5% absolute.
+- Monitoring & dashboards:
+  - Add panels: concentrated_spend FP/FN by channel and percentile bucket, novelty_score distribution, tiny‑batch FP rate, per‑bin sample_counts, audit queue composition for concentrated_spend cases.
+- Audit triage:
+  - Priority for human audit: concentrated_top2_flag AND (extreme_absolute_flag OR channel_spend_bin sample_count < bin_min_n) AND ensemble vote positive.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New per‑record metrics to persist:
+  - top_channel_spend_bin_id, top_channel_percentile_by_channel, channel_bin_sample_count, channel_bin_posterior_mean, channel_bin_posterior_se, novelty_score, outlier_flag, logit_shift_amount, p_combined_before/after_penalty.
+- Model & training changes:
+  - GLM_fallback v11:
+    - Add features: top_channel_spend_bin_id (one‑hot or ordinal), top_channel_percentile_by_demo (numeric), channel_outlier_flag, novelty_score, top2_share, spend_entropy.
+    - Include interactions: channel_outlier_flag × (CryoSleep, Age_bucket, Cabin_deck) and top_channel_spend_bin_id × cabin_deck.
+    - Use stratified sampling to include rare high‑spend positives if they exist; otherwise avoid overfitting.
+  - SRM/aggregator:
+    - Return per‑model bootstrap SEs and per‑channel spend evidence contributions (e.g., how much aggregator relies on RoomService).
+- Active learning:
+  - Prioritize concentrated_spend contradictions and zero_spend contradictions for human labeling; add higher sample weight to these cases in next retrain.
+- Robust preprocessing:
+  - Use log1p transformation for spends for model stability; compute rank/percentile features for absolute magnitude.
+  - For extreme outliers, cap numeric features used for model input but keep raw value for OOD detection and bin lookup (i.e., winsorize model input but preserve bin id).
+- Tests & CI:
+  - Add deterministic unit tests:
+    - Case A: Single record concentrated high spend with ensemble moderate/high vote -> audit/reject (0082_01).
+    - Case B: Single record zero_spend + cryo_true -> audit/reject (0081_01).
+    - Case C: Large batch with many high spends -> standard logic unaffected.
+    - Case D: Known positive concentrated spend samples -> must still be accepted if bin evidence supports.
+
+Updated deterministic scoring pipeline (v3.5.0)
+1. Snapshot load at start of batch: channel table, channel_pair table, zero_spend table, cryo table, channel_spend_bin table, channel_spend_stats, model versions, calibrators.
+2. Preprocess per record:
+   - Compute total_spend, num_nonzero_channels, zero_spend_flag, spend_entropy, top_channel, second_channel, channel_pair_id, top2_share, top_channel_spend, top_channel_percentile_by_channel (lookup), top_channel_spend_bin_id (lookup), channel_outlier_zscore, novelty_score, batch_size.
+   - Winsorize / log1p the spend features for model inputs; preserve raw top_channel_spend for bin logic.
+3. Lookup priors:
+   - posterior_mean_ch & se, posterior_mean_pair & se, posterior_mean_zero & se, posterior_mean_cryo & se, posterior_mean_bin & se (if bin present).
+4. Model inference:
+   - aggregator_p + SE, GLM_p + SE, SRM_p + SE.
+5. Compute E (ensemble mean), component weights (w_pair, w_ch, w_zero, w_cryo, w_bin), P_prior, alpha_post_total, p_combined_prepenalty.
+6. Novelty and outlier handling:
+   - If concentrated_top2_flag and extreme_absolute_flag:
+     - If bin sample_count < bin_min_n OR posterior_mean_bin low → compute logit_shift = δ_logit_outlier × novelty_scale; apply logit shift to p_combined_prepenalty.
+     - Else include posterior_mean_bin in prior normally.
+   - If channel_outlier_zscore > z_outlier_threshold but percentile < extreme_percentile_threshold, scale novelty_score accordingly (so borderline outliers get softer penalty).
+7. Compute var_combined including var_bin and var_novelty; se_combined = sqrt(max(var_combined, base_min_se(batch_size)^2)).
+8. Calibrate:
+   - Compute z_adj = base_z * (1 + γ1 * combined_FP_risk + γ2 * model_disagreement + γ3 * novelty_score).
+   - p_lower = p_combined_after_penalty − z_adj * se_combined.
+   - p_final = calibrator(p_lower, covariates=[novelty_score, top_channel_percentile, top2_share, spend_entropy, zero_spend_flag, model_disagreement]).
+9. Decision gating:
+   - If batch_size < small_batch_min and novelty_score > novelty_threshold: require p_final ≥ E_conservative_high to auto accept; else route to priority_audit.
+   - If concentrated_top2_flag AND extreme_absolute_flag AND bin sample_count < bin_min_n: priority_audit unless E ≥ E_extreme_high and disagreement ≤ σ_low.
+   - Else apply standard thresholds.
+10. Output decision + full provenance and persist logs for audit and active learning.
+11. Post‑batch: aggregate metrics, update priors when human labels are available (with decay), update bin/training stats.
+
+Default hyperparameters (v3.5.0 initial)
+- channel smoothing s_ch = 5; pair smoothing s_pair = 8; bin smoothing s_bin = 5.
+- τ_ch = 50; τ_pair = 75; τ_zero = 100; τ_cryo = 80; τ_bin = 150; τ_total = 80.
+- cluster_min_n = 30; channel_spend_bin_min_n = 30.
+- extreme_percentile_threshold = 0.995; top2_share threshold = 0.98.
+- δ_logit_outlier = 0.8; z_outlier_threshold = 4.0.
+- ensemble weights: aggregator 0.5, GLM 0.3, SRM 0.2.
+- small_batch_min = 10; base_min_se_batch(n==1) = 0.07; base_min_se_batch(2–9) = 0.035.
+- E_high = 0.88; E_extreme_high = 0.95; E_conservative_high = 0.975.
+- model_disagreement σ_low = 0.05; σ_high = 0.15.
+- novelty_score weights detailed above; novelty_threshold = 0.6.
+- Calibration: base_z = 1.645; β = 0.2, γ1 = 1.0, γ2 = 0.6, γ3 = 1.0.
+
+Validation experiments & acceptance criteria
+- Holdout & stratified LOO across slices:
+  - Stratify by: zero_spend × cryo_flag, concentrated_top2 × top_channel_percentile bins, channel_spend_bin, cabin_deck, age_bucket, homeplanet.
+  - Include priority test cases: 0069_01, 0070_01, 0071_01, 0073_01, 0074_01, 0076_01, 0078_01, 0081_01, 0082_01.
+- Metrics to evaluate:
+  - Per_slice FP/FN rates (zero_spend × cryo, concentrated_spend × bin), Brier score, ECE, CI coverage, audit precision/recall, audit queue size/latency, tiny‑batch FP rate.
+- Success criteria vs v3.4.4:
+  - Reduce concentrated_spend FP rate (high percentile bins) by ≥ 60% vs v3.4.4 OR not degrade other slices by > 5%.
+  - Maintain zero_spend FP reduction from v3.4.4.
+  - Recover ≥ 70% of previously missed TPs for undersampled slices (0074_01, 0076_01) vs earlier baselines.
+  - Overall FN increase ≤ 8%; audit load increase manageable (< 2× current capacity) with active learning to reduce over time.
+- Parameter sweeps:
+  - extreme_percentile_threshold ∈ {0.99, 0.995, 0.999}, δ_logit_outlier ∈ {0.5, 0.8, 1.2}, base_min_se_batch(n=1) ∈ {0.05, 0.07, 0.10}, channel_spend_bin_min_n ∈ {20,30,50}.
+- Ablations:
+  - with/without channel_spend_bin prior; with/without logit outlier penalty; small_batch_min {5,10,20}.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+   - Create and populate channel_spend_bin and channel_spend_stats; expose top_channel_percentile_by_channel lookup API; add these features to feature store.
+   - Ensure zero_spend & cryo tables from v3.4.4 are persisted.
+2. Scoring engineers:
+   - Implement preprocessor changes: compute top_channel_percentile, top_channel_spend_bin_id, channel_outlier_zscore, novelty_score, and add concentrated/outlier gating into scorer.
+   - Implement logit outlier penalty and increased base_min_se for n==1.
+   - Add deterministic provenance logging fields (see pipeline).
+   - Shadow run on recent batches including the priority cases (0074/0076/0078/0081/0082).
+3. ML:
+   - Retrain GLM_fallback v11 with new features and interactions; retrain calibrators with novel covariates.
+   - Prepare stratified validation and parameter sweeps.
+4. Ops/SRE:
+   - Add CI checks for concentrated_spend FP rate canary; implement staged rollout gating.
+5. Product/ops:
+   - Draft human audit instructions for concentrated_spend contradictions and zero_spend contradictions.
+6. Monitoring:
+   - Add dashboards for top_channel percentile buckets, bin sample counts, novelty_score distribution, and audit queue composition.
+
+How v3.5.0 would handle 0082_01 (concrete flow)
+1. Feature extraction: top_channel = RoomService; top_channel_spend = 7406; top2_share = 1.0 (concentrated_top2_flag True); top_channel_percentile_by_channel likely ≥ 99.5th (extreme_absolute_flag True); channel_spend_bin_id = e.g., >p99.9 bin (if distribution shows so); channel_bin_sample_count likely small.
+2. Lookup priors: channel_spend_bin posterior_mean_bin and sample_count_bin retrieved. If sample_count_bin < bin_min_n (common for very extreme bins), bin offers weak evidence.
+3. Ensemble: E computed from models (may be high).
+4. alpha_post_total computed: bin weight small if bin sample count low; prior remains dominated by global & channel priors.
+5. Outlier handling:
+   - novelty_score high (concentrated + extreme percentile + high zscore).
+   - Apply logit shift (δ_logit_outlier) to reduce p_combined_prepenalty.
+   - Increase se_combined (base_min_se for n==1 set to 0.07).
+   - z_adj scaled up because novelty_score high.
+6. Decision gating:
+   - Unless E ≥ 0.95 and model_disagreement ≤ 0.05, this case is routed to priority_audit rather than auto‑accept; p_final would likely fall below auto‑accept threshold.
+7. Net effect: 0082_01 would be audited or rejected rather than auto‑accept, reducing FP probability.
+
+Expected tradeoffs & mitigations
+- Tradeoffs:
+  - More audits for concentrated extreme spends (initially higher priority_audit load).
+  - Risk of delaying some true positives with extreme spends if they exist.
+- Mitigations:
+  - Active learning to quickly label concentrated_spend cases and incorporate them into channel_spend_bins; weight those samples higher to recover legitimate positives.
+  - Staged rollout and canary thresholds to control audit load.
+  - Adjust δ_logit_outlier and extreme_percentile_threshold through validation to achieve target FP/recall tradeoff.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudocode implementing v3.5.0 rules (preprocessing, priors, outlier penalty, calibration, gating).
+- channel_spend_bin generation script + retention/decay policy.
+- Shadow retrain: GLM_fallback v11 + stratified validation report and parameter sweeps.
+- Unit test matrix including 0081_01 and 0082_01 deterministic tests.
+- Dashboard additions and CI checks for concentrated_spend canary.
+- 72‑hour implementation checklist (owners, artifacts, canary criteria).
+
+One‑line summary
+v3.5.0 augments v3.4.4 by adding per‑channel absolute‑spend bins, concentrated‑spend OOD detection and logit outlier penalties, and stricter small‑batch gating — preventing FPs like 0082_01 while preserving earlier gains on zero_spend and concentrated‑pair slices.
+
+Recommended immediate next action
+I can either:
+1) produce the deterministic scorer skeleton (Python pseudocode) and the minimal unit test matrix for v3.5.0 now (recommended), OR
+2) run a shadow rerun across last N batches (include 0074_01, 0076_01, 0078_01, 0081_01, 0082_01) and return stratified validation output + suggested operating point.
+
+Which would you prefer? If you want the scorer skeleton, I will include the new feature calculations, prior fusion, outlier penalty, calibrator call, and unit tests for the key edge cases.
+
+============================================================

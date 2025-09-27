@@ -1,0 +1,286 @@
+PREDICTIVE METRICS - ITERATION 37
+============================================================
+
+Updated Predictive Metrics Report — v2.7
+(Goal: eliminate high‑spend false positives like 0061_01 and zero‑spend false negatives without creating new high‑spend false negatives; improve batch accuracy & calibrated confidence; keep decisions deterministic, reproducible & auditable)
+
+Executive summary — immediate takeaway and top priorities
+- Immediate problem: batch produced a high‑spend False Positive (0061_01: large FoodCourt + Spa + ShoppingMall) driven by summed spend contributions and under‑estimated uncertainty (over‑confident covariance assumptions). This mirrors the earlier 0045_01 failure mode and shows our single “one‑size‑fits‑all” spend attenuation / correlation assumptions remain brittle for multi‑channel high spend patterns.
+- Root cause (short): multi‑channel extreme spend created a large positive logit; static Corr_spend + global winsorization under‑estimated se_logit_final → overconfident positive. No per‑prediction spend‑reliability/co‑spend coherence logic prevented acceptance.
+- Top priorities (deploy in order):
+  1. Immediately force stricter handling for multi‑channel extreme spend (temporary rule): force GLM_fallback + increased attenuation until SRM & cluster‑specific parameters are retrained and validated.
+  2. Deploy SpendPatternClustering + SpendReliabilityModel (SRM) + CoSpendCoherence measure to make attenuation routing dynamic and deterministic.
+  3. Replace fixed Corr_spend and global winsorization with cluster‑specific covariance and winsorization quantiles; enforce a per‑cluster min_se_logit to avoid under‑confidence underestimation.
+  4. Update consensus rules to accept single‑model positives only for high SRM reliability & coherent patterns; require consensus / GLM verification for low/contradictory / multi‑channel cases.
+  5. Persist full per‑prediction provenance and add batch precommit checks & audit queues for spend‑anomaly cases.
+
+1) What specific patterns in the current metrics led to the 0061_01 prediction error
+- Multi‑channel extreme spend: this passenger had very large FoodCourt and Spa (and medium ShoppingMall). The aggregator summed large positive per‑channel deltas into a very large final logit.
+- Under‑estimated uncertainty:
+  - Corr_spend used a global/intermediate correlation assumption (too high for this regime), which lowered the computed se_logit_final and produced overconfident p_lower.
+  - No enforced min_se_logit or cluster‑specific covariance, so a few large deltas looked artificially precise.
+- Global winsorization / clipping too coarse: winsorization did not suppress multi‑channel mosaic effects (many channels high at once), so total contribution remained inflated.
+- No co‑spend coherence signal or SRM: system lacked a deterministic measure to detect “unlikely multi‑channel patterns” (e.g., Spa and FoodCourt both extreme for this segment).
+- GLM_fallback either not invoked or not decisive: because aggregator p_lower exceeded the acceptance threshold with artificially small se, we never required fallback consensus.
+- Result: over‑confident True prediction despite historical patterns where similar multi‑channel extremes often map to False.
+
+2) How decision rules should change (concrete, deterministic rules to prevent similar errors)
+High‑level change: move from global, fixed attenuation and static Corr_spend → cluster‑aware winsorization/covariance + SRM‑driven dynamic attenuation + co‑spend coherence checks that deterministically control routing and thresholds.
+
+New deterministic components and rules (v2.7)
+- SpendPatternClustering (deterministic seeded KMeans or rule tree; snapshot per batch):
+  - Clusters: {none/low, balanced, single_spike, multi_high}. Persist cluster_id.
+- CoSpendCoherence (CSC): Mahalanobis distance of normalized channel vector to cluster centroid (deterministic). High CSC implies incoherent/rare co‑spend combination → reduces reliability.
+- SpendReliabilityModel (SRM): deterministic, versioned model outputting reliability_score ∈ [0,1] + bootstrap_se. Inputs: per_channel_z, channel_ratios, dominance measures, Age_bucket, Cabin_deck, Destination, prior segment label rate, CSC, name/cabin duplicate flags, sample history flags.
+- Dynamic attenuation (replace fixed spend_outlier_factor):
+  - base_factor = clip(0.35 + 0.65 * SRM_score, 0.35, 1.0)
+  - coherence_factor = {1.0 for low CSC, 0.8 for medium CSC, 0.6 for high CSC} (deterministic mapping)
+  - spend_factor = base_factor * coherence_factor (clip to [0.25, 1.0])
+  - Rationale: single‑channel high but coherent + high SRM → little attenuation; multi_high incoherent → stronger attenuation.
+- Per‑cluster winsorization & clipping:
+  - Use per_channel per_cluster quantiles (fallback to global if n small). Multi_high cluster uses more aggressive per_channel caps to avoid additive extremes.
+- Corr_spend & se_logit:
+  - Use cluster‑specific covariance matrices for contribution propagation.
+  - Enforce min_se_logit = max(estimated_se_logit, min_se_by_cluster). Defaults: normal=0.18, spike=0.28, multi_high=0.35 (tune on validation).
+- Routing & consensus (deterministic):
+  - Compute aggregator_p & se_agg, GLM_p & se_glm (if GLM invoked), SRM_score (with CI), CSC.
+  - Define effective_reliability = SRM_score * coherence_factor.
+  - Decision tiers:
+    - High reliability (effective_reliability ≥ 0.90):
+      - Accept aggregator_positive if p_lower_agg ≥ 0.75 (no mandatory consensus). Log GLM if available.
+    - Medium reliability (0.7 ≤ eff_rel < 0.90):
+      - Force GLM_fallback + require at least 2/3 agreement among {aggregator_post_attenuation, GLM, SRM_binary_decision}. If no consensus → Abstain & audit.
+    - Low reliability (eff_rel < 0.7) OR multi_high incoherent:
+      - Strong attenuation (factor ≤ 0.5), force GLM_fallback; require GLM_p_lower ≥ 0.80 AND aggregator_p_lower ≥ 0.68 to return True. Else → Predict False or Abstain (if contradiction).
+  - Contradiction guard:
+    - If aggregator indicates Positive but nonspend_support (non‑spend channels or negative deltas) magnitude |nonspend_support| ≥ 0.06 and eff_rel < 0.95 → force GLM + consensus or Abstain.
+- Deterministic logging:
+  - Persist SRM_score, CSC, spend_cluster_id, spend_factor, per_channel_z, top_contrib_share, aggregator_p, GLM_p, se_logit_final, primary_decision_reason, snapshot_id.
+
+3) New insights about passenger transport patterns revealed by this error group
+- Multi‑channel extremes behave differently from single‑channel spikes:
+  - Multi_high simultaneous spikes often indicate billing artifacts (prepaid bundles, group charges, refunds, duplicates) or rare events; historically they correlate less with True labels than a single coherent channel spike.
+- Channel semantic asymmetry:
+  - Spa + FoodCourt simultaneous extremes appear less predictive than a ShoppingMall single spike in some segments. This requires per‑segment/channel predictive weights.
+- Correlations are regime‑dependent:
+  - Inter‑channel correlations are lower in single_spike clusters and even lower when co‑spend incoherence is high. A global Corr_spend mischaracterizes these regimes.
+- Label/data noise is concentrated in multi_high outliers: more human audit required here (duplicates/refunds detection).
+- Both tails (zeros and extremes) need symmetric, regime‑aware treatment.
+
+4) How confidence levels should be recalibrated
+- Two‑stage calibration with spend‑regime offsets:
+  - Stage 1: Platt_map(global) on raw aggregator logits → p_global.
+  - Stage 2: Apply per‑segment & per‑spend_cluster Platt offsets if sufficient n; else use global.
+- Dynamic z for uncertainty bands (choose z per effective_reliability & cluster):
+  - If eff_rel ≥ 0.90 → z = 1.28 (90% band)
+  - 0.7 ≤ eff_rel < 0.9 → z = 1.96 (95%)
+  - eff_rel < 0.7 or multi_high incoherent → z = 2.33 (98%)
+- Se computation:
+  - se_logit_final computed using cluster‑specific covariance matrix; combine with GLM bootstrap se when GLM is used to form consensus CI.
+  - Enforce min_se_logit per cluster to avoid numeric underestimation.
+- Acceptance thresholds (initial, validate/tune):
+  - Regular positive: p_lower ≥ 0.75
+  - High‑reliability: same thresholds; allow single‑model acceptance
+  - Medium reliability: require 2/3 consensus OR (aggregator_p_lower ≥ 0.80 & GLM_p_lower ≥ 0.68)
+  - Low reliability / multi_high incoherent: GLM_p_lower ≥ 0.80 required (and aggregator non‑contradiction)
+  - Abstain region: lacking consensus with wide CI or contradiction; log to audit queue.
+
+5) Adjustments needed for consistency across batches
+- Deterministic snapshot & batch metadata persistence (required):
+  - snapshot_id capturing: winsor quantiles (per channel & per cluster), cluster centroids, SRM/GLM versions, calibration maps, seeds for clustering/bootstraps. Persist for audit & reproducibility.
+- Batch precommit checks (block/alert if triggered):
+  - fraction_multi_high_spend > baseline * 1.25 → alert & require manual review if > threshold.
+  - median_total_spend shift > 1.5× baseline MAD → block and require review.
+  - GLM_fallback_used fraction > baseline * 1.5 → alert.
+- Audit queue sampling & triggers:
+  - All multi_high & high_CSC cases predicted True
+  - SRM_score < 0.7 AND predicted True
+  - GLM_fallback_used
+  - contradiction_flag cases
+  - top_contrib_share ≥ 0.5 with predicted True
+- Deterministic pooling & seeding: ensure cluster assignment and bootstraps use snapshot seeds. Persist per‑prediction seeds if needed.
+
+6) How to improve metrics & models to handle edge cases like 0061_01
+- New diagnostics persisted per prediction:
+  - spend_cluster_id, SRM_score & bootstrap_se, CSC (Mahalanobis distance), spend_factor, per_channel_z, per_channel_percentile, top_contrib_share (top N channel share), aggregator_p & p_lower, se_logit_final, min_se_flag, GLM_p & p_lower & bootstrap_se, contradiction_flag, winsorization_quantiles_used (per channel), snapshot_id, primary_decision_reason.
+- New/updated models:
+  - SpendReliabilityModel (SRM) v1: supervised classifier/regressor predicting “reliability of spend signal” with bootstrapped CI. Train with balanced sampling of outliers and contradiction cases.
+  - CoSpendClusterer: deterministic k‑means / rule engine (k ∈ {3,4}) with per‑cluster covariance and winsor quantiles.
+  - GLM_fallback v2: enriched features (per_channel_z, channel_ratios, SRM_score, CSC, top_contrib_share, name/cabin duplication flags), trained with oversampling of multi_high / single_spike regimes and bootstrapped CI.
+  - “Coverage guard” regressor: predicts expected se_logit (helps set min_se_by_cluster).
+- Training & data:
+  - Oversample extreme multi_high cases and contradiction labeled examples for SRM and GLM_fallback training.
+  - Add features capturing transaction duplication/refund signals (e.g., identical amounts across cabin group, negative adjustments).
+  - Create a labeled audit set containing 0045_01, 0053_01, 0061_01 and similar to ensure robust SRM discrimination.
+- Immediate stop‑gap mitigations (deploy within 24–72h):
+  - Force GLM_fallback + stronger attenuation (spend_factor ≤ 0.5) for all records assigned to multi_high cluster.
+  - Lower multi_high per_channel winsor quantile (e.g., from 0.995 → 0.99) to reduce additive effect.
+  - Enforce min_se_logit = 0.35 for multi_high until cluster covariances recalculated and SRM retrained.
+
+Updated deterministic scoring pipeline — v2.7 (production outline)
+1. Snapshot & baseline
+   - Load snapshot (winsorization quantiles per channel & per cluster; cluster centroids; model versions; calibration maps). Persist snapshot_id.
+2. Age bucketing & base priors (unchanged)
+   - Use Laplace smoothing for p0_global and segment priors.
+3. SpendPatternClustering (deterministic)
+   - Normalize channel vector = s_i / (Σ s_i + ε); assign cluster_id.
+4. CoSpendCoherence (CSC)
+   - Compute Mahalanobis distance of normalized s_i to cluster centroid → CSC score (low/med/high).
+5. Spending preprocessing
+   - Per‑channel winsorize using per‑cluster quantiles; fallback to global.
+   - s_i = log1p(x_winsorized)
+   - Compute per_channel_median & MAD (cluster aware) → z_i
+   - total_spend_log1p & total_spend_robust_z
+   - top_contrib_share = sum of top 1–2 channel contributions / total contribution
+6. Compute deterministic aggregator (priors + deltas)
+   - Clip per‑channel deltas with cluster‑specific max_delta and group_sum_cap.
+7. Run SRM (SpendReliabilityModel)
+   - Input: per_channel_z, channel_ratios, dominance measures, Age_bucket, Cabin_deck, Destination, CSC, name/cabin indicators.
+   - Output: SRM_score ∈ [0,1] + bootstrap_se. Persist SRM_score.
+8. Dynamic attenuation & routing
+   - Compute spend_factor = base_factor * coherence_factor (deterministic).
+   - Apply spend_factor to spending contributions.
+   - Determine routing per effective_reliability = SRM_score * coherence_factor.
+   - If medium/low reliability → force GLM_fallback.
+9. GLM_fallback (if invoked)
+   - Deterministic compact model with enriched features + bootstrap for CI.
+10. Aggregate & compute uncertainties
+    - Compute logit_final = logit0_effective + Σ contributions (post attenuation).
+    - Compute se_logit_final using cluster covariance; enforce min_se_logit for cluster.
+    - Choose z by effective_reliability/cluster.
+    - p_raw → p_calibrated by global Platt + per_segment & per_cluster offsets → p_lower/p_upper.
+11. Decision & provenance
+    - Apply deterministic consensus & thresholds from rules above.
+    - Persist full diagnostics & primary_decison_reason. Route to audit if abstain/GLM_fallback/contradiction or if spend_outlier_flag AND predicted True.
+12. Post‑batch checks
+    - Run precommit checks, emit alerts, persist batch summary metrics.
+
+v2.7 concrete initial parameter defaults (tune on validation)
+- Laplace alpha = 1; shrinkage k_segment = 14
+- min_bin_count = 40; min_age_n = 50; min_platt_n = 200
+- Clustering: k = 4 (none, balanced, single_spike, multi_high). Deterministic seed persisted.
+- winsorization per_channel_per_cluster_q:
+  - default = 0.995
+  - ShoppingMall single_spike cluster up to 0.999
+  - multi_high cluster default = 0.99 (more aggressive)
+- max_delta_spend_channel: cluster‑dependent (spike_channel_cap ±0.6, multi_high per channel ±0.4)
+- group_sum_cap_spend (post attenuation) = ±1.0 (lower than v2.6 to prevent sum overconfidence)
+- Corr_spend (per cluster): compute from training; default global = 0.6; single_spike = 0.35; multi_high = 0.25
+- min_se_logit_by_cluster: normal=0.18; spike=0.28; multi_high=0.35
+- spend_channel_outlier_z = 4.0; spend_total_outlier_z = 4.5
+- SRM attenuation thresholds:
+  - SRM_high = 0.90 → base_factor ≈ 1.0
+  - SRM_med = 0.7 → base_factor ≈ 0.8
+  - SRM_low = 0.5 → base_factor ≈ 0.6
+  - SRM_very_low < 0.5 → base_factor = 0.35
+  - coherence_factor mapping: low CSC =1.0, med CSC=0.8, high CSC=0.6
+- Decision thresholds:
+  - Regular p_lower_pos_threshold = 0.75; p_upper_neg_threshold = 0.25
+  - High reliability: accept single‑model if p_lower ≥ 0.75
+  - Medium reliability: require 2/3 consensus
+  - Low reliability: GLM_p_lower ≥ 0.80 required
+- z values:
+  - z_normal = 1.28; z_med = 1.96; z_low = 2.33
+- Targets:
+  - Reduce high‑spend False Positives ≥ 50% vs v2.6 baseline on validation.
+  - High‑spend False Negatives increase ≤ 5% (ideally reduce).
+  - Abstain fraction ≤ 5–8% after tuning.
+  - Improve ECE/Brier in spend regimes by >10%.
+
+Validation experiments (high priority)
+- Stratified LOO by cluster & channel patterns:
+  - Holdouts: single_spike ShoppingMall, single_spike RoomService, multi_high Spa+FoodCourt, zero_spend.
+  - Measure: per‑cluster accuracy, recall, precision, FP/FN by spend cluster, Brier score, ECE, abstain fraction.
+- SRM validation:
+  - Report SRM AUC, calibration (Brier/ECE), calibration curves by cluster.
+  - Verify effective_reliability thresholds align with real FP/FN tradeoffs.
+- Sensitivity sweeps:
+  - Spend attenuation mapping slopes, coherence_factor values {0.6, 0.8, 1.0}, winsor quantiles {0.99,0.995,0.999}, min_se settings, Corr_spend per cluster.
+- GLM_fallback robustness:
+  - Retrain with enriched outlier cases; evaluate bootstrap CI coverage and concordance with aggregator in high SRM cases.
+- Decision rule ablations:
+  - Compare dynamic attenuation + SRM vs fixed attenuation; measure impact on high_spend FP/FN and overall ECE.
+- Coverage & CI tests:
+  - Check 90/95/98% interval coverage per cluster on validation.
+
+Monitoring & alerts (per prediction + batch summary)
+- Persist per prediction: SRM_score, CSC, spend_cluster_id, spend_factor, per_channel_z, aggregator_p/p_lower, se_logit_final, min_se_flag, GLM_p/p_lower, GLM_fallback_used, contradiction_flag, winsorization_quantiles_used, top_contrib_share, snapshot_id, primary_decision_reason.
+- Dashboards & alerts:
+  - fraction_multi_high_spend: alert if > baseline * 1.25
+  - GLM_fallback fraction per batch: alert if > baseline * 1.5
+  - median_total_spend shift > 1.5× baseline MAD: block & require review
+  - High_spend cluster FP rate rising >10%: alert
+  - Coverage & ECE per cluster: alert if coverage drops > 5% or ECE increases
+- Audit queue triggers:
+  - SRM_score < 0.7 AND predicted True
+  - multi_high & CSC_high predicted True
+  - GLM_fallback_used
+  - Contradiction_flag
+  - top_contrib_share ≥ 0.5 predicted True
+
+Case‑level diagnosis — how v2.7 would handle 0061_01 (the batch error)
+- Original record: RoomService=45, FoodCourt=1096, ShoppingMall=148, Spa=1377, VRDeck=1
+- v2.7 behavior (deterministic):
+  - Cluster assignment: multi_high (multiple channels extreme).
+  - CSC: High (Mahalanobis distance far from typical centroids) → coherence_factor = 0.6.
+  - SRM: likely medium‑low reliability (depending on segment priors); effective_reliability = SRM_score * 0.6 falls below 0.7.
+  - spend_factor: base_factor (from SRM) * 0.6 → substantial attenuation (e.g., from 0.8 → 0.48).
+  - Per‑channel winsorization (multi_high cluster) trims extreme tails before summation.
+  - min_se_logit for multi_high enforced (e.g., 0.35) → se_logit_final increases, p_lower reduces substantially.
+  - Because eff_rel < 0.7 and multi_high: force GLM_fallback. GLM likely recognizes multi_high pattern as noisy → GLM_p_lower likely < 0.80.
+  - Decision: Predict False or Abstain. Case routed to audit queue (multi_high & predicted True would be audited; but here predicted False — still logged).
+- Net: The system would not have produced an overconfident True as in v2.6. The temporary stop‑gap (force GLM for multi_high) would have prevented this FP immediately.
+
+Immediate operational actions (24–72 hours)
+- Apply temporary mitigations:
+  - Force GLM_fallback & stronger attenuation (spend_factor ≤ 0.5) for multi_high cluster; lower multi_high winsor quantile to 0.99.
+  - Persist extra diagnostics for all multi_high records and route predicted True ones to human audit queue.
+- Data action:
+  - Add 0061_01, 0045_01, 0053_01 and similar audit cases to retraining sets (label corrections & contextual notes).
+- Training action:
+  - Retrain SRM quickly (initial GBM/logistic) using oversampled outliers and submit to validation.
+  - Retrain GLM_fallback with enriched features and bootstrapped CI.
+- Monitoring:
+  - Tighten precommit batch checks for median spend shift & multi_high fraction.
+
+Expected tradeoffs
+- Short term: higher GLM_fallback use, higher audit load and possible increase in Abstain fraction. Compute & logging costs increase.
+- Medium term: reduced high_spend FP rate, improved calibration (Brier/ECE) in spend regimes, fewer over‑suppressed FNs after SRM + GLM retrain and per‑cluster tuning.
+- Risk: if SRM mis‑trains it may underweight legitimate single_spike positives; mitigate by oversampling and human review of SRM edge cases.
+
+Rollout checklist (prioritized)
+Immediate (24–72h)
+1. Implement deterministic SpendPatternClustering + CSC calculation & snapshot.
+2. Enforce temporary rule: force GLM_fallback + stronger attenuation for multi_high cluster; reduce multi_high winsor quantile to 0.99.
+3. Persist new diagnostics (SRM placeholders, CSC, spend_cluster_id, spend_factor, per_channel_z, top_contrib_share).
+4. Add identified error cases (0045_01, 0053_01, 0061_01) to training/audit queue; label & note.
+Near term (1–2 weeks)
+1. Train SRM v1 (GBM/logistic) and validate; tune spend_factor mapping & coherence_factor.
+2. Retrain GLM_fallback with enriched features & bootstrapped CI.
+3. Deploy per‑cluster covariance matrices and min_se_logit enforcement.
+4. Run full validation sweeps and tune thresholds; reduce temporary mitigations gradually as SRM/GLM validated.
+Medium term (after +50–200 new labels)
+1. Iterate SRM & GLM_with audit labels; refine mapping thresholds and per‑cluster winsorization.
+2. Replace heuristic coherence_factor with SRM‑learned adjustment term.
+3. Consider compact chooser model that deterministically routes records to aggregator/GLM/ensemble based on diagnostics.
+Long term
+1. Continuous retraining with human‑in‑the‑loop for audit cases.
+2. Explore hierarchical Bayesian pooling for segment priors and posterior predictive intervals.
+3. If accepted, develop a supervised stacker for deterministic weighted ensemble with auditability guarantees.
+
+Validation & monitoring plan (deliverables)
+- LOO stratified validation report by cluster (accuracy, precision, recall, FP/FN by spend cluster).
+- SRM validation (AUC, calibration, reliability plots).
+- Per‑cluster ECE / Brier before vs after v2.7.
+- CI coverage report for 90/95/98 intervals by cluster.
+- Post‑deployment dashboard: fraction_multi_high, GLM_fallback_fraction, FP_rate_by_cluster, median_total_spend shift.
+
+Immediate outputs I can produce for you
+- Deterministic Python scorer implementing v2.7 skeleton (clustering + CSC + SRM stub + dynamic attenuation + GLM_fallback stub + full diagnostics).
+- LOO evaluation on your labeled set and a validation report showing predicted behavior for 0045_01, 0053_01, 0061_01 under v2.7.
+- Unit tests & reproducible audit log schema for new diagnostics.
+Which would you like first — the scorer code, the LOO report, or both?
+
+One‑line summary: v2.7 adds deterministic co‑spend coherence + SpendReliability logic, cluster‑specific covariance & winsorization, and stricter consensus rules for multi‑channel extremes so we avoid high‑spend overconfidence (FPs like 0061_01) while still allowing coherent high‑spend positives when evidence supports them — all with full per‑prediction provenance and batch precommit checks for reproducibility and auditability.
+
+============================================================

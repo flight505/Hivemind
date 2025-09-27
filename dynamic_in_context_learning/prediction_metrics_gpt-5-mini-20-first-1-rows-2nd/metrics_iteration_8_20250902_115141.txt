@@ -1,0 +1,252 @@
+PREDICTIVE METRICS - ITERATION 8
+============================================================
+
+Executive summary — immediate takeaway and top priorities
+- What happened: The new false positive (0022_01; predicted True, actual False) is a classic complement to the Terta/Mael failures: a single, extreme spending signal (RoomService = 980) dominated the evidence and tipped a marginal aggregator into a positive call. This is the same family of failure modes as before (many weak correlated positives or single extreme contributor), but now exposed as an over-weighted continuous/outlier feature rather than many small categorical buckets.
+- Immediate priorities (deploy in this order):
+  1. Implement spending/outlier handling: winsorize/log-transform spending, quantile-binning, per-bin Laplace + shrinkage, and require min_bin_count before allowing a bin to contribute strongly.
+  2. Enforce a one-feature dominance guard: if one feature contributes > X% of signed support, require independent supporting signal(s) or force Abstain/fallback.
+  3. Keep existing Laplace smoothing + reliability shrinkage (k = 5) and reliability-scaling of weights (k2 = 5).
+  4. Keep small-n hard-neutralization (n ≤ 3 → delta *= 0.5) and delta cap ±0.8; extend small-n logic to quantile bins.
+  5. Strengthen p_lower gating for single-feature-dominated predictions (raise required p_lower).
+  6. Log per-prediction diagnostics (p_final, p_lower, se_logit_final, top contributors, top_contributor_share, snapshot_id) and add new monitors for top_contributor_share and spending-bin counts.
+
+Root cause analysis — what specifically went wrong for 0022_01
+- Key datapoints: HomePlanet=Mars, Cabin=D/0/P (Deck D, Side P), Destination=TRAPPIST-1e, Age=21, RoomService=980, FoodCourt=2, ShoppingMall=69, Spa=0, VRDeck=0.
+- Failure pattern:
+  - RoomService = 980 is an extreme outlier. The current pipeline treated spending either as raw continuous or as a very-high bin with little support (small-n) but still allowed it to contribute a large delta.
+  - The spending delta was treated as independent positive evidence and outweighed other signals (e.g., Cabin/Deck effects or HomePlanet). There was no dominance guard, so a one-feature heavy contribution could flip a marginal final logit.
+  - Uncertainty for that spending bin was underestimated or not propagated properly; se_logit_final did not increase enough to push p_lower below the threshold.
+- Net result: Over-reliance on a single extreme/rare spending signal → false positive.
+
+What this reveals about passenger patterns and feature behavior
+- Spending is heavily skewed and sparse in high quantiles; large spending values are rare and unreliable without sufficient bin support.
+- High spending does not universally imply transported; correlation varies by other dimensions (deck, destination, age, VIP).
+- Continuous outliers are effectively new categories and require the same conservative treatment as small-n categorical buckets.
+- Single-feature dominance (especially from continuous/outlier features) is a high-risk pattern for both FP and FN.
+
+Complete updated deterministic scoring pipeline (production-ready)
+All changes are deterministic given stored snapshot (N and per-bin / per-value counts). This replaces and augments the earlier pipeline.
+
+Notation & snapshot
+- Snapshot stores: N, T, per-category n_i/t_i for categorical values, per-quantile-bin n_bin/t_bin for continuous features (spending), Corr_ij for features (for grouping), and base_weights.
+- New per-prediction logs must include top_contributor_share and per-bin counts.
+
+0) Baseline prior
+- p0 = (T + 1) / (N + 2)
+
+1) Spending pre-processing (new; apply for RoomService, FoodCourt, ShoppingMall, Spa, VRDeck)
+- Winsorize at winsor_pct (default 99.5th percentile observed in snapshot).
+- Transform: x' = log1p(x_winsorized)
+- Create quantile bins (num_bins = 20 by default) on transformed values across snapshot. Merge bins whose n_bin < min_bin_count into adjacent bins until min_bin_count satisfied.
+- For any bin with n_bin = 0 (new extreme observed in production), treat as small-n/new-category (see step 2 & 10).
+
+2) Per-value / per-bin Laplace smoothing
+- For categorical value i or spending bin b:
+  - If n > 0: p_i_smoothed = (t_i + 1) / (n_i + 2)
+  - If n = 0: p_i_smoothed = p0 and mark as new_category_low_support
+- For spending bins, enforce min_bin_count merging so that isolated outliers end up with very small n or merge to a conservative bin.
+
+3) Reliability shrinkage (k = 5)
+- p_i_shrunk = (n_i / (n_i + k)) * p_i_smoothed + (k / (n_i + k)) * p0
+
+4) Log-odds deltas (cap and small-n neutralization)
+- logit0 = ln(p0 / (1 − p0))
+- raw_delta_i = ln(p_i_shrunk / (1 − p_i_shrunk)) − logit0
+- Small-n neutralization (applies to categorical values and spending bins):
+  - If n_i ≤ n_small (n_small = 3) → raw_delta_i := raw_delta_i * small_n_factor (0.5)
+  - If n_bin < min_bin_count_threshold (e.g., 5 or 10) treat as small-n with stronger neutralization (factor = 0.3)
+- delta_i := clip(raw_delta_i, −max_delta, +max_delta)  (max_delta = 0.8)
+
+5) Continuous/outlier extra-variance treatment
+- For spending bins flagged as high-quantile (top 2–5% of snapshot) or bins with extreme mean, increase posterior variance (se_delta_i) by multiplier (e.g., ×1.5−2.0) to reflect extra epistemic uncertainty.
+
+6) Base feature weights (starting point)
+- Starting base_w (recommendation, re-fit later): CryoSleep 0.30, Deck 0.22, HomePlanet 0.10, Spending (aggregate) 0.10 (reduced), Destination 0.08, Age 0.08, Side 0.06, VIP 0.04
+- Rationale: reduce immediate spending base weight to limit its dominating influence until we can re-fit.
+
+7) Age-conditioned multipliers (as before)
+- CryoSleep multiplier:
+  - Age ≤ 1: 0.5
+  - 1 < Age ≤ 12: 0.65
+  - Age > 12: 1.0
+
+8) Reliability scaling of weights (k2 = 5)
+- r_i = n_i / (n_i + k2)
+- raw_w_i = base_w_i * age_multiplier_i * r_i
+- For spending, use r_bin computed from per-bin n_bin.
+
+9) Redundancy correction (group normalization)
+- Cluster features with abs(Corr_ij) ≥ corr_group_threshold (0.25).
+- For each cluster G with m features, rescale: raw_w_i ← raw_w_i / sqrt(m).
+- Normalize weights: w_i = raw_w_i / Σ_j raw_w_j.
+
+10) Dominance guard (new)
+- Compute signed_contrib_i = w_i * delta_i (signed).
+- total_signed_abs = Σ_j abs(signed_contrib_j)
+- top_contrib_share = max_i abs(signed_contrib_i) / (total_signed_abs + ε)
+- If top_contrib_share > top_share_threshold (default 0.5):
+  - If top feature is a spending bin and n_bin < dominance_bin_n_min (default 10) → force Abstain (or fallback to safe policy).
+  - Else require: at least one additional reliable supporting feature in same direction (r >= reliable_r_min = 0.6 and abs(p_i_shrunk − p0) >= 0.05). If none → Abstain/fallback.
+  - Also require stricter p_lower (see Decision rules).
+- This prevents single extreme features (or small-n spending bins) from flipping the prediction.
+
+11) Combine into logit
+- logit_final = logit0 + Σ_i signed_contrib_i
+- p_final = sigmoid(logit_final)
+
+12) Uncertainty propagation (Beta posterior variance → se on logit)
+- For each feature i:
+  - a_i = t_i + 1; b_i = n_i − t_i + 1
+  - var_p_i = (a_i * b_i) / ((a_i + b_i)^2 * (a_i + b_i + 1))
+  - For small-n or new bins: increase var_p_i (or set se_delta_i large, e.g., 2.0)
+  - se_delta_i ≈ sqrt(var_p_i) / (p_i_shrunk * (1 − p_i_shrunk))  (linearization)
+  - For transformed spending bins, apply extra-variance multiplier if flagged
+- se_logit_final = sqrt( Σ_i (w_i^2 * se_delta_i^2) )
+- z default 1.28 for one-sided 90% CI:
+  - lower_logit = logit_final − z * se_logit_final → p_lower = sigmoid(lower_logit)
+  - upper_logit = logit_final + z * se_logit_final → p_upper = sigmoid(upper_logit)
+
+13) Evidence & support diagnostics
+- support_i_signed = (p_i_shrunk − p0) * r_i
+- support_pos = Σ_i base_w_i * max(0, support_i_signed)
+- support_neg = Σ_i base_w_i * max(0, −support_i_signed)
+- support_abs_total = support_pos + support_neg
+- reliable_pos_count = count of features with r_i ≥ 0.6 and (p_i_shrunk − p0) ≥ 0.05
+- reliable_neg_count analogous
+
+14) Decision / Abstain / Fallback (revised, stricter and dominance-aware)
+- If support_abs_total < T_low (T_low = 0.035) AND max(reliable_pos_count, reliable_neg_count) < 2 → Abstain (manual review).
+- One-feature-dominance special logic (if top_contrib_share > 0.5):
+  - If top contributor is small-n (n ≤ dominance_n_small threshold or spending bin n_bin < 10) → Abstain or fallback to safe policy (default fallback: False).
+  - Else require p_lower ≥ p_lower_dominance_threshold (default 0.65) AND at least one other reliable signal OR reliable_pos_count ≥ 2 → Predict True.
+- Otherwise (no dominance):
+  - Predict True if:
+    - support_pos > support_neg AND
+    - (support_pos ≥ support_pos_min OR reliable_pos_count ≥ 2) AND
+    - p_lower ≥ p_lower_pos_threshold (general) = 0.55
+  - Predict False if:
+    - support_neg > support_pos AND
+    - (support_neg ≥ support_neg_min OR reliable_neg_count ≥ 2) AND
+    - p_upper ≤ p_upper_neg_threshold = 0.45
+  - Else → Abstain or fallback.
+- Age-conditioned p_lower as before (higher for children/infants).
+
+15) Persist for diagnostics (every prediction)
+- Persist: p_final, p_lower, p_upper, se_logit_final, support_pos, support_neg, support_abs_total, reliable_pos_count, reliable_neg_count, top-3 contributors (feature, delta_i, w_i, n_i, t_i), top_contrib_share, snapshot_id, spending_bin_ids, Corr_ij clusters used.
+
+16) Auto-fallback policy (if abstain unavailable)
+- For single-feature-dominated positive cases with weak bin support → default to False (Not Transported) if false positives are costlier.
+- Log all such fallbacks and sample for manual audit.
+
+Why this fixes 0022_01 (conceptual)
+- RoomService=980 becomes an extreme transformed value and will likely fall into a top quantile spending bin with very small n_bin. Under the new rules:
+  - Small-n neutralization + extra-variance on that bin reduces delta_i magnitude and increases se_delta_i.
+  - Dominance guard detects the spending bin as the top contributor (top_contrib_share > 0.5) and — because the bin has n_bin < dominance threshold — forces Abstain or fallback to False.
+  - p_lower will be conservative (reduced) due to increased se_logit_final.
+- Net result: the system will avoid an automatic False→True flip from a single high spending outlier.
+
+Concrete parameter recommendations (deployable defaults)
+- Laplace alpha = 1
+- Shrinkage k = 5
+- Reliability weight k2 = 5
+- max_delta = ±0.8
+- small_n_threshold = 3, small_n_factor = 0.5
+- spending_winsor_pct = 0.995
+- spending_bins = 20, min_bin_count = 5 (merge bins until satisfied)
+- dominance_top_share_threshold = 0.50
+- dominance_bin_n_min = 10
+- top_contrib_requirement_r = 0.6
+- T_low = 0.035
+- support_pos_min = 0.06
+- support_neg_min = 0.05
+- p_lower_pos_threshold (general) = 0.55
+- p_lower_dominance_threshold = 0.65 (for single-feature dominated cases)
+- p_upper_neg_threshold = 0.45
+- z for one-sided CI = 1.28 (90%); consider 1.64 (95%) if abstain capacity allows
+
+Updated confidence mapping
+- High confidence (auto-accept True/False):
+  - p_lower ≥ 0.60 AND support_abs_total ≥ 0.08 AND reliable_count_in_direction ≥ 2 AND top_contrib_share ≤ 0.4
+- Medium confidence:
+  - p_lower ≥ 0.55 AND support_abs_total ≥ 0.05 AND top_contrib_share ≤ 0.5
+- Low confidence (Abstain preferred; manual review or fallback):
+  - p_lower < 0.55 OR support_abs_total < 0.05 OR top_contrib_share > 0.5
+
+Batch consistency & reproducibility updates
+- Always attach snapshot_id and spending_bin map to every batch and per-row log.
+- Deterministic scoring: same snapshot, same weights, same merging rules for bins (no randomness).
+- Batch-level pre-commit checks:
+  - Compute batch_abstain_rate and batch_mean_se_logit.
+  - Compute fraction of predictions with top_contrib_share > dominance_top_share_threshold; if > batch_dominance_alert_rate (default 3%), pause auto-commits and sample for audit.
+  - Alert if mean number of new spending bins encountered > threshold (e.g., > 1% of batch).
+- Version base_weights; only re-fit after +50 labeled updates.
+
+Edge-case handling (explicit rules)
+- New spending bins (n_bin = 0) or extremely high outliers → treat as new_category_low_support, p_i_shrunk = p0, se_delta_i large → force Abstain unless multiple other reliable sources exist.
+- Single-feature dominance → require independent support or Abstain/fallback.
+- Missing spending → use is_spend_missing flag; do not treat NaN as zero. Missingness can be predictive.
+- Infants/children → stricter p_lower and reliable-signal requirements as before.
+
+Monitoring & alerts (what to compute & thresholds)
+- Per-prediction fields logged: p_final, p_lower, p_upper, se_logit_final, support_pos, support_neg, support_abs_total, reliable_pos/neg_count, top contributors, top_contrib_share, spending_bin_id(s), snapshot_id.
+- Dashboards:
+  - Daily: Abstain rate, auto-fallback rate, distribution of top_contrib_share, distribution of p_lower and se_logit_final.
+  - Spending-bin health: per-bin n_bin, t_bin, FPR/FNR, trend slope; highlight bins with n_bin < min_bin_count used in predictions.
+  - Batch health: mean se_logit_final, fraction of predictions with top_contrib_share > 0.5.
+- Triggers:
+  - Re-fit base_weights after +50 labels or if bin-level FPR/FNR exceed control limits.
+  - Alert on sudden rise in spending-bin new encounters (> historical mean + 3σ).
+
+Validation experiments to run immediately
+- LOO evaluation on current labeled set (N = 23; optionally +1 if you add Mael and +1 for Terta) with the revised pipeline (no re-fitting of base_weights) to measure Brier, accuracy, abstain fraction, corrected errors (Mael, Terta, 0022_01).
+- Threshold sweep for p_lower_pos_threshold ∈ {0.50, 0.55, 0.60} and dominance thresholds ∈ {0.4, 0.5, 0.6} to trade off abstain vs FP.
+- Sensitivity analysis for spending_bins ∈ {10, 20, 30} and min_bin_count ∈ {5, 10} to see how 0022_01 and other FPs/FNs respond.
+- Validate se_logit_final analytic variance vs bootstrap on spending bins to ensure CI coverage.
+
+Rollout checklist (prioritized)
+Immediate (24–48 h)
+  1. Add spending pre-processing: winsorize, log1p, quantile-bin and merge, record per-bin n/t.
+  2. Apply Laplace smoothing + shrinkage k=5 on bins and categorical values.
+  3. Enforce small-n neutralization and delta cap ±0.8 for bins and categories.
+  4. Implement dominance guard (top_contrib_share detection) and stricter p_lower for dominated predictions.
+  5. Decrease spending base weight slightly (0.12 → 0.10 → 0.08 suggested) until re-fit; persist versions.
+  6. Add per-prediction logging fields (top_contrib_share, spending_bin_id, se_logit_final).
+Near-term (1–2 weeks)
+  1. Implement redundancy grouping (Corr_ij threshold 0.25) and merge cluster normalization.
+  2. Run LOO and threshold sweeps and select operating points.
+  3. Update dashboards and alerts (dominance share monitoring).
+Medium-term (after +50 labels)
+  1. Re-fit base_weights via regularized logistic regression using shrunken p_i features; include r_i and top_contrib_share as meta-features.
+  2. Consider hierarchical Bayesian pooling for spending bins / sparse categories to improve small-n estimates.
+Long-term (100+ labels)
+  1. Replace piecewise aggregator with a regularized GLM that preserves uncertainty propagation and dominance guards.
+  2. Use isotonic or Platt calibration on p_final with cross-validated held out data to improve probability estimates.
+
+Case-level diagnosis for 0022_01 under revised pipeline (what will happen)
+- RoomService = 980 → winsorized at 99.5th pct or placed into top quantile bin with n_bin likely small.
+- That spending bin will receive strong small-n neutralization and extra variance. Its delta magnitude will be capped and se_delta inflated.
+- Dominance guard will likely detect that spending contributes >50% of signed support. Because the bin n_bin < dominance_bin_n_min (10), the system will Abstain. If abstain is disabled, fallback to safe policy (default: False) to avoid automatic FP.
+- Log entry created with top_contrib_share, spending_bin_id, p_final/p_lower, and reason for Abstain/fallback.
+
+Expected short-term tradeoffs
+- Lower false positive rate for outlier-driven cases (like 0022_01).
+- Higher abstain rate initially; target < 5% but expect short-term increase — monitor and re-calibrate after +50 labels.
+- Slight decrease in automated coverage for predictions driven by single high spenders; improves precision and auditability.
+
+Final recommended short list (actionable)
+1. Immediately implement spending winsorize/log-transform + quantile binning + min_bin_count merging.
+2. Add dominance guard (top_contrib_share) with conservative defaults (0.5 share; require second reliable signal or abstain).
+3. Keep Laplace + shrinkage + reliability-scaling + small-n neutralization + delta cap ±0.8, and add extra-variance for spending outlier bins.
+4. Reduce spending base_weight slightly until re-fit, and persist versions of all weights.
+5. Add and monitor per-prediction top_contrib_share and spending-bin health dashboards; run LOO now to measure improvement on Mael/Terta/0022_01.
+6. If abstain is unavailable, default to False for single-feature-dominated positive calls until more labels are collected.
+
+Would you like:
+- A) A compact, drop-in Python scoring function that implements these exact steps (spending preprocessing, binning, smoothing, shrinkage, dominance guard, uncertainty propagation and decision logic), or
+- B) A LOO evaluation run of the revised logic on your current labeled set (reporting Brier, accuracy, abstain stats and which previous errors are corrected), or
+- C) Both (function + LOO run)?
+
+I recommend option B first (LOO with the revised decision logic, keeping base_weights fixed) so you can quantify immediate gains (especially on Mael/Terta/0022_01). I can prepare the code and run it on your labels as soon as you confirm access.
+
+============================================================

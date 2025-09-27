@@ -1,0 +1,272 @@
+PREDICTIVE METRICS - ITERATION 136
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short):
+  - A 1‑record batch included Passenger 0178_01 (RoomService=3414.0; sum_spend ≈ 3722) which the model auto‑predicted Transported=True but actual=False (false positive). Root causes: n==1 auto‑decision logic + extreme single‑channel spend outlier (top1_outlier) → raw spend signal produced an overconfident positive logit; calibrator / uncertainty model under‑estimated uncertainty for this rare top1_outlier slice; pooled priors did not give enough counter‑evidence; per‑feature and total‑logit caps & transforms were too permissive for extreme spends; no winsorization / outlier gating on raw spends.
+- Immediate priority (0–6h):
+  - Stop n==1 auto‑decisions for fragile_flag that includes top1_outlier and multi_high patterns. Add 0178_01 (and 0174_01, 0172_01, 0171_01, 0170_01) to the canary list and route to priority_audit.
+  - Persist raw spends, per‑feature logit contributions, imputation provenance, pooled_prior snapshot id and cohort_id for canaries.
+  - Enforce emergency winsorization + per‑feature logit clamps on spend features in scorer (temporary stopgap).
+  - Expose var and se components in scoring logs for fast debugging.
+
+Concise answers to the six required questions (batch accuracy focus)
+1) What specific patterns caused this error?
+- An extreme single‑channel outlier (RoomService=3414) produced an oversized positive spend signal. The model effectively summed/weighted this into a large positive logit. Because the batch was n==1, the decision system trusted the model’s high p_model without adequate cross‑checks. The calibrator and pooled priors had not been conditioned to inflate uncertainty for such top1_outliers — so p_final was overconfident.
+
+2) How should decision rules be modified to prevent recurrence?
+- Treat top1_outlier (very large per‑channel spend or extreme top1_share) and multi_high_sum records as fragile. For n==1 batches require corroboration: pooled_prior τ high and sufficient N_slice, GLM_fallback agreement, ensemble agreement, and low se_combined & tight quantile width before auto‑decision. Otherwise route to priority_audit. Add batch_frac_fragile gating (hold whole batch if fragile fraction ≥ threshold).
+
+3) What new insights about transport patterns?
+- Extremely high single‑channel spend is a distinct slice: it behaves differently from moderate high spends or multi‑channel high spend. It can be either anomalous (data error) or a cohort‑specific behavior with different association sign with transported. Treating it as a monotonic positive signal is brittle.
+
+4) How should confidence levels be recalibrated?
+- Use heteroskedastic, slice‑aware calibration (CQR / quantile heads + variance net) that explicitly increases uncertainty for:
+  - top1_outlier records,
+  - high_total_spend records,
+  - multi_high_channel records,
+  - small‑N slices and n==1,
+  - high novelty_distance records.
+- Output p10/p50/p90 + sd and apply conservative se_floors for these fragile slices.
+
+5) What adjustments are needed for batch consistency?
+- Make cohort a decision unit (conflicting cohort member predictions hold cohort). Add batch_frac_fragile checks (if fraction fragile in batch ≥ threshold, hold auto‑decisions). Persist transforms and imputation provenance across scorer/calibrator/gate to avoid silent drift.
+
+6) How can metrics be improved to handle edge cases?
+- Add explicit slice KPIs: top1_outlier_FP_rate (per channel), roomservice_outlier_FP_rate, n==1_outlier_FP_rate, multi_high_FP_rate, novelty_FP_rate. Expand pooled priors stratification to include top1_channel/top1_bucket and top1_dominance. Enforce per‑feature & total_logit caps, winsorize raw spends, and add outlier variance terms.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Feature engineering updates (v→v+1)
+- Persist raw inputs (mandatory): RoomService, FoodCourt, ShoppingMall, Spa, VRDeck (value + imputed_flag + imputation_method + source_date).
+- New / persisted flags:
+  - sum_spend = sum of five channels (raw & log1p)
+  - winsorized_spend[channel] = winsorize(raw, upper=UPPER_CHANNEL_QUANTILE or absolute cap)
+  - is_winsorized_channel_flag
+  - top1_channel, top1_spend, top1_share = top1_spend / (sum_spend + eps)
+  - top1_outlier_flag = (top1_spend ≥ TOP1_SPEND_OUTLIER_THRESHOLD) OR (top1_share ≥ TOP1_SHARE_OUTLIER)
+  - num_high_spend_channels = count(ch where spend ≥ CHANNEL_HIGH_THRESHOLD)
+  - multi_high_flag = num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD
+  - high_total_spend_flag = sum_spend ≥ SUM_SPEND_HIGH
+  - outlier_score (Mahalanobis / LOF / isolation forest) relative to spend cluster centroids
+  - is_single_channel_dominant_flag (top1_share ≥ TOP1_DOM_THRESHOLD)
+  - all_zero_flag, cryo_all_zero_flag, per_channel_imputed_flags, missingness_count
+- Transform changes:
+  - Use winsorize(raw_spend, upper=GLOBAL_SPEND_UPPER) then log1p (or scaled tanh(log1p(x))) to saturate extreme values.
+  - Add rank or bucket transforms for top1_spend and sum_spend.
+
+Recommended initial thresholds (sweepable):
+- CHANNEL_HIGH_THRESHOLD = 100
+- MULTI_HIGH_THRESHOLD = 2
+- SUM_SPEND_HIGH = 500
+- TOP1_SPEND_OUTLIER_THRESHOLD = 1000 (capture 0178_01); consider sweep 800–2000
+- TOP1_SHARE_OUTLIER = 0.85
+- GLOBAL_SPEND_UPPER (absolute winsor) = 2000 for initial stopgap, then tune.
+
+B. Pooled priors (expanded stratification + stronger backoff)
+- Stratify priors by: CryoSleep × all_zero_flag, sum_spend_bucket, top1_channel × top1_bucket, top1_share_bucket, multi_high_flag, HomePlanet, Age_bucket.
+- Increase prior pseudo‑count N0 for fragile slices:
+  - N0_top1_outlier = 1000 (start; sweepable)
+  - N0_multi_high = 400
+  - N0_high_total_spend = 400
+- Blend: μ_blend = τ_slice * μ_slice + (1−τ_slice) * μ_global, τ_slice = N_slice/(N_slice + N0_slice). Back off to coarser strata if N_slice small.
+
+C. Per‑feature logit caps, winsorization & sign‑consistency down‑weighting
+- Enforce winsorization/clipping on raw spends before feature transform.
+- Per‑feature caps (start values; sweepable):
+  - CAP_PER_FEATURE_LOGIT (spend baseline) = 1.5 (lowered)
+  - CAP_PER_FEATURE_LOGIT (RoomService top1_outlier channel) = 1.2 for outliers
+  - CAP_PER_FEATURE_LOGIT (VRDeck / Spa) = 1.6
+  - CAP_SUM_SPEND_LOGIT = 2.0
+  - CAP_TOTAL_SPEND_LOGIT = 2.0 (strict)
+- Implementation:
+  - compute feature_value = winsorize(raw_spend, global_upper); feature_trans = log1p(feature_value); raw_logit_contribution = weight × feature_trans; per_feature_logit = clamp(raw_logit_contribution, −cap, +cap)
+  - total_spend_logit = clamp(sum(per_feature_logit_spend_channels), −CAP_SUM_SPEND_LOGIT, +CAP_SUM_SPEND_LOGIT)
+- Down‑weight rules:
+  - If top1_outlier_flag True → scale spend contributions by max(0.2, 1.0 − 0.6×outlier_confidence) [start scale 0.3]
+  - If multi_high_flag True and multi_channel_sign_consistency_score < 0.75 → scale spend contributions × max(0.4, sign_consistency)
+  - If any per_channel_imputed_flag True → downweight spend logits ×0.6–0.8
+
+D. Variance / SE model (add top1/outlier terms)
+- Add variance components:
+  - var_top1_outlier = κ_top1 * log1p(top1_spend) * top1_share
+  - var_multi_spend = κ_multi * min(num_high_spend_channels, 3)
+  - var_total_spend = κ_total * log1p(sum_spend)
+  - var_channel_incoherence = κ_channel_incoh * (1 − multi_channel_sign_consistency_score)
+  - var_outlier_detection = κ_outlier * outlier_score (Mahalanobis / LOF)
+- Keep existing var_cryo, var_dom_channel, var_novelty, var_missingness, var_cohort_uncertainty.
+- Combine:
+  - var_combined = var_base + var_top1_outlier + var_multi_spend + var_total_spend + var_channel_incoherence + var_outlier_detection + ...
+  - se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- Starting κ (conservative; sweepable):
+  - κ_top1 = 0.28; κ_multi = 0.18; κ_total = 0.12; κ_channel_incoh = 0.10; κ_outlier = 0.20
+  - κ_cryo = 0.25; κ_novel = 0.14; κ_miss = 0.06; κ_sign = 0.08; κ_cohort = 0.05
+- SE floors:
+  - n==1 & top1_outlier or high_total_spend: se_floor = 0.35–0.60 (start 0.45)
+  - stable slices: se_floor = 0.06–0.10
+
+E. Decision‑gating (pattern‑aware + batch/cohort aware)
+- Fragile_flag (v2):
+  - cryo_all_zero_flag OR top1_outlier_flag OR top1_share ≥ TOP1_SHARE_OUTLIER OR high_total_spend_flag OR multi_high_flag OR high_novelty_flag OR any per_channel_imputed_flag OR missingness_count ≥ 2 OR dominance_sign_consistency_score < 0.7 OR multi_channel_sign_consistency_score < 0.75 OR in_batch_cohort_contradiction_flag
+- Batch/cohort checks:
+  - batch_frac_fragile = (#fragile_records_in_batch)/batch_size
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 0.05): pause auto‑decisions for entire batch; route to priority_audit/shadow.
+  - If cohort present and any members have contradictory predictions: route whole cohort → priority_audit.
+- n==1 gating for fragile_flag:
+  - If fragile_flag and n_batch==1, require ALL:
+      - pooled_prior_tau ≥ Z_high_slice AND N_slice ≥ N_min_slice (slice‑dependent)
+      - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice)
+      - ensemble_agreement ≥ A_high
+      - se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice
+    Otherwise route → priority_audit.
+- Example initial thresholds:
+  - TOP1_SPEND_OUTLIER_THRESHOLD = 1000; TOP1_SHARE_OUTLIER = 0.85
+  - SUM_SPEND_HIGH = 500; CHANNEL_HIGH_THRESHOLD = 100; MULTI_HIGH_THRESHOLD = 2
+  - N_min_top1 = 200; N_min_high_sum = 120; N_min_cryo = 100
+  - N0_top1 = 1000; N0_multi_high = 400
+  - Z_high_slice = 0.95; A_high = 0.995
+  - SE_accept_high_sum = 0.10; se_floor_n1_top1 = 0.45
+  - BATCH_FRAGILE_THRESHOLD = 0.05
+
+F. Calibrator & GLM_fallback retrain plan (top1/outlier & novelty focused)
+- Calibrator:
+  - Heteroskedastic calibrator that outputs p10/p50/p90 & sd via CQR or quantile head + variance network.
+  - Inputs (new): raw_logit, winsorized sum_spend, top1_spend, top1_share, top1_outlier_flag, num_high_spend_channels, per_channel_imputed_flags, dominance_sign_consistency_score, multi_channel_sign_consistency_score, outlier_score, novelty_distance, cohort features.
+  - Loss: quantile pinball + ECE penalty + Brier. Strongly upweight fragile slices:
+    - top1_outlier ×12, multi_high ×10, high_total_spend ×8, cryo_all_zero ×10.
+- GLM_fallback:
+  - Interpretable ElasticNet logistic with winsorized spends and interactions (top1_spend × Age_bucket, top1_spend × HomePlanet, top1_outlier_flag × top1_channel). Enforce per‑feature caps.
+  - GLM_fallback_agrees if |p_model − p_glm| ≤ δ (start δ=0.05 for fragile slices).
+- Training:
+  - Rolling window 18–36 months; stratified CV ensure fragile slices appear in each fold (oversample or targeted sampling).
+  - Shadow run: 14–28 days with gating active and canaries blocked from auto‑accept.
+- Acceptance criteria (shadow run):
+  - top1_outlier_FP_rate ↓ ≥ 40–60%
+  - high_total_spend_FP_rate ↓ ≥ 40%
+  - cohort contradiction rate ↓ ≥ 50%
+  - global ECE not worse by >0.5% absolute
+
+G. Monitoring, metrics & alerts (batch‑focused)
+- Per‑slice KPIs (near‑real time):
+  - top1_outlier_FP_rate (by channel), roomservice_outlier_FP_rate, multi_high_channel_FP_rate, n==1_auto_accept_rate, n==1_fragile_FP_rate.
+  - cryo_all_zero_FN_rate
+  - cohort_contradiction_rate
+- Batch KPIs:
+  - Batch_auto_decision_rate, Batch_frac_fragile, Batch_provenance_consistency_rate
+- Alerts & pages:
+  - Any canary auto‑accepted → immediate page ML/Ops.
+  - top1_outlier_FP_rate increase > baseline + X% over 24h → page.
+  - batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD → automatically hold auto‑decisions & notify.
+  - cohort contradiction autocase → page.
+- Dashboards:
+  - Show per‑record provenance (winsorized vs raw, per_feature_logits, pooled_prior_snapshot) for recent canaries and top offenders.
+
+H. CI unit tests & validation (cover top1_outlier, multi_high, high_total_spend, cryo_all_zero, top1_dom, novelty, cohort)
+- Unit tests:
+  - winsorization and top1_outlier_flag computed identically across scorer/calibrator/gate.
+  - se_combined increases for top1_outlier & high_total_spend & novelty_flag.
+  - calibrator widens p10/p90 for top1_outlier and high_total_spend records.
+  - pooled_prior blending respects large N0_top1 and prevents tiny N slices from dominating.
+  - per_feature & total spend logit caps enforced.
+  - batch_frac_fragile ≥ threshold disables auto‑decisions.
+  - cohort contradiction detection holds cohort.
+  - Canaries (0178_01, 0174_01, 0172_01, 0171_01, 0170_01) must not be auto‑accepted during gating tests.
+- Regression tests:
+  - Global ECE, AUC, Brier degrade less than tolerance when gating enabled.
+  - Integration tests validate end‑to‑end persistence of imputation provenance and per_feature_logit contributions.
+
+I. Operational actions (0–72 hours) — precise timeline
+1) Immediate (0–6h)
+   - Deploy gating patch: block auto‑decisions for any n==1 record with top1_outlier_flag OR sum_spend ≥ SUM_SPEND_HIGH OR num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD OR any per_channel_imputed_flag OR missingness_count ≥ 2; route to priority_audit. Add 0178_01, 0174_01, 0172_01, 0171_01, 0170_01 to canary list.
+   - Persist provenance fields: raw per‑channel spends, winsorized_spends, per‑feature logit contributions, pooled_prior_snapshot_id, cohort_id.
+   - Enforce temporary winsorization and per‑feature logit caps in scorer: winsorize upper=GLOBAL_SPEND_UPPER (start=2000); CAP_PER_FEATURE_LOGIT(spend)=1.5; CAP_TOTAL_SPEND_LOGIT=2.0.
+   - Escalate: any auto‑accept for fragile_flag → priority_audit page.
+2) Short‑term (6–24h)
+   - Expose variance/SE components (var_top1_outlier, var_total_spend, var_multi_spend, se_combined) in scoring output for debugging and dashboards.
+   - Implement batch‑level hold if batch_frac_fragile ≥ 5% and cohort contradiction detection.
+   - Instrument dashboards & alerts for top1_outlier_FP_rate and multi_high_channel_FP_rate.
+   - Start targeted label collection for recent top1_outlier records for 14‑day active labeling queue.
+3) Mid‑term (24–72h)
+   - Retrain calibrator & GLM_fallback with updated inputs and upweight schedule; run 14–28 day shadow‑run with gating active.
+   - Publish pooled‑prior snapshots for top1/outlier slices.
+   - Run CI/regression tests to ensure no materially negative global impacts.
+   - Tune winsorization cap using shadow run diagnostics.
+
+J. Per‑record provenance to log (required & extended)
+- Raw per‑channel and imputation provenance: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck (value + imputed_flag + imputation_method + source_date).
+- Transforms: winsorized_spend[channel], winsorized_sum_spend, log1p_transforms, is_winsorized_flag.
+- Aggregates & dominance: sum_spend, sum_spend_log, sum_spend_bucket, num_high_spend_channels, multi_high_flag, top1_channel, top1_spend, top1_share, top1_outlier_flag.
+- Flags: all_zero_flag, cryo_all_zero_flag, per_channel_imputed_flags, missingness_count, num_nonzero_channels.
+- Novelty & anomaly: outlier_score, novelty_distance_norm, spend_cluster_id, spend_cluster_transport_rate.
+- Model internals: per_feature_logit_contributions (map), pooled_prior_snapshot_id, μ_slice, τ_slice_blend.
+- Variances: var_top1_outlier, var_multi_spend, var_total_spend, var_cryo, var_dom_channel, var_high_spend, var_novelty, var_missingness, var_sign_inconsistency, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, p_final_sd, quantile_width, gating_reasons, routing_decision, scorer_version, calibrator_version, provenance_hash.
+
+K. Initial hyperparameters (start values; sweepable)
+- CHANNEL_HIGH_THRESHOLD = 100
+- MULTI_HIGH_THRESHOLD = 2
+- SUM_SPEND_HIGH = 500
+- TOP1_SPEND_OUTLIER_THRESHOLD = 1000
+- TOP1_SHARE_OUTLIER = 0.85
+- GLOBAL_SPEND_UPPER (winsorization) = 2000
+- TOP1_DOM_THRESHOLD = 0.60
+- CAP_PER_FEATURE_LOGIT (spend baseline) = 1.5; for RoomService_outlier = 1.2; VRDeck/Spa = 1.6
+- CAP_SUM_SPEND_LOGIT = 2.0; CAP_TOTAL_SPEND_LOGIT = 2.0
+- BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+- N0_top1 = 1000; N0_multi_high = 400; N0_cryo_all_zero = 300
+- N_min_top1 = 200; N_min_high_sum = 120; N_min_cryo = 100
+- Z_high_slice = 0.95; A_high = 0.995
+- SE_accept_high_sum = 0.10; se_floor_n1_top1 = 0.45
+- κ_top1 = 0.28; κ_multi = 0.18; κ_total = 0.12; κ_cryo = 0.25; κ_novel = 0.14; κ_miss = 0.06; κ_sign = 0.08
+- GLM_agreement_delta δ = 0.05 (fragile slices) / 0.12 (non‑fragile)
+
+L. CI canaries & expected behavior
+- 0178_01 (RoomService=3414.0, sum_spend≈3722)
+  - Expected: route -> priority_audit (unless pooled_prior/GLM/ensemble/backing present and se_combined very small). Must not be auto‑accepted in gating tests.
+- 0174_01 (multi‑channel high spend example)
+  - Expected: route -> priority_audit until slice N and τ high & models agree.
+- 0172_01 / 0171_01 / 0170_01: cryo_all_zero & VRDeck dominance examples
+  - Expected: route -> priority_audit until slice N and τ high & models agree.
+- Unit tests assert these behaviors each CI run.
+
+Immediate one‑line corrective action
+- Deploy gating patch: route any n==1 record with top1_spend ≥ 1000 OR sum_spend ≥ 500 OR num_high_spend_channels ≥ 2 OR any per_channel_imputed_flag OR missingness_count ≥ 2 to priority_audit; add canaries (0178_01, 0174_01, 0172_01, 0171_01, 0170_01) to canary list.
+
+Concise gating pseudocode
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD:
+      route all r in B -> priority_audit; continue
+  - for each record r in B:
+      fragile_flag = cryo_all_zero_flag OR top1_outlier_flag OR top1_share ≥ TOP1_SHARE_OUTLIER OR sum_spend ≥ SUM_SPEND_HIGH OR num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD OR novelty_flag OR any per_channel_imputed_flag OR missingness_count ≥ 2 OR dominance_sign_consistency_score < 0.7 OR multi_channel_sign_consistency_score < 0.75
+      if n_batch == 1 and fragile_flag:
+         if (pooled_prior_tau ≥ Z_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice):
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if cohort_id present and exists conflicting sign predictions:
+         route all cohort members -> priority_audit
+
+Why this will reduce batch errors (short)
+- Explicitly identifies extreme single‑channel outliers (like 0178_01) and multi‑channel high sums as brittle slices and prevents overconfident single‑record auto decisions by:
+  - Winsorizing and saturating raw spends so a single extreme value cannot produce an unbounded logit.
+  - Applying stricter per‑feature & total logit caps and down‑weighting for outliers.
+  - Increasing modeled uncertainty (variance terms & elevated se_floors) for outlier slices so the calibrator produces wider quantiles.
+  - Requiring corroborating evidence (priors, GLM fallback, ensemble agreement) for n==1 fragile auto‑decisions.
+  - Stratified pooled priors with larger N0 for outliers prevent tiny‑N slices from swinging posterior strongly.
+  - Canaries and monitoring detect regressions quickly.
+
+Tradeoffs & operational notes
+- Blocking more n==1 auto‑decisions (especially high_total_spend or per‑channel outlier) increases human review workload — prepare prioritized labeling or temporary triage staffing.
+- Winsorization and strong priors reduce extreme false positives but can blunt sensitivity for true positives in genuine extreme cases — mitigate by tuning via shadow runs and active labeling.
+- Upweighting fragile slices speeds correction but introduces retrain complexity; use stratified CV and shadow runs to guard against overfitting.
+- Additional provenance logging increases storage & transfer costs — balance retention windows with debugging needs.
+
+Next steps / offers
+- Option A (0–3h, recommended): I will produce the exact gating patch (pseudocode → code) + unit tests including 0178_01 & others, and a deploy checklist for the stopgap. This will implement winsorization and per‑feature logit caps and block fragile n==1 auto‑decisions immediately.
+- Option B (24–72h): I will produce the full retrain recipe: calibrator training script, GLM_fallback spec, upweight schedule, CV fold design, hyperparameter sweep matrix, shadow‑run dashboard spec and label acquisition plan.
+
+Which do you want first? If you want the stopgap deployed this hour I will deliver the gating patch, unit tests, and deploy checklist immediately.
+
+============================================================

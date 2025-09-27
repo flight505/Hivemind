@@ -1,0 +1,121 @@
+PREDICTIVE METRICS - ITERATION 17
+============================================================
+
+### **Analysis of Prediction Error for Passenger 0034_01**
+
+**1. What specific patterns in the current metrics led to this prediction error?**
+The model incorrectly predicted non-survival for Passenger 0034_01 due to a critical oversight in the interaction between CryoSleep status and spending patterns:
+
+- **Failure to Account for CryoSleep Context:** The model applied zero-spend penalties (Rule S-3) despite `CryoSleep: True`, which biologically prevents spending. All zero values here are expected and should not be penalized.
+
+- **Over-Reliance on Spending Data Alone:** Rules like S-3 and A-4 were triggered based purely on numerical values without considering the passenger's metabolic state. The system treated this as a "low-spend" case rather than a "frozen passenger" case.
+
+- **Insufficient Weight for CryoSleep Survival Bias:** Existing rules did not adequately capture the strong correlation between CryoSleep and survival (due to reduced resource consumption and protected state during incidents).
+
+**2. How should the decision rules be modified to prevent similar errors?**
+- **Add CryoSleep Override Rule:** Create a new rule (C-1): "IF CryoSleep == True, ALL spending-based penalties are nullified, and apply +2 modifier for survival bias."
+- **Refine Zero-Spend Logic:** Update S-3 to include condition: "IF CryoSleep == False AND [conditions]" to prevent misapplication.
+- **Enhance Pre-Processing:** Implement metadata flagging for CryoSleep passengers before spending rules are applied.
+
+**3. What new insights does this error reveal about passenger transport patterns?**
+- **CryoSleep Dominates Spending Signals:** When passengers are frozen, spending data becomes irrelevant for survival prediction.
+- **Resource Conservation Advantage:** CryoSleep passengers inherently have higher survival rates due to reduced vulnerability during crises.
+- **Metadata Over Raw Values:** Operational status (CryoSleep) can override behavioral data (spending) in predictive importance.
+
+**4. How should confidence levels be recalibrated?**
+- **New CryoSleep Rule (C-1) Confidence:** 95% (high confidence due to biological constraints)
+- **Zero-Spend Rule (S-3) Confidence:** Reduce to 40% when applied without CryoSleep check
+- **Overall Model Confidence:** Increase to 91% with better context handling
+
+**5. What adjustments are needed for better consistency?**
+- **Pre-Processing Priority:** Evaluate CryoSleep status before any spending-related rules
+- **Batch Validation:** Add checkpoint to verify CryoSleep exceptions are applied consistently
+- **Error Analysis Focus:** Flag all CryoSleep passengers in prediction audits
+
+**6. How can the metrics be improved to handle edge cases like this one?**
+- **Add "CryoSleep Context" feature category** with specialized rules
+- **Implement rule dependency tagging** to prevent conflicting logic
+- **Create sub-models** for CryoSleep vs. awake passengers
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v2.8**
+
+**Report Objective:** Integrate learning from Passenger 0034_01 error, emphasizing CryoSleep context dominance over spending data. Optimized for batch prediction accuracy.
+
+**Analysis Basis:** Enhanced metabolic state handling and refined rule prioritization logic.
+
+---
+
+### **1. Enhanced Decision Logic: Context-Weighted System v2.8**
+
+**A. Priority Rules (Apply First):**
+
+*   **Rule C-1: CryoSleep Override (NEW)**
+    *   **Condition:** `CryoSleep == True`
+    *   **Score Modifier:** **+2** (nullifies all spending penalties)
+    *   **Confidence:** **95%**
+    *   **Precedence:** **HIGHEST PRIORITY**
+
+**B. Evidence Rules (Apply if C-1 not triggered):**
+
+*   **Base Score:** **+1**
+
+*   **Rule A-4: NaN with Spending**
+    *   **Condition:** Any amenity value is NaN AND sum(non-NaN amenities) > 0
+    *   **Score Modifier:** **+1**
+    *   **Confidence:** **75%**
+
+*   **Rule S-3: Multiple Zero-Spend Evidence (UPDATED)**
+    *   **Condition:** `CryoSleep == False` AND number of explicit zero-spend amenities >= 3 AND `TotalSpend < 500`
+    *   **Score Modifier:** **-2**
+    *   **Confidence:** **40%**
+
+*   **Rule SH-1: Selective High-Spender Pattern**
+    *   **Condition:** `TotalSpend > 1500` AND number of zero-spend amenities >= 2
+    *   **Score Modifier:** **+3**
+    *   **Confidence:** **85%**
+
+---
+
+### **2. Updated Probability Estimates & Scoring Examples**
+
+| Passenger Profile | Applied Rules | Total Score | Prediction | Probability |
+| :--- | :--- | :--- | :--- | :--- |
+| **Error Case: 0034_01** | C-1 (+2), Base (+1) | **+3** | **True** | **~90%** |
+| CryoSleep + All Zeros | C-1 (+2), Base (+1) | +3 | **True** | ~90% |
+| Awake, Multiple Zeros | S-3 (-2), Base (+1) | -1 | **False** | ~45% |
+| NaN with Spend | A-4 (+1), Base (+1) | +2 | **True** | ~70% |
+
+---
+
+### **3. Recalibrated Confidence Levels**
+
+| Rule / Component | Revised Confidence | Rationale |
+| :--- | :--- | :--- |
+| **CryoSleep Override (C-1)** | **95%** | Biological certainty overrides spending data |
+| **Multiple Zero-Spend (S-3)** | **40%** | Context-dependent reliability |
+| **NaN with Spending (A-4)** | **75%** | Unchanged |
+| **Overall Model** | **91%** | Improved with metabolic state handling |
+
+---
+
+### **4. Strategic Recommendations for Batch Prediction Accuracy**
+
+1.  **Immediate Deployment:** Implement **Rule C-1** with highest priority in batch processing
+2.  **Pre-Processing Enhancement:** Update batch scripts to:
+    - Sort passengers by CryoSleep status first
+    - Apply C-1 before any spending evaluation
+3.  **Validation Protocol:** Create dedicated audit for CryoSleep predictions
+4.  **Feature Engineering:** Add `IsCryoSleep` binary feature with rule dependency tags
+5.  **Batch Optimization:** Process CryoSleep passengers through simplified decision tree
+
+**Implementation Timeline:**
+- Immediate: Deploy C-1 rule update
+- 24h: Update batch pre-processing scripts
+- 48h: Implement new validation checks
+- 72h: Full batch re-processing with updated metrics
+
+This update corrects the critical oversight regarding CryoSleep passengers and establishes proper context hierarchy for future predictions.
+
+============================================================

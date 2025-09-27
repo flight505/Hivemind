@@ -1,0 +1,36 @@
+PREDICTIVE RULES - ITERATION 24
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. [If CryoSleep = True AND all spending categories (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) are zero or missing AND there is no cabin-mate with a contradictory active-spend signal then predict Transported = True]
+
+2. [If CryoSleep = True AND any spending category (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) > 0 then predict Transported = False]
+
+3. [If CryoSleep = True BUT at least one cabin-mate has CryoSleep = False AND non-luxury spend (RoomService+FoodCourt+ShoppingMall) > 0, treat the CryoSleep label as unreliable and predict Transported = False]
+
+4. [Define non_luxury_sum = RoomService + FoodCourt + ShoppingMall and luxury_sum = Spa + VRDeck. If CryoSleep = False AND non_luxury_sum >= 500 AND luxury_sum < 1000 AND Age < 60 (or Age missing) then predict Transported = True]
+
+5. [If non_luxury_sum >= 2000 AND luxury_sum <= 1000 then predict Transported = True (strong non-luxury spending pattern indicates transported), even if total_spend is moderately large]
+
+6. [If a single luxury category is extreme (Spa > 3000 OR VRDeck > 3000) OR luxury_sum is > 1000 and contributes > 50% of total_spend then predict Transported = False (luxury-dominated profiles associated with not transported)]
+
+7. [If total_spend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck > 10000 then predict Transported = False (very high overall spend signals not transported); do not apply this rule when non_luxury_sum >= 2000 AND luxury_sum <= 1000 (non-luxury-dominant household/business travel exception)]
+
+8. [Destination modulation: for TRAPPIST-1e and 55 Cancri e, elevated non_luxury spending (especially FoodCourt or ShoppingMall > 1000) increases probability of Transported = True; for PSO J318.5-22, moderate-to-high total_spend (>5000) biases toward Transported = False unless overridden by strong non-luxury signal (non_luxury_sum >= 2000)]
+
+9. [VIP handling: if VIP = True then increase probability of Transported = True but do NOT override clear spending contradictions — require VIP + (zero spends OR non_luxury_sum >= 500 OR cabin-majority transported signal) to force a True prediction]
+
+10. [Age modifiers: if Age < 18 then do not auto-predict transported; instead predict Transported = True for minors when at least one strong supporting signal is present (CryoSleep = True with zero spends OR non_luxury_sum = 0 with cabin-majority transported OR non_luxury_sum <= 50 and destination-favored); if Age >= 60 AND CryoSleep = False then predict Transported = False]
+
+11. [When CryoSleep is missing/NaN treat it conservatively as False unless at least two independent positive indicators exist among {VIP = True, non_luxury_sum >= 500, cabin-majority predicted Transported = True, Age < 18 with zero spends} in which case predict Transported = True]
+
+12. [Cabin propagation: propagate a Transported = True label across passengers sharing the same full Cabin identifier only when at least one cabin member has a strong, non-contradictory positive signal (CryoSleep = True with zero spends OR non_luxury_sum >= 2000 OR VIP = True with no contradictory spends); otherwise do NOT force unanimous cabin label]
+
+13. [Conflict resolution priority: when CryoSleep and spend patterns disagree, follow CryoSleep rules only if CryoSleep = True with zero spends and no cabin contradiction; otherwise follow spend-based rules (non_luxury_sum and luxury_sum thresholds) to decide Transported]
+
+14. [When HomePlanet, Age or Cabin are missing, base prediction on ordered robust signals: (1) CryoSleep with spend-consistency, (2) non_luxury_sum vs luxury_sum patterns, (3) VIP flag, (4) destination modulation; require at least two supporting signals to predict Transported = True]
+
+15. [Default fallback: if no strong positive indicator (CryoSleep-consistent, non_luxury_sum >= 500, VIP-supported, or cabin-majority) and spending is mixed or low-to-moderate, predict Transported = False]
+
+============================================================

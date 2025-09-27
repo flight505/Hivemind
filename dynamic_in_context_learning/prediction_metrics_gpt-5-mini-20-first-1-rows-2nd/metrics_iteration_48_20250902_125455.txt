@@ -1,0 +1,240 @@
+PREDICTIVE METRICS - ITERATION 48
+============================================================
+
+Updated Predictive Metrics Report — v3.3.2 (post_0071_01)
+
+VERSION & GOAL
+- Version: v3.3.2 (post_0071_01)
+- Goal: eliminate recent false positives (0070_01 VRDeck medium spike, 0071_01 FoodCourt extreme spike) while preserving rescue for true positives like 0069_01 (RoomService extreme spike). Make batch decisions robust to channel semantics that vary by demographic and spend-shape, add explicit FP-risk signals, tighten single_spike routing, and introduce audit gating for ambiguous/high-risk patterns.
+
+EXECUTIVE SUMMARY — immediate takeaway and top priorities
+- Immediate problem: A new FP (0071_01) shows that our "extreme_single_spike → rescue" pathway is too permissive across channels. The system allowed an extreme FoodCourt spike (top_share ≈ 0.97) to be accepted as transported even though, in this cohort (Age 17), FoodCourt spikes are frequently non‑transportation (recreational) patterns.
+- Compound failure mode (systemic):
+  1. No explicit FP_risk in ChannelReliability results in across-the-board rescue allowances.
+  2. Extreme rescue policy was global (applied to many channels) rather than channel‑aware.
+  3. GLM/SRM training lacked targeted negatives for extreme FoodCourt/VRDeck patterns in young cohorts → model overconfidence.
+  4. Missing/unused spend-shape signals (top2_share, spend_entropy, channel_percentile) and demographic × channel interactions.
+- Top immediate priorities (deploy in order):
+  1. Short (24–72h): compute per (channel,cluster) FP_risk and add it to scorer; change extreme rescue to be channel-aware (whitelist + FP_risk gates); add spend_entropy and top2_share flags to preprocessor; retrain GLM with negative oversampling for FoodCourt & VRDeck and deploy in shadow.
+  2. Medium (1–14d): implement ChannelReliabilitySigned v2 (hierarchical EB + FP_risk), DecisionRisk audit routing, per‑channel asymmetry in attenuation multipliers, and tighten medium/exreme single_spike rules.
+  3. Long: active learning loop (priority audits feed retraining), per‑channel evolving priors, continuous reweighting and monitoring.
+
+ANSWERS TO THE SIX QUESTIONS
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Case facts for 0071_01:
+  - Spends: RoomService=16, FoodCourt=2165, VRDeck=52 → total = 2233.
+  - top_channel = FoodCourt, top_contrib_share ≈ 2165/2233 ≈ 0.9695 (extreme_single_spike ≥0.95).
+  - top2_share ≈ (2165+52)/2233 ≈ 0.9928 (very concentrated top2).
+  - Age = 17 (young cohort), CryoSleep = False.
+- How metrics failed:
+  - Extreme-spike rescue logic was applied generically; no per-channel FP_risk or per-age adjustment blocked FoodCourt rescue.
+  - Aggregator relaxation allowed a dominant FoodCourt logit to push decision to True.
+  - GLM/SRM over‑confident due to training set blind spots (insufficient negative examples for high FoodCourt in <25).
+  - No spend-shape gating: high top2_share & very low entropy indicate anomalous concentrated behavior that should increase skepticism.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+- Introduce FP_risk(channel, cluster, spend_bucket) and make it a primary gating input.
+  - FP_risk = smoothed( FP_count / (TP_count + FP_count) ) with Laplace smoothing s (default 5) and exponential time decay.
+- Make single_spike granular and channel-aware:
+  - Bands: low (0.50–0.70), medium (0.70–0.95), extreme (≥0.95).
+  - Per-band consensus rules (default, tuneable):
+    - Extreme: allow rescue only if channel_rescue_allowed(channel) AND FP_risk ≤ 0.10 AND (aggregator_p_lower≥0.70 AND (GLM_p≥0.60 OR SRM≥0.80)). If FP_risk in (0.10,0.25] require BOTH GLM_p≥0.65 AND SRM≥0.85.
+    - Medium: require aggregator_p_lower≥0.80 AND (GLM_p≥0.65 OR SRM≥0.80); if FP_risk>0.10, require BOTH.
+    - Low: require 2/3 strong consensus (aggregator_p_lower≥0.85, GLM_p≥0.70, SRM_p≥0.85) or audit.
+- Channel rescue metadata:
+  - Maintain per-channel rescue_allow flag and rescue_severity_limit. Default: RoomService: allowed (more permissive), FoodCourt/VRDeck: not automatically allowed; require FP_risk ≤ 0.05 and strong model consensus.
+- Age-aware tightening:
+  - For Age < 25, scale FP_risk by 1.15–1.25 (or increase model thresholds by +0.05) for channels historically showing recreational spikes (FoodCourt, VRDeck, ShoppingMall).
+- DecisionRisk & audit gating:
+  - Compute DecisionRisk = 0.45*disagreement_ratio + 0.25*dir_uncertainty + 0.15*spend_extremeness + 0.15*FP_risk, where:
+    - disagreement_ratio = (#models disagreeing on positive / 3),
+    - dir_uncertainty = 1 - |mean_cluster_logodds| normalized,
+    - spend_extremeness = (top_contrib_share − 0.5)/0.5 clamped [0,1].
+  - If DecisionRisk > 0.35 → route to audit/abstain instead of auto-accept.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Channel semantics are conditional on demographics:
+  - FoodCourt spikes in younger cohorts often indicate recreational behavior and a lower transport probability.
+  - RoomService extremes are more likely to be transport-relevant for middle-aged adults.
+- Two-channel concentration (top2_share very high) often indicates either bill-splitting behavior or concentrated anomalous transactions that require additional scrutiny — it is not equivalent to a single extreme channel.
+- Channel polarity flips across Age/Cabin buckets frequently enough to require hierarchical modeling (channel×age×cabin interactions) rather than global channel effects.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Two-stage calibration retained but with FP_risk-aware SE inflation and z-scaling:
+  - predicted_se_final = max(base_pred_se, base_min_se*(1 + anomaly_scale)*(1 + dir_uncertainty_penalty)) + fp_risk * se_fp_scale (se_fp_scale default = 0.20).
+  - z_for_p_lower = base_z * (1 + FP_risk*1.2 + dir_uncertainty*0.8), base_z = 1.645.
+  - Shrink p_final toward prior when FP_risk elevated: p_final = p_cal / (1 + 0.3 * FP_risk).
+  - Only apply per-channel calibration offsets if channel_count ≥ 150; otherwise use shrunk cluster offset.
+  - Retrain Platt calibrator with FP_risk and spend_shape features as covariates.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persist and version channel×cluster tables with TP_count, FP_count, FP_risk, posterior_mean, posterior_CI, sample_count, q_C_k, and rescue_allow metadata.
+- Pre-commit checks (fail build / staged rollout triggers):
+  - Per-channel medium_single_spike accept rate ≤ historical_baseline*(1 + 0.10).
+  - If any channel FP_risk increases by > 0.05 since last snapshot → stage rollout and manual review.
+  - Block if extreme_single_spike predicted False while cluster_posterior_mean ≥ 0.80 (safety).
+- Audit queue triggers:
+  - medium single_spike predicted True with FP_risk ≥ 0.15 → priority audit.
+  - top2_share > 0.95 + contradictory cluster_dir signs → priority audit.
+  - DecisionRisk > 0.35 → audit.
+- Dashboards: per_channel_per_age_bucket FN/FP, medium/exreme accept rates, FP_risk trend, audit counts/latency.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- ChannelReliabilitySigned v2:
+  - Maintain Beta posterior for P(transported | top_channel=C, cluster=k) AND FP_count, TP_count with Laplace smoothing s=5 and weekly half-life decay. Store posterior samples and FP_risk.
+  - Provide an API with channel_rescue_allow flag computed from historical TP/FP and effect stability.
+- Model updates:
+  - GLM_fallback v6: add top_channel×Age_bucket, top_channel×CryoSleep, top_channel×Cabin_deck interactions; add spend_shape features: top2_share, spend_entropy, num_nonzero_channels, top_channel_percentile, channel_FP_risk; oversample negatives for channels with historical FPs (FoodCourt, VRDeck).
+  - SRM v3: include channel posteriors & FP_risk; return SRM_score + bootstrap SE.
+  - CoverageGuard retrain: SE predictor that includes FP_risk and spend_shape features.
+- Edge detectors:
+  - top2_share flag (>0.95), low_entropy flag (<0.25), extreme_percentile flag (top_channel_spend percentile > 99.9 within demographic group), contradiction flag (top2 channels have opposing cluster_dir signs).
+- Active learning:
+  - Route priority audits into a labeled buffer and reweight retraining for channels with high FP_risk; short retrain cadence (weekly) for hot channels.
+
+CASE DIAGNOSIS — 0071_01 (what happened)
+- Passenger snapshot:
+  - RoomService 16, FoodCourt 2165, ShoppingMall 0, Spa 0, VRDeck 52; top_channel = FoodCourt (top_share ≈ 0.9695, extreme), top2_share ≈ 0.9928.
+  - Age 17, CryoSleep False, Cabin F/14/P, HomePlanet Earth.
+- Likely scoring path:
+  - Aggregator produced a strong positive logit from extreme FoodCourt concentration.
+  - v3.3 global extreme rescue allowed acceptance without per-channel safeguards.
+  - GLM/SRM concurred (or at least one high) due to lack of targeted negatives for FoodCourt spikes in young cohorts → consensus → predicted True.
+  - Actual False implies FoodCourt extremes in this demographic are frequently non‑transport patterns — our prior for FoodCourt is mis-specified at cluster level.
+- Key numeric indicators: extreme single_spike (0.9695), top2_share very high (0.9928), Age 17 (young), low spend entropy — should have raised DecisionRisk.
+
+DECISION-RULE CHANGES (concrete, v3.3.2)
+- FP_risk computation:
+  - Over sliding window with exponential decay λ (weekly half-life), compute TP_kC and FP_kC where top_channel==C and top_contrib_share>q_C_k.
+  - FP_risk_kC = (FP_kC + s) / (TP_kC + FP_kC + 2*s), s=5 default.
+- Channel rescue policy:
+  - Build per-channel rescue_allow boolean and rescue_thresholds determined by historical TP/FP and effect stability.
+  - Default: RoomService: rescue_allow = true (moderate leniency); FoodCourt/VRDeck/ShoppingMall: rescue_allow = false (require stronger proof).
+  - Auto-rescue path allowed only when rescue_allow==true AND FP_risk ≤ 0.10 (or per-channel tuned).
+- Single_spike routing (defaults):
+  - low: [0.50–0.70): strict consensus → audit otherwise.
+  - medium: [0.70–0.95): aggregator_p_lower ≥ 0.80 AND (GLM_p ≥ 0.65 OR SRM ≥ 0.80); if FP_risk>0.10 require BOTH or audit.
+  - extreme: ≥0.95: allow rescue only when rescue_allow(channel) OR FP_risk ≤ 0.05; else require aggregator_p_lower ≥ 0.85 AND GLM_p ≥ 0.70 AND SRM ≥ 0.90 OR audit.
+- Spend-shape contradictions:
+  - If top2_share > 0.95 and top_channels have opposing cluster_dir_signs → audit.
+  - If spend_entropy < 0.25 → increase required GLM/SRM thresholds by +0.05.
+- Age-sensitive scaling:
+  - If Age < 25 and channel ∈ {FoodCourt, VRDeck, ShoppingMall} → multiply FP_risk by 1.25 (or add +0.05 to required GLM/SRM thresholds).
+
+CALIBRATION ADJUSTMENTS
+- SE and z-scaling:
+  - se_logit_final = max(base_pred_se, base_min_se*(1 + anomaly_scale)*(1 + dir_uncertainty_penalty)) + fp_risk * 0.20
+  - z = base_z * (1 + FP_risk*1.2 + dir_uncertainty*0.8) where base_z = 1.645
+- Probability shrink:
+  - p_final = p_cal / (1 + 0.3 * FP_risk)
+- Per-channel offsets only if channel_count ≥ 150; otherwise use shrunk cluster offset.
+- Retrain Platt (and isotonic where useful) including FP_risk and spend_shape covariates.
+
+CONSISTENCY & MONITORING
+- Persist versioned channel×cluster tables with columns: TP_count, FP_count, FP_risk, posterior_mean, posterior_logodds_CI, sample_count, q_C_k, rescue_allow.
+- Precommit checks:
+  - medium_single_spike_accept_rate_by_channel ≤ baseline*(1 + 0.10)
+  - FP_risk delta > 0.05 since last snapshot → staged deploy + manual review.
+  - Block if extreme_single_spike predicted False and cluster_posterior_mean ≥ 0.80.
+- Dashboards & alerts:
+  - Per-channel × Age_bucket FP_rate/FN_rate, medium/exreme accept rates, FP_risk trends, priority audits, audit latency.
+  - Emergency alert: any channel with FP_risk > 0.30 and daily FP_count increase > 10.
+- Audit queue: prioritize DecisionRisk > 0.35, medium_single_spike predicted True with FP_risk≥0.15, top2_share>0.95 with ambiguous direction.
+
+MODEL & FEATURE UPDATES
+- ChannelReliabilitySigned v2:
+  - Beta posterior for P(transported | top_channel=C, cluster=k) with Laplace s=5 and EB shrinkage τ=50.
+  - Persist posterior samples for deterministic reproducibility.
+- GLM_fallback v6:
+  - Features added: top_channel one-hot, top_channel×Age_bucket, top_channel×CryoSleep, top_channel×Cabin_deck interactions; top2_share, spend_entropy, num_nonzero_channels, top_channel_percentile, channel_FP_risk.
+  - Oversample negatives for channels with high historical FP (FoodCourt, VRDeck).
+  - Output p_mean and bootstrap SE.
+- SRM v3:
+  - Include channel posteriors & FP_risk and return SRM_score with CI.
+- CoverageGuard retraining:
+  - Predict SE including FP_risk and spend_shape features.
+- Edge detectors:
+  - top2_share_flag, low_entropy_flag, extreme_percentile_flag, contradiction_flag.
+- Active learning:
+  - Route priority audits to human labels and feed them back into training sets (high importance weight).
+
+DETERMINISTIC SCORING PIPELINE (v3.3.2)
+1. Snapshot load: quantiles, cluster centroids, ChannelReliabilitySigned table (including FP_risk, rescue_allow), GLM/SRM versions, per_channel calibration maps, deterministic RNG seed.
+2. Per_record features: top_channel, top_contrib_share, top2_share, num_nonzero_channels, spend_entropy, per_channel_percentiles, cluster_id, Age_bucket.
+3. EdgeDetector: flag top2_share>0.95, entropy_low, extreme_percentile.
+4. ChannelReliability lookup: cluster_posterior_mean, posterior_CI, posterior_logodds_lower/upper/mean, sample_count, FP_risk, rescue_allow.
+5. Direction flags: dir_positive_cluster, dir_negative_cluster (require sample_count ≥ min_n).
+6. Aggregator: compute aggregator_logit/SE; apply FP_risk-aware multiplier (per-channel asymmetry); compute counterfactual aggregator (no attenuation).
+7. SRM_v3 predict (return score+SE).
+8. GLM_v6 predict (include FP_risk & interactions).
+9. Consensus & routing:
+   - Identify single_spike band and channel rescue metadata; apply per-band, per-channel rules.
+   - Compute DecisionRisk; if DecisionRisk > threshold or contradictions present → audit/abstain.
+10. Calibration & uncertainty:
+   - predicted_se via CoverageGuard; final se_logit_final includes FP_risk penalty; compute p_lower using z scaling; apply p_final shrink factor for FP_risk.
+11. Decision persistence: final decision, reason_code, full per-prediction provenance (aggregator logits, counterfactual, channel×cluster posterior ids, FP_risk, GLM/SRM outputs + SEs, DecisionRisk, edge flags).
+12. Post-batch checks & alerts.
+
+DEFAULT PARAMETERS (v3.3.2 initial)
+- single_spike thresholds: low 0.50, medium 0.70, extreme 0.95
+- FP_risk smoothing s = 5; EB shrinkage τ = 50; cluster_min_n = 30; global_min_n = 50
+- FP_risk categories: low ≤0.10, moderate 0.10–0.25, high >0.25
+- medium acceptance: aggregator_p_lower baseline = 0.80; GLM baseline = 0.65; SRM baseline = 0.80
+- extreme rescue baseline: aggregator_p_lower baseline = 0.70; GLM baseline = 0.60; SRM baseline = 0.80
+- aggregator up cap when FP_risk≤0.10: +7%; FP_risk (0.10,0.25]: +3%; else ambiguous multiplier 0.95 or lower.
+- se_fp_scale = 0.20; base_z = 1.645; DecisionRisk threshold = 0.35
+- per_channel calibration min_n = 150; per_cluster calibration min_n = 100
+
+VALIDATION EXPERIMENTS & METRICS
+- Holdouts: stratify by cluster, top_channel, Age_bucket; targeted holdouts: 0066_01, 0067_02/03, 0069_01, 0070_01, 0071_01.
+- Metrics: per_channel_per_cluster FN/FP, Brier, ECE, CI coverage, audit fraction, abstain fraction, rescue_auto_accept fraction, per-age bucket error rates.
+- Sweeps:
+  - τ ∈ {20,50,100}
+  - cluster_min_n ∈ {20,30,50}
+  - medium lower bound ∈ {0.65,0.70,0.75}
+  - FP_risk gate ∈ {0.05,0.10,0.15,0.25}
+  - DecisionRisk thresholds ∈ {0.30,0.35,0.40}
+- Ablation: compare v3.2 vs v3.3 vs v3.3.2 to target:
+  - Reduce medium-single_spike FPs (especially FoodCourt/VRDeck) by ≥50% vs v3.3.
+  - Retain ≥60% of extreme RoomService rescues (reduce FNs like 0069_01 by ≥50% vs v3.0).
+  - Keep overall FP increase for RoomService ≤20% and overall abstain/audit fraction within operational limits.
+
+IMMEDIATE OPERATIONAL ACTIONS (24–72 hours)
+1. Compute and persist FP_risk(channel, cluster, spend_bucket) historical table and expose it to scorer (Data Engineering).
+2. Implement channel rescue metadata: create rescue_allow defaults (RoomService:true; FoodCourt/VRDeck:false) and expose to scorer (Scoring Engineers).
+3. Add top2_share, spend_entropy, top_channel_percentile to preprocessor; compute DecisionRisk per prediction (Scoring Engineers).
+4. Tighten medium & extreme single_spike acceptance in scorer to use FP_risk gating and route ambiguous/high DecisionRisk to audit or abstain (Scoring + ML).
+5. Retrain GLM_fallback v6 with negative oversampling for FoodCourt & VRDeck; deploy in shadow (Model Team).
+6. Add precommit check: per-channel medium_single_spike_pred_True fraction_by_channel ≤ baseline + 10%; fail build if exceeded (SRE/CI).
+
+EXPECTED TRADEOFFS & MITIGATIONS
+- Tighter rules → fewer FPs but potentially more audits/abstains and some FNs.
+  - Mitigate by targeted retraining (oversample negatives for trouble channels), per-channel rescue whitelist (recover RoomService), and short retrain cadence for hot channels.
+- Audit volume will increase initially; prioritize DecisionRisk > 0.5 and high FP_risk cases for human review.
+
+HOW v3.3.2 WOULD HANDLE 0071_01 (concrete flow)
+1. Identify extreme_single_spike (top_contrib_share ≈ 0.9695).
+2. Lookup ChannelReliabilitySigned for (FoodCourt, cluster derived from Age=17, CryoSleep=False, Cabin_deck=F). Likely FP_risk_kC > 0.10 (moderate) based on recent FPs in young cohorts.
+3. Check rescue_allow(FoodCourt) => false by default.
+4. Apply extreme rules: rescue not permitted; require aggregator_p_lower ≥ 0.85 AND GLM_p ≥ 0.70 AND SRM ≥ 0.90. Not satisfied (GLM/SRM likely lower) → compute DecisionRisk.
+5. DecisionRisk > 0.35 due to high spend_extremeness and moderate FP_risk → route to priority audit (or abstain if audit not available).
+Result: avoid auto-accept for 0071_01, preventing the FP.
+
+DELIVERABLES I WILL PRODUCE NEXT (deterministic, versioned)
+- Deterministic scorer skeleton (Python pseudocode) implementing v3.3.2 rules (ChannelReliabilitySigned v2 + FP_risk, single_spike banding, DecisionRisk router) with unit tests and deterministic seeds.
+- Shadow GLM_fallback v6 retrain with negative oversampling for FoodCourt & VRDeck and stratified validation.
+- LOO validation report comparing v3.2, v3.3, v3.3.2 with recommended operating points and parameter sweep results.
+- Audit log schema, precommit rule definitions, and dashboard KPI spec.
+- Prioritised 72‑hour implementation checklist (owners, artifacts).
+
+ONE-LINE SUMMARY
+v3.3.2 adds explicit per (channel,cluster) FP_risk and channel-aware extreme-rescue gating, tightens single_spike consensus rules, incorporates spend-shape and age×channel interactions, retrains GLM/SRM with targeted negatives, and routes ambiguous/high-risk cases to prioritized audit — preventing FPs like 0071_01 while preserving true positive rescues such as 0069_01.
+
+Would you like me to:
+- produce the deterministic scorer skeleton (Python pseudocode + unit tests) now, or
+- run the stratified LOO validation (v3.3 vs v3.3.2) and return the validation report with recommended operating points?
+
+I can also generate a prioritized 72‑hour implementation checklist with suggested owners and required artifacts if that’s helpful.
+
+============================================================

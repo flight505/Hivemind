@@ -1,0 +1,292 @@
+PREDICTIVE METRICS - ITERATION 187
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+
+What happened (short)
+- New brittle failure in n==1 batch: Passenger 0221_04 (CryoSleep=True, RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0) was predicted False but actual True (FN). This is a different brittle failure family than the previous super‑dominant spend FP: “cryo + all‑zero spend” behaviour was mis‑handled.
+- Immediate confirmed root causes:
+  - cryo_allzero pattern (CryoSleep == True AND all spends == 0) was not treated as fragile. The model had learned a negative bias for zero‑spend vectors (likely because many non‑transported examples in training had zero spends), so it under‑predicted p(Transported) for this pattern.
+  - Pre‑imputation signals were not preserved (NaNs/zero ambiguity), so the model could not differentiate “true zero spend” vs “imputed/missing/cryosleep-driven zero”.
+  - Calibrator was not conditioned on cryo_allzero / missingness patterns → underestimated uncertainty for this slice.
+  - n==1 gating allowed auto decision without GLM_fallback/ensemble concordance checks for cryo_allzero cases.
+  - No slice‑aware priors or cluster handling for CryoSleep+zero groups; the global model over‑generalized.
+- Top immediate priorities
+  1) Hotfix (0–3h): treat cryo_allzero_flag (and infant_allzero) as fragile when n_batch == 1 → route to priority_audit unless strict fallback/ensemble + calibrated uncertainty checks pass.
+  2) Persist pre‑imputation detectors (raw NaNs preserved) including cryo_allzero_flag, zero_spend_vector_flag, sum_raw_spend, missingness_bitmap.
+  3) Inflate uncertainty for cryo_allzero fragiles (SE floor start 0.75) and enforce audit for n==1 cryo_allzero unless GLM+ensemble agree.
+  4) Add 0221_04 to canaries and persist full provenance for immediate triage and retraining examples.
+  5) Retrain calibrator/GLM with upweighting for cryo_allzero positives and add cryo cluster priors.
+
+Concise answers to the six operational questions (batch‑accuracy focus)
+
+1) Which specific patterns caused the error?
+- Pattern: cryo_allzero: CryoSleep == True AND all channel spends == 0 (raw). Model had a negative prior for zero‑spend vectors (learned from training distribution), so p_model was too low and calibrator under‑estimated uncertainty for this slice.
+
+2) How should decision rules be modified?
+- Precompute cryo_allzero and zero_spend_vector from raw (pre‑imputation) data and mark as fragile.
+- If n_batch == 1 AND cryo_allzero_flag (or infant_allzero_flag or imputed_count ≥ 1) → route to priority_audit unless:
+  - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_cryo),
+  - ensemble_agreement ≥ A_high,
+  - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice,
+  - se_combined ≤ SE_accept_slice AND quantile_width ≤ QW_accept_slice.
+
+3) New transport‑pattern insights?
+- CryoSleep + zero spends is a distinct behaviour slice: it can represent true low‑activity transported passengers (e.g., cryo, no onboard spend) and also non‑transported passengers. The conditional distribution of Transported in this slice differs enough from the population that the main model’s global weights are unreliable without slice conditioning.
+
+4) How should confidence be recalibrated?
+- Use heteroskedastic calibration conditioned on cryo_allzero, missingness, infant flags, and cabin/destination buckets. Inflate variance for cryo_allzero slices (κ_cryo start 0.80) and enforce SE floors for n==1 fragiles (start 0.75).
+
+5) What adjustments are needed for batch consistency?
+- Compute batch_frac_fragile; if batch_frac_fragile ≥ 5% hold/require audit.
+- For n==1 or very small batches, require stricter gating for cryo_allzero: GLM/ensemble concordance + low SE + narrow quantile width.
+
+6) How can metrics be improved for edge cases like this?
+- Persist pre‑imputation raw spends and imputation provenance.
+- Add cryo_allzero and zero_spend_vector detectors; upweight these cases in calibrator/GLM training; create cryo cluster priors and GLM_fallback for small‑n decisions.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Immediate emergency actions (0–3h)
+- Hotfix gating:
+  - If n_batch == 1 AND (cryo_allzero_flag OR infant_allzero_flag OR any_missing_channel_flag OR imputed_count ≥ 1 OR novelty_high_flag) → route to priority_audit.
+  - For cryo_allzero_flag: audit by default for n_batch ≤ 10 unless very strong concordance (GLM+ensemble + low se).
+- Persist provenance: raw per_channel spends (NaNs preserved), cryo_allzero_flag, zero_spend_vector_flag, sum_raw_spend, missingness_bitmap, top1/top2/etc computed on raw.
+- SE floor: if n==1 & cryo_allzero_flag OR infant_allzero OR super_dominant → se_floor = 0.75 (start). This inflates uncertainty and widens p10/p90 for safety.
+- Add 0221_04 to canaries; stop auto‑decisions for current canary list until gating active.
+
+B. Pre‑imputation flag & detector definitions (compute before any imputation)
+- any_missing_channel_flag: True if any spend feature is NaN.
+- zero_spend_vector_flag: True if ALL spend channels are exactly zero (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck == 0.0) AND not all NaN.
+- cryo_allzero_flag: True if CryoSleep == True AND zero_spend_vector_flag == True.
+- infant_allzero_flag: True if Age < 2 AND zero_spend_vector_flag == True.
+- sum_raw_spend, non_nan_spend_count, top1_value_raw, top1_share_raw computed as before (NaNs preserved).
+- missingness_signature: bitmap of NaNs across channels.
+- imputed_count and imputation_method (provenance).
+
+C. Feature engineering updates (v→v+1)
+- Preserve raw per_channel spends + NaNs.
+- Add: cryo_allzero_flag, zero_spend_vector_flag, infant_allzero_flag, sum_raw_spend, non_nan_spend_count, top1_share_raw, top1_channel_pctile_raw, top1_top2_ratio_raw, channel_entropy_raw, missingness_count, missingness_bitmap.
+- Interaction features: cryo_allzero × Age_bucket, cryo_allzero × cabin_deck, zero_spend_vector × VIP.
+
+D. Channel‑aware thresholds, percentiles & caps
+- Compute channel percentiles monthly (95/99/99.5/99.9).
+- Define SPEND_ZERO_TOLERANCE = 0.0 (exact zero) for zero_spend_vector, but allow tiny epsilon for floating errors (1e‑6).
+- Cryo slice stats: compute historical p(Transported | cryo_allzero) and p(Transported | cryo_nonzero) to decide prior blending.
+
+E. Per‑feature logit caps & bias dampening
+- CAP_PER_CHANNEL_LOGIT = 1.0 (base), LOGIT_TOPK_SUM_CAP = 1.6 (as before).
+- New negative‑bias dampening: if zero_spend_vector_flag or cryo_allzero_flag → reduce magnitude of features that drive negative logit (e.g., "no spend" indicators) by multiplying logit contribution by β_zero = 0.6 to prevent over‑penalization.
+- Persist caps_triggered and dampening reasons for audit and retraining.
+
+F. Variance / SE model enhancements (heteroskedastic)
+- var_combined = var_base +
+    κ_top1_high*I(top1_high_pctile) +
+    κ_super_dom*I(super_dominant_flag) +
+    κ_dom*I(single_channel_dominant_flag) +
+    κ_cryo*I(cryo_allzero_flag) +
+    κ_infant*I(infant_allzero_flag) +
+    κ_impute*imputed_count +
+    κ_missing*missingness_count +
+    κ_multi_high*multi_channel_count
+  - Start values (updated):
+    κ_top1_high = 0.50;
+    κ_super_dom = 0.80;
+    κ_dom = 0.60;
+    κ_cryo = 0.80;  (increase for cryo_allzero)
+    κ_infant = 0.60;
+    κ_impute = 0.25;
+    κ_missing = 0.30;
+    κ_multi_high = 0.45.
+- se_combined = sqrt(max(var_combined, se_floor(context)^2)).
+- SE floors:
+  - n==1 & fragile_topN OR super_dominant OR cryo_allzero OR infant_allzero → se_floor = 0.75.
+  - n>1 but batch_frac_fragile > BATCH_FRAGILE_THRESHOLD (start 5%) → se_floor = 0.55.
+
+G. Decision‑gating (pattern‑aware + batch/cohort aware)
+- fragile_flag_v2 = union(infant_allzero, cryo_allzero, single_channel_dominant, super_dominant, per_channel_abs_outlier, high_top1_abs_flag, per_channel_implausible, any_missing_channel, imputed_count ≥ 1).
+- batch_frac_fragile = #fragile_records_in_batch / batch_size.
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (0.05) → route entire batch to priority_audit.
+- n==1 fragile gating: allow auto decision ONLY if ALL pass:
+  - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice,
+  - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice),
+  - ensemble_agreement ≥ A_high,
+  - se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice.
+  - Else → priority_audit.
+- For cryo_allzero_flag: default audit for n ≤ 10 unless GLM+ensemble near‑perfect agreement & se_combined very small.
+
+H. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Heteroskedastic quantile calibrator producing p10/p50/p90 and variance; include cryo_allzero_flag, zero_spend_vector_flag, missingness_count, age_bucket, cabin_deck, and per_feature_logit contributions as conditioning features.
+  - Loss: pinball for quantiles + Brier for p50 + ECE regularizer.
+  - Upweight cryo_allzero positive examples by ×8–12 during calibration/training (tunable) because they’re rare and historically mis‑predicted.
+- GLM_fallback:
+  - ElasticNet logistic on winsorized log1p channel features + zero_spend_vector_flag + cryo_allzero_flag + missingness bitmap + top1_share_raw + age_bucket + cabin_deck + top1 indicators.
+  - Used as interpretable fallback for n small / audits.
+- Training:
+  - Rolling window 12–36 months, CV stratified on cryo_allzero and fragility flags.
+  - Shadow run 14–28 days to estimate audit volume and tune thresholds.
+
+I. Mixture priors & cluster detection (slice‑aware)
+- For cryo_allzero and other brittle slices, cluster on demographics, raw_spend_vector, missingness_signature, cabin_deck, destination.
+- Compute cluster priors μ_cluster, N_cluster; blend priors by cluster membership probability. For cryo_allzero, expect separate clusters (e.g., young adults vs elderly).
+- For cryo slices keep conservative prior mixtures to avoid overconfident extrapolation from global model.
+
+J. Monitoring, metrics & alerts (batch‑focused)
+- New slice KPIs:
+  - cryo_allzero_FP_rate & FN_rate (per age_bucket/cabin_deck).
+  - zero_spend_vector_FP_rate & FN_rate.
+  - n==1_auto_accept_rate; n==1_fragile_auto_accept_rate.
+  - batch_frac_fragile, batch_hold_rate.
+- Alerts:
+  - Any canary (incl. 0221_04) auto_accepted/rejected → immediate page.
+  - cryo_allzero FN rate in recent day > baseline + X% → page.
+  - batch_frac_fragile ≥ threshold → hold batch + page.
+- Dashboards:
+  - Per‑record provenance and gating_decision for fragiles and canaries.
+
+K. CI unit tests & validation (cryo & zero_spend)
+- Unit tests:
+  - Pre‑imputation flags computed correctly and NaNs preserved.
+  - zero_spend_vector_flag triggers when all channel spends == 0.0.
+  - cryo_allzero_flag triggers when CryoSleep == True AND zero_spend_vector_flag == True.
+  - se_combined respects se_floor for n==1 & cryo_allzero.
+  - Negative‑bias dampening applied when cryo_allzero_flag True.
+  - batch_frac_fragile ≥ threshold disables auto_decisions.
+  - Canaries (incl. 0221_04) must not be auto_accepted/rejected while emergency gating active.
+- Regression tests:
+  - Global ECE/AUC/Brier tolerate small shifts; slice‑level FN rate for cryo_allzero decreases.
+- Synthetic stress tests:
+  - Inject cryo_allzero examples with varying labels; validate routing to audit and behavior when GLM+ensemble agree.
+  - Test zero_spend_vector but CryoSleep False (distinguish behaviors).
+
+L. Operational actions & timeline (0–72h)
+1) Immediate (0–3h)
+   - Deploy hotfix gating for n==1 cryo_allzero & infant_allzero; hold canaries (add 0221_04) and persist provenance.
+   - Apply negative‑bias dampening for zero_spend_vector features and enforce per_feature_logit caps.
+2) Short‑term (3–24h)
+   - Implement pre‑imputation detectors, cryo_allzero_flag, zero_spend_vector_flag; baseline GLM_fallback; compute batch_frac_fragile; instrument dashboards; collect labels for flagged cases.
+   - Shadow run to estimate audit load and tune thresholds.
+3) Mid‑term (24–72h)
+   - Retrain heteroskedastic quantile calibrator & GLM_fallback with upweighted cryo_allzero positives; deploy cluster priors for cryo slices; run extended shadow run (14–28 days).
+4) Longer term
+   - Monthly recompute of channel percentiles; automated hyperparameter sweeps for κ_cryo, se_floor, β_zero; continuous monitoring and threshold adaptation.
+
+M. Per‑record provenance to log (minimum)
+- Raw per_channel spends (NaNs preserved) + per_channel_imputed_flags + imputation_method.
+- CryoSleep raw + cryo_allzero_flag.
+- Raw Age + age_imputed_flag + Age_bucket.
+- Transforms & flags: zero_spend_vector_flag, sum_raw_spend, non_nan_spend_count, top1/top2_channel, top1_value_raw, top1_share_raw, top1_channel_pctile, channel_entropy_raw, missingness_bitmap, single_channel_dominant_flag, super_dominant_flag, per_channel_abs_outlier_flag.
+- Model internals: per_feature_logit_contributions (raw & capped), caps_triggered, dampening_reason, pooled_prior_snapshot_id, μ_slice/μ_cluster, τ_slice_blend.
+- Variance: var_components, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, quantile_width, gating_reasons, routing_decision, scorer_version.
+
+N. Initial hyperparameters (start values; sweepable)
+- SPEND_ZERO_TOLERANCE = 0.0 (epsilon 1e‑6)
+- SE floor for n==1 cryo_allzero = 0.75
+- κ_cryo = 0.80; κ_infant = 0.60
+- β_zero (negative‑bias dampening) = 0.6
+- CAP_PER_CHANNEL_LOGIT = 1.0; LOGIT_TOPK_SUM_CAP = 1.6
+- BATCH_FRAGILE_THRESHOLD = 0.05
+- N_min_slice = 60; τ_high_slice = 0.95
+- δ_slice (GLM tolerance) = 0.05; δ_cryo = 0.03
+- A_high (ensemble agreement) = 0.995
+- QW_accept_slice (quantile width) = 0.12
+- cryo_upweight_factor_for_training = 8
+
+O. CI canaries & expected behavior
+- Canary list (add 0221_04): 0210_01, 0211_03, 0212_01, 0212_02, 0213_01, 0216_01, 0219_01, 0220_02, 0220_03, 0220_04, 0221_01, 0221_04.
+- Expected route while gating is active: priority_audit for cryo_allzero canaries.
+- CI asserts: canaries not auto_accepted/rejected; raw provenance preserved; per_feature_logit contributions logged.
+
+P. Gating pseudocode (pattern‑aware, batch focused)
+- For each batch B:
+  - Compute batch_frac_fragile = count(r in B where fragile_flag_v2)/|B|
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD: route all r in B -> priority_audit; continue
+  - For each r in B:
+      compute pre‑imputation flags (including cryo_allzero_flag, zero_spend_vector_flag, single_channel_dominant_flag, any_missing_channel_flag, infant_allzero), top1/top2/top3, multi_channel_count
+      set fragile_flag_v2 = union of above
+      If cryo_allzero_flag AND n_batch ≤ 10:
+         route r -> priority_audit (unless GLM+ensemble near perfect agreement & se_combined very small)
+         continue
+      If n_batch == 1 and fragile_flag_v2:
+         If pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice) AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice:
+             allow auto_decision
+         Else:
+             route r -> priority_audit
+         continue
+      If zero_spend_vector_flag:
+         apply negative‑bias dampening to zero‑spend indicators
+         If GLM+ensemble concordant AND se_combined small -> allow auto_decision
+         Else route -> priority_audit
+      [other gating rules as earlier...]
+
+Q. Specific diagnosis — Passenger 0221_04 (chain of failure & root cause)
+- Raw: CryoSleep=True, RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0 → zero_spend_vector_flag=True and cryo_allzero_flag=True.
+- Failure chain:
+  1) raw pattern (cryo_allzero) was not flagged as fragile pre‑imputation, so scoring pipeline treated it as a normal record.
+  2) Model learned a negative association between zero spends and Transported (training distribution bias); per_feature_logit contributions pushed p_model low.
+  3) Calibrator did not condition on cryo_allzero → produced narrow p10/p90 and under‑estimated uncertainty.
+  4) n==1 gating allowed auto decision → FN accepted.
+- Root causes:
+  - No cryo_allzero detector or zero_spend_vector detector active pre‑imputation.
+  - No negative‑bias dampening for zero_spend patterns.
+  - Calibrator lacked slice conditioning for cryo patterns.
+  - No GLM_fallback/ensemble gating for n==1 fragiles.
+  - Potential label imbalance / under‑representation of transported==True in cryo_allzero slice in training → model bias.
+
+R. How these changes reduce batch errors (short)
+- Pre‑imputation detectors capture cryo_allzero records before transforms/imputation.
+- Default audit for cryo_allzero in small batches prevents high‑impact FNs/FPS in n==1.
+- Negative‑bias dampening plus logit caps stop “zero spend” features from overwhelming predictions.
+- Heteroskedastic calibrator + SE floors make system conservative on fragiles.
+- GLM fallback + ensemble concordance supply an interpretable safety net for small‑n decisions.
+- Upweighting cryo_allzero positives in retraining reduces model bias for this slice.
+
+S. Tradeoffs & operational notes
+- Expect increased audit volume initially, particularly for cryo_allzero and super_dominant slices—plan for human triage capacity.
+- Some short‑term degradation in global AUC/Brier may occur while gating/audits are introduced—acceptable tradeoff to reduce high‑impact FNs/FPS in fragile slices.
+- Additional compute and latency for GLM_fallback and pre‑imputation detectors, especially in small‑batch or interactive flows.
+
+T. Next steps / recommended sequencing (concrete)
+1) Hotfix (within 1 hour)
+   - Deploy n==1 & n≤10 cryo_allzero gating; add 0221_04 to canaries; persist provenance and per_feature_logits; enable negative‑bias dampening.
+2) Short (1–24h)
+   - Implement pre‑imputation detectors + baseline GLM_fallback; instrument dashboards; collect labels for cryo_allzero cases and run shadow audits to estimate volume.
+3) Mid (24–72h)
+   - Retrain heteroskedastic quantile calibrator & GLM_fallback with upweighted cryo_allzero positives; deploy cluster priors; run extended shadow run (14–28 days).
+4) Longer term
+   - Monthly percentile recompute; ongoing monitoring and threshold adaptation; create partial automated adjudication (heuristic rules + GLM) to reduce human audit load.
+
+Runnable checklist (concrete)
+- Do not auto‑accept any n==1 record where:
+  - cryo_allzero_flag == True OR
+  - infant_allzero_flag == True OR
+  - per_channel_abs_outlier_flag == True OR
+  - imputed_count ≥ 1 OR
+  - single_channel_dominant_flag == True OR
+  - missing_homeplanet_flag OR missing_destination_flag.
+- Add unit test: CryoSleep True + all spends 0.0 & n==1 -> route to audit unless GLM+ensemble & se checks pass.
+- Log per_feature_logit_contributions and caps_triggered and dampening_reason for these cases for immediate triage.
+
+Immediate debugging checklist for this specific error (0221_04)
+1) Log inspection:
+   - Extract per_feature_logit_contributions (raw & capped), calibrator p10/p50/p90, var_components, se_combined.
+   - Check GLM_fallback probability and ensemble agreement history.
+2) Data checks:
+   - Confirm CryoSleep ingestion correctness (True vs string), and that zero spends are not masked NaNs from upstream imputation.
+   - Verify that raw fields were preserved (NaNs vs zeros).
+   - Compute historical p(Transported | cryo_allzero) to see if this is an outlier or label noise.
+3) Training checks:
+   - Evaluate label distribution for cryo_allzero slice; if positives are under‑represented upweight or augment synthetic positives.
+   - Retrain calibrator/GLM with upweighted cryo_allzero positives and test slice FN reduction.
+
+Offer / next action
+- Recommendation: Push the hotfix gating now (include cryo_allzero_flag, zero_spend_vector_flag, infant_allzero_flag; hold canaries including 0221_04 and persist provenance). This will immediately prevent repeat FNs in n==1 and small batches.
+- I can deliver:
+  1) Emergency gating implementation package (runnable pseudocode + unit tests + CI patch) within the hour.
+  2) Full retraining pipeline spec (heteroskedastic quantile calibrator + GLM_fallback + mixture priors), hyperparameter sweep matrix, and shadow‑run dashboard spec for the 24–72h plan.
+
+Which deliverable would you like first?
+
+============================================================

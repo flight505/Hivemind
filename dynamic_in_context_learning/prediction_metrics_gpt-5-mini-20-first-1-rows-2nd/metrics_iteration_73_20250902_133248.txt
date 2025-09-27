@@ -1,0 +1,256 @@
+PREDICTIVE METRICS - ITERATION 73
+============================================================
+
+Version: v3.5.8 (post_0108_01) — Updated predictive metrics & operational plan (integrates lessons from 0099_01 and 0099_02)
+
+Executive summary — immediate takeaway & top priorities
+- Two complementary failure modes surfaced in n==1 batches:
+  - 0099_01: false positive on a concentrated_top3 spend pattern (ShoppingMall + FoodCourt + RoomService, top3_share ≈ 0.972). Root cause: calibrator + pooled priors aggregated single‑channel signals without triple‑combo semantics; SE floors and gating for K>=3 were too permissive → confident FP auto‑accept.
+  - 0099_02: false negative on zero_spend pattern (all channel spends = 0). Root cause: zero_spend treated as low‑signal and over‑confidently rejected in n==1 because calibrator lacked zero_spend × Age/context interactions and gating did not treat untrusted zero patterns symmetrically → confident FN.
+- Immediate 0–72h priorities (actionable):
+  1. Enforce symmetric n==1 gating for all untrusted pattern_types: concentrated_topK (K≥1) AND zero_spend AND high‑novelty multi_channel records → route to priority_audit unless extreme consensus.
+  2. Deploy direction‑aware logit_shift for concentrated_topK and zero_spend; increase SE floors (κ) and novelty inflation for K>=3 and zero patterns.
+  3. Expose ordered_topK (K up to 3), top1/2/3_share, ordered_topK_id, zero_spend flag, spend_entropy and novelty_score to feature store; log decisions & applied shifts for AL.
+  4. Retrain calibrator & GLM_fallback with explicit topK combos, triple interactions and zero_spend×Age/context terms using grouped CV by subslice & pattern_type.
+
+1) What specific patterns in the current metrics led to these prediction errors?
+- 0099_01 (concentrated_top3 FP):
+  - pattern_type = concentrated_top3 (top3_share ≈ 0.972).
+  - Calibrator lacked explicit triple‑combo covariates; it pooled marginal single‑channel priors (ShoppingMall, FoodCourt, RoomService) that individually leaned positive → pooled_prior became strongly positive.
+  - slice_trust_table lacked ordered_top3 counts → subslice marked NOT Trusted; but gating thresholds were asymmetric/lenient for K>=3 so record was auto‑accepted.
+  - SE floors for concentrated K>=3 were too low (under‑estimated uncertainty); novelty_score wasn't used to dampen confidence.
+- 0099_02 (zero_spend FN):
+  - pattern_type = zero_spend (all channel spends = 0).
+  - Model implicitly treated zero_spend as low signal and relied on ensemble p_ens which leaned negative; calibrator did not incorporate age/context interactions that in training correlated zero_spend→True (e.g., infants/children with zero spend but transported).
+  - N_subslice for the exact zero_spend × context tuple was low or historical TP_rate low (untrusted), but gating didn't enforce symmetric routing for zero patterns → auto‑reject happened.
+- Measurable indicators to detect similar risk:
+  - pattern_type ∈ {concentrated_topK (top3_share ≥ 0.90), zero_spend (sum_spend==0), high_novelty (novelty_score ≥ 0.95)} AND n==1.
+  - N_subslice (ordered_topK or zero_spend×context) < min_n_by_pattern[K or zero].
+  - pooled_prior vs p_ens divergence (|pooled_prior − p_ens| > 0.25) and high ensemble agreement in the wrong direction.
+  - Low spend_entropy + topK_share high OR sum_spend==0 + Age_bucket in child range.
+
+2) How should the decision rules be modified to prevent similar errors?
+Principles
+- Pattern‑aware and symmetric gating in small batches. Treat concentrated_topK AND zero_spend as directional patterns requiring explicit handling.
+- Calibrator must see triple combos and zero_spend interactions.
+Concrete immediate rule changes
+- Pattern detection:
+  - concentrated_top1: top1_share ≥ 0.80 OR (spend_entropy ≤ 0.25 AND top1_share ≥ 0.70)
+  - concentrated_top2: top2_share ≥ 0.90 OR (spend_entropy ≤ 0.15 AND top2_share ≥ 0.75)
+  - concentrated_top3: top3_share ≥ 0.90 OR (spend_entropy ≤ 0.12 AND top3_share ≥ 0.70)
+  - zero_spend: sum_spend == 0
+  - precedence: zero_spend → top1 → top2 → top3 → multi_channel → dispersed
+- Symmetric n==1 gating (expanded):
+  - If n==1 AND pattern_type ∈ {zero_spend, concentrated_top1, concentrated_top2, concentrated_top3, high_novelty_multi} AND NOT Trusted_subslice:
+    - Do NOT auto‑accept and do NOT auto‑reject. Route to priority_audit unless extreme consensus.
+    - Extreme thresholds (initial):
+      - extreme_accept_threshold = {K1:0.995, K2:0.998, K3:0.999, zero:0.995}
+      - extreme_reject_threshold = {K1:0.005, K2:0.002, K3:0.001, zero:0.005}
+      - agreement_threshold_accept/reject = 0.98
+- Direction‑aware logit_shift (for concentrated_topK and zero_spend):
+  - pooled_prior = hierarchical_pooling(subslice_prior, channel_bin_prior, global_prior).
+  - polarity = 2*pooled_prior − 1
+  - logit_shift = polarity * δ_logit_pattern * novelty_scale (clipped)
+  - δ_logit_pattern initial: {K1:0.90, K2:0.60, K3:0.50, zero:0.60}
+  - novelty_scale = (1 − min(novelty_score, 0.95)) — dampens shift for very novel combos.
+  - Clip |logit_shift| ≤ δ_max_pattern (set equal to δ_logit_pattern initially).
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Triple‑combos are not simple aggregates: ordered_top3 combinations can have empirical label behavior different from single‑channel priors (marginals can be misleading).
+- Zero_spend patterns can be informative and context‑dependent (Age, Cabin_deck, Destination) — zero spending does not always imply negative label.
+- n==1 batches substantially amplify both FP and FN risk for pattern types that are rare, concentrated, or zero_spend — they must be treated symmetrically to avoid automation bias in either direction.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Use pattern‑aware variance modeling and covariate calibrator that outputs both calibrated probability and uncertainty:
+  - var_slice ≈ posterior_mean*(1−posterior_mean)/(N_subslice + 1)
+  - var_pattern = κ_pattern * g(num_nonzero_channels, spend_entropy, novelty_score)
+  - var_novelty_conditional = κ_novelty * novelty_score^2 (if subslice untrusted)
+  - Combined variance:
+    - var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern
+    - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- SE floors and κ (initial):
+  - var inflation κ_pattern = {K1:1.0, K2:1.3, K3:1.6, zero:1.4}
+  - concentrated_nontrusted_floor = {K1:0.07, K2:0.08, K3:0.10}
+  - zero_nontrusted_floor = 0.09
+  - extreme_novelty_floor = 0.12
+  - trusted_slice_floor = 0.02
+- Calibration model:
+  - Replace scalar Platt with covariate‑aware LightGBM (or small NN) that takes:
+    - p_after_penalty, pattern_type, ordered_topK_id (hashed embedding), top1/2/3_share, sum_spend, num_nonzero_channels, spend_entropy, novelty_score, pooled_prior, N_subslice, model_disagreement, Age_bucket, Cabin_deck, Destination, zero_spend_flag.
+  - Output both p_final and p_final_uncertainty (via quantile loss or ensemble variance).
+- Decision z_adj:
+  - z_adj = base_z * (1 + γ_FP*FP_risk + γ_dis*model_disagreement + γ_nov*novelty_score)
+  - base_z = 1.645; sample γs = {FP_risk:1.0, model_disagreement:0.6, novelty_score:1.0}; if Trusted_subslice apply λ_trust reduction = 0.35.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Deterministic snapshotting: snapshot scorer, calibrator, slice_trust_table and hyperparams at batch start (snapshot_id) and use same snapshot for entire batch run.
+- Gating & routing consistency:
+  - Apply symmetric small‑batch gating for any untrusted pattern_type including zero_spend and concentrated_topK.
+  - Do NOT update slice_trust_table in‑batch (post batch update only).
+- Logging & provenance:
+  - Persist for each record: pattern_type, ordered_topK_id, N_subslice, pooled_prior, applied_logit_shift, novelty_score, p_ens, se_ens, p_after_penalty, p_final, p_final_uncertainty, decision_reason_code, snapshot_id.
+- Audit queue & triage:
+  - Prioritize concentrated_top3 contradictions and zero_spend contradictions with Age/context evidence. Provide fast labeling path to grow N_subslice.
+- Canary & rollout:
+  - Shadow new scorer across recent batches and enable canary for 1% live traffic; require per‑pattern acceptance criteria before full rollout.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New per‑record features (add to feature store):
+  - ordered_top1/2/3 tuple, top1_share, top2_share, top3_share, ordered_topK_id (K up to 3, hashed), triple_interaction_flags, sum_spend, spend_entropy, num_nonzero_channels, zero_spend_flag, novelty_score, pooled_prior_by_K, missingness_count.
+- Slice_trust_table enhancements (schema):
+  - key = (pattern_type, ordered_topK_tuple or zero_key, Age_bucket, Cabin_deck, Destination)
+  - columns = N_total, N_positive, TP_rate, decayed_count, decayed_tp_rate, last_updated, snapshot_id
+  - min_n_by_pattern initial: {K1:50, K2:30, K3:40, zero:40}
+  - τ_pattern (pooling strength): {K1:100, K2:160, K3:220, zero:180}
+- Modeling & training changes:
+  - GLM_fallback v15: include pattern_type, topK combo hashed embeddings, triple interactions, zero_spend×Age_bucket, and pattern_type×context interactions.
+  - Calibrator v5: LightGBM covariate calibrator with grouped CV by ordered_topK_id & pattern_type to guard against leakage.
+  - Ensembling: aggregator 0.45, GLM 0.30, SRM 0.25 initial; tune in validation.
+- Hierarchical pooling (Empirical Bayes):
+  - pooled_prior = (τ_pattern * μ_global + N_subslice * μ_subslice) / (τ_pattern + N_subslice)
+  - τ_pattern heavier for larger K and zero patterns (see τ_pattern above) to avoid over‑fitting tiny subslices.
+- Active Learning:
+  - Prioritize contradictory records for:
+    - ordered_top3 combos and zero_spend × Age_bucket contradictions
+    - novel combos with high novelty_score and low N_subslice
+  - Stop sampling a subslice once N_subslice ≥ min_n_by_pattern or decayed TP_rate stable.
+- Monitoring additions:
+  - Per‑pattern ECE/Brier/precision/recall for zero_spend and concentrated_top1/2/3.
+  - Per‑combo FP/FN alerts (top3 combos).
+  - n==1 FP/FN rate monitoring and audit queue size, time‑to‑trust.
+
+Deterministic scoring pipeline (v3.5.8 condensed flow)
+1. Batch snapshot at start: channel_spend_bins/stats, slice_trust_table (ordered_topK up to 3 + zero slices), models, calibrators, hyperparams, snapshot_id.
+2. Preprocessing per record:
+   - Compute sum_spend, sorted topK, top1/2/3_share, num_nonzero_channels, spend_entropy, ordered_topK tuple, ordered_topK_id (hash), zero_spend_flag, Age_bucket, Cabin_deck, Destination, novelty_score.
+   - Determine pattern_type ∈ {zero_spend, concentrated_top1, concentrated_top2, concentrated_top3, multi_channel, dispersed}.
+3. Prior lookups & hierarchical pooling:
+   - Retrieve N_subslice and μ_subslice for ordered_topK tuple or zero_key.
+   - pooled_prior = hierarchical_pooling(μ_subslice, single_channel_bin_prior, global_prior) with τ_pattern.
+4. Model inference:
+   - Ensemble runs → p_ens ± se_ens and model_disagreement.
+5. p_combined_prepenalty = α_prior * pooled_prior + α_ens * p_ens (weights tuned).
+6. Direction‑aware adjustment:
+   - If pattern_type in {concentrated_topK, zero_spend}:
+     - If Trusted_subslice → minimal shift + lower SE floor.
+     - Else polarity_factor = 2*pooled_prior − 1; novelty_scale = (1 − min(novelty_score, 0.95)); logit_shift = polarity_factor * δ_logit_pattern * novelty_scale (clipped).
+     - Inflate var_pattern per κ_pattern and set pattern_nontrusted_floor.
+7. Variance & SE:
+   - var_combined as above → se_combined.
+8. Calibrate:
+   - p_after_penalty = inv_logit(logit(p_combined_prepenalty) + logit_shift).
+   - p_final, p_final_uncertainty = covariate_calibrator.predict([p_after_penalty, pattern_type, ordered_topK_id, top1/2/3_share, sum_spend, spend_entropy, num_nonzero_channels, model_disagreement, pooled_prior, N_subslice, novelty_score, Age_bucket, Cabin_deck, Destination, zero_spend_flag]).
+9. Decisioning & symmetric gating:
+   - If Trusted_subslice and p_final ≥ accept_threshold_trusted → auto‑accept.
+   - Else if n==1 AND pattern_type ∈ {zero_spend, concentrated_topK} AND NOT Trusted_subslice:
+     - Route to priority_audit UNLESS p_final > extreme_accept_threshold AND ensemble agreement > agreement_threshold_accept OR p_final < extreme_reject_threshold AND ensemble agreement > agreement_threshold_reject.
+   - Else standard thresholding with pattern‑aware z_adj.
+10. Persist per‑record provenance and append contradictions to AL queue.
+11. Post‑batch: update slice_trust_table counts (exponential decay), trigger retrains as needed.
+
+Default hyperparameters (initial; sweepable)
+- Pattern detection thresholds as above.
+- min_n_by_pattern: {K1:50 (30–100), K2:30 (20–60), K3:40 (25–60), zero:40 (25–80)}.
+- slice_trust_TP_threshold = 0.70
+- τ_pattern: {K1:100 (40–200), K2:160 (80–320), K3:220 (120–400), zero:180 (100–300)}
+- base_min_se / floors:
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor = {K1:0.07, K2:0.08, K3:0.10}
+  - zero_nontrusted_floor = 0.09
+  - multi_channel_nontrusted_floor = 0.08
+  - extreme_novelty_floor = 0.12
+- δ_logit_pattern = {K1:0.9 (0.6–1.2), K2:0.6 (0.4–0.9), K3:0.5 (0.3–0.8), zero:0.6 (0.4–0.9)}
+- extreme_accept_threshold = {K1:0.995, K2:0.998, K3:0.999, zero:0.995}
+- extreme_reject_threshold = {K1:0.005, K2:0.002, K3:0.001, zero:0.005}
+- ensemble weights start: aggregator 0.45, GLM 0.30, SRM 0.25.
+- base_z = 1.645; γs = {FP_risk:1.0, model_disagreement:0.6, novelty_score:1.0}; λ_trust = 0.35.
+
+Validation experiments & acceptance criteria
+- Test set:
+  - Historical problematic cases: 0084_01, 0086_01, 0092_01, 0097_01, 0098_02 (FN), 0099_01 (FP), and 0099_02 (FN).
+  - Synthetic concentrated_topK and zero_spend × Age_bucket combinations.
+  - Recent live batches in shadow.
+- Metrics:
+  - Per‑pattern precision/recall for zero_spend and concentrated_top1/2/3.
+  - Per‑combo FP/FN for top3 combos.
+  - n==1 FP/FN rates and audit queue size.
+  - Brier score, ECE, CI coverage.
+- Acceptance criteria (relative to v3.5.7 baseline):
+  - concentrated_top3 FP rate: ≥30% relative reduction (target).
+  - zero_spend FN rate: ≥30% relative reduction on historical FN cases (target).
+  - concentrated_top2 FP rate maintain ≥30% reduction.
+  - overall concentrated recall loss ≤2% absolute.
+  - overall FN increase ≤3% absolute.
+  - Audit queue may increase up to 1.5× for 2 weeks; must decline after 4 weeks with AL.
+- Mandatory ablations:
+  - Disable direction‑aware shift → measure concentrated_top3 FP change.
+  - Remove top3/zero covariates in calibrator → measure degradation.
+  - Lower concentrated_nontrusted_floor_K3 → check FP ↑.
+
+Unit test matrix (CI)
+- Case A: concentrated_top3 nontrusted, n==1 (0099_01) → expected: route_to_priority_audit (not auto‑accept).
+- Case B: concentrated_top1 trusted → expected: auto‑accept.
+- Case C: concentrated_top2 untrusted with pooled_prior >0.6 and low ensemble agreement → expected: route_to_priority_audit.
+- Case D: concentrated_top3 trusted with p_final > threshold and ensemble agreement high → expected: auto‑accept.
+- Case E: multi_channel K≥3 but top3_share <0.90 novel → expected: increased SE & audit if n==1.
+- Case F: zero_spend untrusted, age=2 (0099_02) → expected: route_to_priority_audit (not auto‑reject).
+- Case G: previous failing FN case 0098_02 → expected: corrected by direction‑aware/zero adjustments.
+- Case H: dispersed patterns and zero_spend trusted → expected: normal thresholding.
+- Each test verifies logging fields are persisted (applied_logit_shift, pooled_prior, ordered_topK_id, N_subslice, novelty_score, decision_reason).
+
+Immediate operational actions (0–72 hours)
+1. Engineering:
+   - Add ordered_topK combos up to K=3, zero_spend flag and novelty_score to daily rollups & feature store.
+   - Schema change to slice_trust_table for ordered_top3 and zero slices; start day‑zero aggregation.
+2. Scoring engine (shadow/stopgap):
+   - Implement symmetric n==1 gating for all untrusted concentrated_topK and zero_spend; route to priority_audit.
+   - Implement direction‑aware logit_shift for K up to 3 and zero_spend; raise SE floors for K=3 & zero.
+   - Add per‑record provenance logging.
+   - Shadow this scorer over recent batches (include 0099_01 & 0099_02).
+3. ML:
+   - Retrain GLM_fallback + covariate calibrator with top3 and zero_spend features; Grouped CV (2–14 days).
+   - Prepare AL sampling for concentrated_top3 and zero_spend contradictions.
+4. Ops & Monitoring:
+   - Add canary metrics for top3 combos, zero_spend FN rate and n==1 auto_accept/reject rates.
+   - Block full live rollout until acceptance criteria met.
+5. Product & audit:
+   - Update triage to prioritize concentrated_top3 and zero_spend contradictions and provide fast labeling path.
+6. Communication:
+   - Notify ops about temporary audit increase and provide triage instructions.
+
+Expected tradeoffs & mitigations
+- Short‑term audit queue growth — mitigate with prioritized AL labeling and temporary triage capacity.
+- Reduced auto‑coverage for concentrated_topK & zero until subslice counts grow — acceptable to avoid FPs/FNs.
+- Slight increase in latency for some n==1 records routed to audit — mitigated by extreme consensus accept/reject short‑circuit.
+
+How v3.5.8 will handle the two concrete failures (walkthrough)
+- 0099_01 (concentrated_top3 FP):
+  - pattern_type detected as concentrated_top3; ordered_top3 subslice not Trusted; pooled_prior computed; direction‑aware logit_shift is damped by novelty_scale; se inflated (K3 floor 0.10).
+  - Because n==1 and NOT Trusted, symmetric gating routes to priority_audit (unless p_final > 0.999 & agreement > 0.98 — unlikely).
+  - Outcome: prevents confident auto‑accept FP; AL labeling allows trust accumulation.
+- 0099_02 (zero_spend FN):
+  - pattern_type = zero_spend; check ordered_zero_key × Age_bucket; likely NOT Trusted.
+  - Symmetric gating forces priority_audit rather than auto‑reject. Calibrator retrain includes zero_spend×Age interactions so future similar records will be better calibrated.
+  - Outcome: prevents confident auto‑reject FN and collects labels to update slice_trust_table.
+
+Deliverables (next artifacts)
+- Deterministic scorer skeleton implementing expanded pattern detection + symmetric gating + direction‑aware shifts + expanded logging (recommended first).
+- Minimal CI test suite (includes 0098_02, 0099_01, 0099_02).
+- topK_subslice aggregation script + extended slice_trust_table schema.
+- GLM_fallback v15 + covariate calibrator retrain plan & validation report.
+- Dashboards & canary config for top3 & zero_spend FP/FN.
+- AL sampling plan for concentrated_top3 and zero_spend contradictions.
+Recommendation on next deliverable
+- Priority: produce the deterministic scorer skeleton + minimal CI tests first (allows shadow deployment and immediate symmetric gating).
+- Secondary: topK_subslice aggregation script and slice_trust_table updates to accelerate trust accumulation.
+
+One‑line summary
+v3.5.8: enforce symmetric n==1 gating for untrusted concentrated_topK and zero_spend, add triple‑combo & zero_spend semantics to calibrator and slice_trust_table, apply direction‑aware logit shifts and higher SE floors for K>=3/zero, expose ordered_topK & novelty to feature store, and prioritize AL — preventing both confident FPs (0099_01) and FNs (0099_02) while preserving batch consistency.
+
+If you want, I will:
+- produce the deterministic scorer skeleton + minimal CI test suite (recommended), or
+- produce the topK_subslice aggregation script + updated slice_trust_table schema.
+
+Which should I prepare first?
+
+============================================================

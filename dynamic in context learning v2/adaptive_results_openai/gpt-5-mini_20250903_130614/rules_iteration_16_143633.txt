@@ -1,0 +1,85 @@
+PREDICTIVE RULES - ITERATION 16
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. Data preparation (always apply first): compute total_onboard_spend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck (treat NaN as 0); compute food_spend = RoomService + FoodCourt (NaN→0); extract Cabin components (deck/number/side) and count cabin mates; treat missing categorical values as unknown.
+
+2. CryoSleep strong negative (contradiction): If CryoSleep == True AND total_onboard_spend > 0 then Predict Transported = False (passenger is recorded as asleep but shows onboard activity).
+
+3. CryoSleep zero‑spend robust rule (contextual positive, conservative):
+   a) If CryoSleep == True AND total_onboard_spend == 0 AND any cabin mate has total_onboard_spend > 0 then Predict Transported = False (contradictory cabin evidence).
+   b) Otherwise compute cabin_cryo_consensus = fraction of same‑cabin passengers with CryoSleep == True AND total_onboard_spend == 0. Treat consensus >= 0.5 as strong group evidence.
+   c) For CryoSleep == True AND total_onboard_spend == 0, Predict Transported = True only if at least one STRONG supporting condition holds: HomePlanet in {"Europa","Mars"} OR Destination in {"55 Cancri e","PSO J318.5-22"} OR Age <= 2 OR Age >= 70 OR VIP == True OR cabin_cryo_consensus >= 0.5. Otherwise Predict Transported = False.
+
+4. Destination usage policy: Do NOT treat any Destination as an automatic negative. Use Destination only as a weak/moderate supporting signal (55 Cancri e and PSO J318.5-22 are moderate supports for CryoSleep zero‑spend), do NOT count TRAPPIST-1e alone as sufficient support for CryoSleep zero‑spend — require one of the STRONG supports or cabin consensus as in rule 3c.
+
+5. VR strong negatives (refined): If VRDeck >= 4000 then Predict Transported = False (very high VR indicates non‑transport). Also if VRDeck >= 2000 AND VRDeck >= 0.6 * total_onboard_spend then Predict Transported = False (VR dominated spending).
+
+6. VR dominance guard (adult protection): For adults age 18–54, do not flip a VR strong negative to True based only on small non‑zero spending elsewhere; require a separate strong positive (multi‑category high spend or age/CryoSleep support) to override.
+
+7. Spending composition positives (tightened):
+   a) If any single amenity (RoomService, FoodCourt, ShoppingMall, Spa) >= 2000 then Predict Transported = True (large single‑category commitment).
+   b) Else if at least two of the five amenities (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) are each >= 700 (cross‑category engagement) then Predict Transported = True.
+   c) Else if (FoodCourt + ShoppingMall) >= 2000 then Predict Transported = True.
+   (Do NOT use (FoodCourt + ShoppingMall) >= 500 as a positive trigger.)
+
+8. Extreme multi‑category spending positive (safe‑guard): If total_onboard_spend >= 10000 AND no single category accounts for > 70% of total_onboard_spend (i.e., not dominated by VR/Spa/RoomService) then Predict Transported = True.
+
+9. Spending-composition negatives:
+   a) If food_spend >= 3000 AND HomePlanet == "Earth" AND VRDeck < 2000 then Predict Transported = False (Earth high food pattern often non‑transport).
+   b) If Spa >= 0.6 * total_onboard_spend AND Spa >= 1000 then Predict Transported = False (spa‑dominated stay‑in‑cabin pattern).
+   c) If RoomService >= 0.6 * total_onboard_spend AND RoomService >= 2000 then Predict Transported = False (in‑room consumption dominance).
+
+10. Single‑category dominance exceptions: If a single category is dominant but VR is not dominant and the category is extremely large (>= 4000) allow consideration as positive only if accompanied by another supportive signal (CryoSleep zero‑spend consensus, age extreme, or VIP).
+
+11. Age stratified rules:
+   a) Infants/toddlers: If Age <= 2 then Predict Transported = True (strong positive).
+   b) Children/teens (3 <= Age <= 17): Do NOT auto‑predict True; predict True only when an adult cabin mate (>=18) is predicted True by a STRONG positive (CryoSleep zero‑spend with support, age extreme, or spending rules 7/8) OR cabin majority supports True (see rule 12).
+   c) Adults (18–54): require spending/cryosleep/other positives to move to True; protect strong negatives using rule 6.
+   d) Older adults: If Age >= 70 then Predict Transported = True. If 55 <= Age < 70 then predict True only if accompanied by at least one of: total_onboard_spend >= 2000 OR CryoSleep == True with supporting context OR VIP == True.
+
+12. Child/guardian propagation (conservative): For 3 <= Age <= 17, only propagate transport status from adults when the adult(s) are classified by STRONG True signals (see rule 13). Do not let a single weak spending signal in an adult force child True.
+
+13. Define "STRONG True" and "STRONG False" signals (used for cabin propagation and child propagation):
+   a) STRONG True: CryoSleep == True AND total_onboard_spend == 0 with support per rule 3c OR Age <= 2 OR Age >= 70 OR any amenity >= 2000 OR at least two amenities >= 700 OR total_onboard_spend >= 10000 and not single‑category dominated.
+   b) STRONG False: VRDeck >= 4000 OR VR dominance (VRDeck >= 2000 AND VRDeck >= 0.6 * total) OR Spa/RoomService dominance per rule 9 OR CryoSleep contradiction (CryoSleep True while cabin mates have non‑zero spend).
+
+14. Cabin‑level consistency and propagation (safe majority):
+   a) Compute individual labels and mark STRONG True/False.
+   b) For passengers sharing the same Cabin:
+      - If >= 50% of cabin mates are STRONG True then set entire cabin Transported = True.
+      - Else if >= 50% of cabin mates are STRONG False then set entire cabin Transported = False.
+      - Else if ALL cabin mates have CryoSleep == True AND total_onboard_spend == 0 then set entire cabin Transported = True.
+      - Otherwise keep individual predictions (no automatic whole‑cabin flipping for single‑mate signals).
+
+15. Mixed‑signal resolution priority (when rules conflict, apply in this order):
+   (1) VR STRONG FALSEs (rule 5 & 13b),
+   (2) CryoSleep contradictions (rule 2 and 3a / 13b),
+   (3) CryoSleep zero‑spend supported TRUE (rule 3c / 13a),
+   (4) Age extremes (rule 11a and 11d),
+   (5) Cross‑category spending TRUE (rule 7),
+   (6) Single‑category very large TRUE (rule 7a & 8),
+   (7) Spa / RoomService dominance FALSE (rule 9b/9c),
+   (8) VIP modifier (rule 11d and rule 16),
+   (9) Destination weak support as tiebreaker (rule 4).
+
+16. VIP modifier (not a free pass): VIP == True increases prior for True but cannot override STRONG FALSEs. Concretely, predict True for VIP only when VIP is accompanied by at least one STRONG True (rule 13a) and not in conflict with a STRONG False (rule 13b).
+
+17. HomePlanet priors and interactions:
+   a) HomePlanet in {"Mars","Europa"} increases weight for CryoSleep zero‑spend TRUE and for small/infant transport signals (implemented in rule 3c and rule 11).
+   b) HomePlanet == "Earth" increases scrutiny of high FoodCourt (food_spend) patterns — apply rule 9a.
+
+18. Missing or ambiguous data handling:
+   a) Treat NaN spending values as 0.
+   b) If Age is missing, prefer cabin majority/consensus (rule 14) and strong spend/CryoSleep signals.
+   c) If HomePlanet is missing, weight Destination + spending composition more heavily.
+   d) If Cabin is missing, rely only on high‑confidence individual signals (VR strong negatives, CryoSleep zero‑spend supported True, Age <=2 or >=70, or any amenity >=2000).
+
+19. Guard against flipping on isolated small spends: For adults 18–54, do not change a STRONG FALSE to True solely due to small isolated non‑zero spending (<700 in a category and no cross‑category support); require crossing the thresholds in rules 7 or 8 or cabin majority/STRONG True evidence.
+
+20. Final fallback: If after applying all above rules no decisive label is produced or cabin‑level resolution is tied/ambiguous, Predict Transported = False.
+
+21. Implementation note (operational): Always compute individual labels first using rules 2–11 and STRONG definitions, then apply cabin propagation (rule 14), then final conflict resolution via priority order (rule 15).
+
+============================================================

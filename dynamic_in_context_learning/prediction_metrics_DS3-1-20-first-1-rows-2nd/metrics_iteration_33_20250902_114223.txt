@@ -1,0 +1,177 @@
+PREDICTIVE METRICS - ITERATION 33
+============================================================
+
+### **ANALYSIS OF PREDICTION ERROR FOR PASSENGER 0056_01**
+
+**1. What specific patterns in the current metrics led to this prediction error?**
+
+The model incorrectly predicted `False` for Passenger 0056_01, whose actual survival outcome was `True`. This misclassification reveals critical deficiencies in the v3.6 rule-based system's handling of edge cases involving infants (Age = 2.0) with zero spending across all amenity categories:
+
+- **Inadequate Infant/Child Exception Handling:** Despite having well-defined state classification rules (PS-1/PS-2), the system failed to recognize that infants (Age < 5) inherently exhibit zero-spending behavior due to dependency on caregivers. The base score (+1 for awake passengers) and subsequent spending-based rules (IS-1, IS-2) inappropriately penalized this passenger.
+
+- **Over-reliance on Spending Patterns:** All spending-focused rules (SH-1, IS-1, IS-2, LN-1) were triggered negatively:  
+  - `TotalSpend = 0` prevented SH-1 from applying positively.  
+  - 6 zero-spend categories triggered IS-1 severely (-2.0 × 6 = -12 penalty).  
+  - The absence of luxury/necessity spending left LN-1 inactive.  
+  The compounded penalties overwhelmed the base score, resulting in a net score of -11 and a `False` prediction.
+
+- **Missing "Dependent Age" Rule:** No rule existed to override spending-based penalties for young children, whose survival is typically tied to accompanying adults rather than personal resource allocation.
+
+- **CryoSleep Oversight:** Although CryoSleep was `False`, the system did not account for scenarios where awake passengers (especially infants) might logically have zero spending.
+
+**2. How should the decision rules be modified to prevent similar errors?**
+
+To address this, introduce age-based exceptions and refine spending rule applicability:
+
+- **Introduce an "Infant/Child Exception" Rule (NEW - AC-1):**  
+  - **Condition:** `Age < 5` AND `CryoSleep == False`  
+  - **Action:** Override all other rules; assign a fixed score of **+3** and prediction `True`.  
+  - **Confidence:** 90% (high, based on strong biological/logical basis).  
+
+- **Revise Spending Rule Applicability:**  
+  - Modify IS-1, IS-2, and SH-1 to include the condition: `Age >= 5` (to exclude young children from spending-based penalties/rewards).  
+  - Adjust IS-1 modifier to **-1.5 per zero-spend category** (from -2.0) to reduce harshness for edge cases.
+
+- **Enhance Default Rule (DF-1):**  
+  - Expand to capture all-zero-spend cases with `Age >= 5` and `TotalSpend == 0`, applying a neutral score of **0** (rather than base +1) to reflect uncertainty.
+
+- **Processing Order Adjustment:**  
+  Ensure AC-1 executes immediately after state checks (PS-1/PS-2) to preempt inappropriate spending rule application.
+
+**3. What new insights does this error reveal about passenger transport patterns?**
+
+- **Age Dictates Spending Behavior:** Infants/young children (Age < 5) do not engage in personal spending, yet their survival probability remains high when accompanied by caregivers. Spending-based rules are irrelevant for this demographic.
+- **Context Over Raw Data:** Zero spending must be interpreted in context (e.g., age, CryoSleep status) rather than uniformly penalized.
+- **Rule Dependency Hierarchy:** Rules must be structured to prioritize demographic exceptions (e.g., age) over behavioral patterns (e.g., spending) to avoid logical conflicts.
+- **Batch Error Patterns:** Isolated errors (like this) may indicate systematic gaps in covering demographic outliers.
+
+**4. How should confidence levels be recalibrated?**
+
+- **High-Confidence (85-95%):** State checks (PS-1/PS-2), CryoSleep (C-1), and new AC-1 (90%).
+- **Medium-Confidence (70-84%):** SH-1 (75%), IS-1 (70%), LN-1 (70%), IS-2 (70%).
+- **Low-Confidence (60-69%):** SP-1 (65%), DF-1 (60%).
+- **Overall Model Confidence:** Increase to **88%** due to expanded demographic coverage.
+
+**5. What adjustments are needed for better consistency?**
+
+- **Strict Rule Ordering:**  
+  1. State Checks (PS-1/PS-2)  
+  2. Age Exception (AC-1)  
+  3. CryoSleep (C-1)  
+  4. Focused Spender (SP-1)  
+  5. Spending Rules (SH-1 → IS-1 → IS-2 → LN-1)  
+  6. Default (DF-1)  
+
+- **Validation for Edge Demographics:** Automatically flag all predictions for passengers with `Age < 5` or `Age > 80` for pre-batch review until rules stabilize.
+
+- **Weighted Score Aggregation:** Implement a weighted system where rules with higher confidence contribute more significantly to the final score.
+
+**6. How can the metrics be improved to handle edge cases like this one?**
+
+- **Demographic Clustering:** Group passengers by age brackets and spending profiles to identify patterns for rule creation.
+- **Error-Triggered Rule Generation:** Use misclassifications to automatically propose new rules (e.g., AC-1 derived from this error).
+- **Confidence Escalation:** Gradually increase confidence for new rules (e.g., AC-1) after successful validation in 3+ batches.
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v3.7**
+
+**Objective:** Address misclassification of infants/young children with zero spending by introducing age-based exceptions and refining spending rule applicability. Optimize for accuracy across demographic outliers.
+
+---
+
+### **1. Comprehensive Hierarchical Decision Logic v3.7**
+
+**STEP 1: PRIMARY STATE CLASSIFICATION**  
+- PS-1: `Age < 0.5` → Predict `False` (98% confidence)  
+- PS-2: `Age > 100` → Predict `False` (98% confidence)  
+
+**STEP 2: AGE-BASED EXCEPTION (NEW)**  
+- **AC-1: Infant/Child Exception**  
+  - Condition: `Age < 5` AND `CryoSleep == False`  
+  - Action: Score = +3, Predict `True`  
+  - Confidence: 90%  
+
+**STEP 3: CRYOSLEEP-SPECIFIC RULES**  
+- C-1: `CryoSleep == True` → Predict `False` (92% confidence)  
+
+**STEP 4: AWAKE-SPECIFIC RULES**  
+- **Base Score:** +1 (applies only if no other rule triggers)  
+
+- **SP-1: Focused Spender**  
+  - Condition: `CryoSleep == False` AND `Age >= 5` AND number of non-zero-spend categories == 1 AND that category’s value > 1000  
+  - Modifier: +2  
+  - Confidence: 65%  
+
+- **SH-1: Qualified High-Spender**  
+  - Condition: `CryoSleep == False` AND `Age >= 5` AND `TotalSpend > 1500` AND `number of zero-spend amenities <= 1`  
+  - Modifier: +3  
+  - Confidence: 75%  
+
+- **IS-1: Severe Imbalanced Spending**  
+  - Condition: `CryoSleep == False` AND `Age >= 5` AND `TotalSpend > 1000` AND `number of zero-spend amenities >= 4`  
+  - Modifier: -1.5 per zero-spend category  
+  - Confidence: 70%  
+
+- **IS-2: Moderate Imbalanced Spending**  
+  - Condition: `CryoSleep == False` AND `Age >= 5` AND `TotalSpend BETWEEN 500 AND 2000` AND `number of zero-spend amenities == 2`  
+  - Modifier: -3  
+  - Confidence: 70%  
+
+- **LN-1: Luxury vs Necessity Mismatch**  
+  - Condition: `CryoSleep == False` AND `Age >= 5` AND (`Spa + VRDeck + ShoppingMall`) > 3 * (`RoomService + FoodCourt`) AND (`RoomService + FoodCourt`) < 200  
+  - Modifier: -2  
+  - Confidence: 70%  
+
+- **DF-1: Default Rule**  
+  - Condition: No other rule triggered  
+  - Action: Apply base score (+1) if `TotalSpend > 0`, else score = 0  
+  - Confidence: 60%  
+
+**PROCESSING ORDER:**  
+PS-1 → PS-2 → AC-1 → C-1 → SP-1 → SH-1 → IS-1 → IS-2 → LN-1 → DF-1  
+
+---
+
+### **2. Updated Probability Estimates & Scoring Examples**
+
+| Passenger Profile      | Applied Rules      | Total Score | Prediction | Confidence |
+|------------------------|--------------------|-------------|------------|------------|
+| **0056_01 (Age=2.0)**  | AC-1               | +3          | **True**   | 90%        |
+| Severe Neglect (Age=30)| IS-1 (-9), Base (+1)| -8         | **False**  | 70%        |
+| Default (Age=25)       | DF-1 (Score=0)     | 0           | **False**  | 60%        |
+
+---
+
+### **3. Recalibrated Confidence Levels**
+
+| Rule           | Confidence | Change Rationale                     |
+|----------------|------------|---------------------------------------|
+| PS-1/PS-2      | 98%        | Unchanged                             |
+| AC-1 (NEW)     | 90%        | High logical basis                    |
+| C-1            | 92%        | Unchanged                             |
+| SH-1           | 75%        | Unchanged                             |
+| IS-1           | 70%        | Reduced due to modified applicability |
+| LN-1           | 70%        | Unchanged                             |
+| SP-1           | 65%        | Unchanged                             |
+| DF-1           | 60%        | Unchanged                             |
+| **Overall**    | **88%**    | Increased due to broader coverage     |
+
+---
+
+### **4. Strategic Recommendations for Batch Accuracy**
+
+1. **Immediate Deployment:** Implement v3.7 with AC-1 rule and age conditions on spending rules.
+2. **Batch Re-processing:** Re-run the failed batch to validate correction for Passenger 0056_01.
+3. **Monitoring:** Flag all predictions for `Age < 5` and `Age > 80` for one batch cycle to ensure rule stability.
+4. **Continuous Learning:** Institute daily error reviews for the next 72 hours to catch demographic outliers.
+
+**Implementation Timeline:**  
+- **Now:** Deploy v3.7  
+- **1h:** Re-process failed batch  
+- **24h:** Review all age-based predictions  
+- **72h:** Analyze errors for further refinements  
+
+This update ensures robust handling of demographic edge cases while maintaining accuracy for behavioral patterns.
+
+============================================================

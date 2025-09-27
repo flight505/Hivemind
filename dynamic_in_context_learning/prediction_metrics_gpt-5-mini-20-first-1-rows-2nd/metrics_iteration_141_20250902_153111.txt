@@ -1,0 +1,313 @@
+PREDICTIVE METRICS - ITERATION 141
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+
+- What happened (short):
+  - New brittle false negative surfaced in a 1‑record batch: Passenger 0182_01 (Age=24, CryoSleep=True, all channel spends = 0). Model predicted Transported=False but actual=True.
+  - Root causes (summary):
+    - Over‑reliance on all_zero spend signal as a negative predictor;
+    - Missing / under‑weighted interaction: CryoSleep × all_zero (and similar cohort/cabin priors);
+    - Calibrator and variance model under‑estimated uncertainty for the rare slice (all_zero × CryoSleep=True) and for n==1 batches;
+    - Decision gating allowed n==1 auto‑decisions for a fragile slice.
+  - Net pattern after adding this error: brittle negatives appear whenever all spends = 0 are combined with slice signals the model hadn’t learned properly (infant, CryoSleep, certain HomePlanet/Cabin cohorts). Earlier flagged brittle positives (dominant single‑channel spends) remain an orthogonal issue. Both need slice‑aware variance inflation and gating.
+
+- Immediate priority (0–6h):
+  - Emergency gating: block auto‑decisions for any n==1 record that matches an expanded fragile definition (include: all_zero & (Age ≤ AGE_INFANT_THRESHOLD OR CryoSleep=True OR per_channel_imputed_flag OR missingness_count ≥ 2); plus existing dominance/high‑spend fragiles). Route to priority_audit/canary.
+  - Add 0182_01 (and other canaries) to canary list and route them for priority_audit.
+  - Persist raw inputs, winsorized transforms, per‑feature logits, cohort/family prior snapshots and imputation provenance for canaries immediately.
+  - Expose per‑component variance and se in scorer outputs to debug calibrator/uncertainty quickly.
+  - Require GLM_fallback or ensemble corroboration for auto‑decisions on records with fragile flags in n==1 batches.
+
+Concise answers to the six required questions (batch accuracy focus)
+
+1) What specific patterns caused this error?
+- all_zero spend was treated as a strong negative signal across the board. The model under‑weighted slice interactions where all_zero is not strongly negative (here CryoSleep=True, plus possible cabin/cohort signals) and therefore predicted False; calibrator/SE underestimated uncertainty for that rare slice; gating allowed an n==1 auto decision without corroboration.
+
+2) How should decision rules be modified to prevent recurrence?
+- Treat all_zero × CryoSleep (and all_zero × Age_small) as fragile slices. For n==1 records matching fragile flags require either (a) pooled_prior strength and GLM_fallback agreement and ensemble agreement and low se, or (b) route to priority_audit. Add batch_frac_fragile hold. Expand canary list.
+
+3) What new insights about transport patterns?
+- Absence of spend is not uniformly indicative of not being transported. CryoSleep interacts with spend: CryoSleep=True + spends=0 may actually increase transport probability in some cohorts. Cohort/cabin/family priors and CryoSleep status are strong contextual modifiers of spend signals.
+
+4) How should confidence levels be recalibrated?
+- Calibrator must be heteroskedastic and slice‑aware. Inflate variance for:
+  - all_zero × CryoSleep,
+  - all_zero × Age_under5,
+  - top1_dominance / top1_outlier slices,
+  - small‑N slices and n==1 batches,
+  - imputed fields / high novelty slices.
+- Enforce higher se_floor for n==1 fragile cases (start 0.40–0.60).
+
+5) What adjustments for batch consistency?
+- Use cohort (family_name / cabin_id) as decision units: conflicting predictions within a cohort should hold the cohort. Add batch_frac_fragile gating to hold auto‑decisions when fragile fraction is high. Treat n==1 specially.
+
+6) How can metrics be improved to handle edge cases?
+- Add slice KPIs including cryo_all_zero_FN_rate, age_under5_all_zero_FN_rate, top1_dominance_FP_rate, n==1_fragile_auto_accept_rate, cohort_contradiction_rate. Expand pooled priors to include CryoSleep × all_zero slices and stratify by cabin/family.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Immediate emergency actions (0–6h)
+- Emergency gating rule (deploy as a hotfix):
+  - If n_batch == 1 and fragile_flag_v5 == True then block auto‑decision unless strict corroboration. Fragile_flag_v5 includes:
+    - all_zero_flag AND (Age ≤ AGE_INFANT_THRESHOLD OR CryoSleep == True)
+    - top1_spend ≥ TOP1_SPEND_GATE AND top1_share ≥ TOP1_DOMINANCE_THRESHOLD
+    - sum_spend ≥ SUM_SPEND_HIGH
+    - num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD
+    - any per_channel_imputed_flag OR missingness_count ≥ 2
+  - Route blocked records to priority_audit/canary.
+- Add canaries now: 0179_03, 0181_01, 0182_01, plus existing canaries.
+- Persist extra provenance fields immediately: raw per_channel spends + imputation flags, winsorized transforms, per_feature_logit_contributions, pooled_prior_snapshot_id, cohort_id, family_group_size, top1_share, dominance_score, cap_trigger_flags.
+- Expose variance components in scoring output (var_age_small, var_all_zero, var_cryo_allzero, var_top1_share, var_combined, se_combined).
+
+B. Feature engineering updates (v→v+1)
+- Persist raw inputs (value + imputed_flag + method + source_date): RoomService, FoodCourt, ShoppingMall, Spa, VRDeck, Age, Cabin, Name, HomePlanet, CryoSleep, VIP.
+- New / persisted flags and derived features:
+  - all_zero_flag = sum_spend == 0
+  - cryo_flag = CryoSleep == True
+  - cryo_allzero_flag = cryo_flag AND all_zero_flag
+  - age_bucket: infant, toddler, child, teen, adult
+  - age_x_allzero interaction; cryo_x_allzero interaction
+  - family_name, family_group_size, cabin_group_size
+  - cohort_transport_rate per family_name / cabin_id
+  - top1_channel, top1_spend, top1_share, top1_dominance_flag
+  - per_channel_imputed_flags, missingness_count
+  - outlier_score (Mahalanobis / LOF / isolation forest) relative to spend clusters
+  - dominance_sign_consistency_score across cohort members
+- Transform rules:
+  - Winsorize spends then log1p.
+  - Compute top1_share after winsorization.
+  - Use saturating transforms for sum_spend and top1_spend to limit tail influence.
+- Rationale:
+  - cryo_allzero, and age_allzero capture slices where absence of spend has different semantics; cohort priors and cryo status will modify the spend interpretation.
+
+C. Pooled priors — expanded stratification
+- Stratify priors by: Age_bucket × all_zero_flag, CryoSleep × all_zero_flag (new), sum_spend_bucket, top1_channel × top1_share_bucket, family_group_size_bucket, HomePlanet.
+- New pseudo‑counts (starting, sweepable):
+  - N0_cryo_allzero = 300
+  - N0_child_allzero = 800
+  - N0_top1_share = 1200
+  - N0_top1 = 1000
+- Blending:
+  - τ_slice = N_slice/(N_slice + N0_slice); μ_blend = τ_slice*μ_slice + (1−τ_slice)*μ_global
+- Persist pooled_prior_snapshot_id in outputs for debugging and gating.
+
+D. Per‑feature logit caps, winsorization & directionality handling
+- Winsorize spends (GLOBAL_SPEND_UPPER) then compute transforms.
+- Apply per‑feature and aggregate logit caps to avoid a single feature dominating final logit. Start caps:
+  - CAP_PER_FEATURE_LOGIT(spend) = 1.2
+  - CAP_TOP1_SPEND_LOGIT = 1.5
+  - CAP_TOP1_SHARE_LOGIT = 1.0
+  - CAP_SUM_SPEND_LOGIT = 2.0
+  - CAP_TOTAL_SPEND_LOGIT = 2.5
+- Special handling:
+  - Explicit learnable coefficients for age_x_allzero and cryo_x_allzero interactions; cap their contributions (±1.2).
+  - If cryo_allzero_flag is true, do not allow all_zero to force a strong negative logit without cohort/pool corroboration; apply a downweight to global all_zero negative coefficient and add cohort prior / cryo interaction weight.
+- Rationale:
+  - Prevent an all_zero signal from unilaterally dominating score in rare slices; let cohort / CryoSleep modify outcomes.
+
+E. Variance / SE model (add cryo_allzero term)
+- New variance components:
+  - var_age_small = κ_age_small * indicator(age_bucket in {infant,toddler})/sqrt(max(N_slice_age_bucket,1))
+  - var_all_zero = κ_all_zero * all_zero_flag
+  - var_cryo_allzero = κ_cryo_allzero * cryo_allzero_flag
+  - var_age_allzero_interaction = κ_age_allzero * age_x_allzero
+  - var_top1_share = κ_top1_share * max(0, top1_share − 0.5)
+  - var_top1_outlier = κ_top1 * indicator(top1_spend ≥ TOP1_SPEND_OUTLIER)
+  - var_imputation = κ_imputation * any_imputed_flag
+- Combine:
+  - var_combined = var_base + var_age_small + var_all_zero + var_cryo_allzero + var_age_allzero_interaction + var_top1_share + var_top1_outlier + var_imputation + ...
+  - se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- Starting κ (conservative; sweepable):
+  - κ_age_small = 0.25; κ_all_zero = 0.20; κ_cryo_allzero = 0.30; κ_age_allzero = 0.30
+  - κ_top1 = 0.28; κ_top1_share = 0.22; κ_multi = 0.18; κ_total = 0.12; κ_novel = 0.14; κ_imputation = 0.10
+- SE floors:
+  - n==1 & fragile (cryo_allzero OR all_zero+age_under5 OR top1_dominance OR top1_outlier OR high_total_spend OR any_imputed_flag): se_floor = 0.40–0.60 (start 0.50 for cryo_allzero)
+  - stable slices: se_floor = 0.06–0.10
+
+F. Decision‑gating (pattern‑aware + batch/cohort aware)
+- Fragile_flag_v5 =
+  - cryo_allzero_flag OR
+  - (all_zero_flag AND age_under5_flag) OR
+  - top1_outlier_flag OR
+  - high_total_spend_flag OR
+  - multi_high_flag OR
+  - top1_dominance_flag OR
+  - any per_channel_imputed_flag OR missingness_count ≥ 2 OR
+  - dominance_sign_consistency_score < DOMINANCE_CONSISTENCY_THRESHOLD
+- Batch/cohort checks:
+  - batch_frac_fragile = (#fragile_records_in_batch)/batch_size
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 0.05): hold auto‑decisions for the batch and route to audit.
+  - If cohort/family present and conflicting predictions exist within cohort: hold whole cohort.
+- n==1 gating for fragile_flag:
+  - If fragile_flag and n_batch==1, require ALL:
+    - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice
+    - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice)
+    - ensemble_agreement ≥ A_high
+    - se_combined ≤ SE_accept_slice AND quantile_width ≤ QW_accept_slice
+  - Otherwise route to priority_audit.
+- Example thresholds (sweepable):
+  - AGE_INFANT_THRESHOLD = 5
+  - TOP1_DOMINANCE_THRESHOLD = 0.6
+  - TOP1_SPEND_GATE = 250
+  - SUM_SPEND_HIGH = 500
+  - MULTI_HIGH_THRESHOLD = 2
+  - BATCH_FRAGILE_THRESHOLD = 0.05
+  - N0_cryo_allzero = 300
+  - N_min_cryo_allzero = 100
+  - Z_high_slice = 0.95; A_high = 0.995
+  - SE_accept_cryo_slice = 0.12; se_floor_n1_cryo = 0.50
+  - δ_slice (fragile) = 0.05; ensemble_agreement threshold A_high = 0.995
+
+G. Calibrator & GLM_fallback retrain plan (cryo_allzero focused)
+- Calibrator:
+  - Use heteroskedastic calibrator with quantile heads (p10/p50/p90) + variance net.
+  - Inputs must include cryo_flag, cryo_allzero_flag, age_bucket, age_x_allzero, top1 features, family_group_size, cohort_transport_rate, per_channel_imputed_flags, outlier_score and novelty_distance.
+  - Loss: quantile pinball + ECE penalty + Brier; strongly upweight fragile slices:
+    - cryo_allzero ×12, age_under5×all_zero ×12, top1_dominance ×12, top1_outlier ×10, multi_high ×8.
+- GLM_fallback:
+  - ElasticNet logistic with explicit interactions:
+    - cryo_flag × all_zero, age_bucket × all_zero, top1_channel × top1_share, family_transport_rate × cryo_flag.
+  - GLM_fallback_agrees if |p_model − p_glm| ≤ δ; initial δ=0.05 for fragile slices.
+- Training:
+  - Rolling window 18–36 months; targeted upsampling of cryo_allzero and age_under5×all_zero in training and CV folds.
+  - Shadow run: 14–28 days with gating active and canaries blocked from auto‑accept.
+- Acceptance criteria (targets):
+  - cryo_allzero_FN_rate ↓ ≥ 40–60%
+  - age_under5_all_zero_FN_rate ↓ ≥ 40–60%
+  - top1_dominance_FP_rate ↓ ≥ 40%
+  - cohort contradiction rate ↓ ≥ 50%
+  - global ECE not worse by >0.5% absolute
+
+H. Monitoring, metrics & alerts (batch‑focused)
+- Slice KPIs (near‑real time):
+  - cryo_all_zero_FN_rate (by family/cabin buckets)
+  - age_under5_FN_rate, all_zero_FN_rate
+  - top1_share_FP_rate and top1_dominance_FP_rate
+  - n==1_auto_accept_rate, n==1_fragile_auto_accept_rate
+  - cohort_contradiction_rate
+- Batch KPIs:
+  - Batch_auto_decision_rate, Batch_frac_fragile, Batch_provenance_consistency_rate
+- Alerts:
+  - Any canary auto_accepted → immediate ML/Ops page
+  - cryo_all_zero_FN_rate increase > baseline + X% over 24h → page
+  - top1_dominance_FP_rate increase > baseline + X% over 24h → page
+  - batch_frac_fragile ≥ threshold → hold auto_decisions & notify
+  - cohort contradiction autocase → page
+- Dashboards:
+  - Per‑record provenance view for canaries and recent fragile auto‑decisions including raw vs winsorized, per_feature_logits, pooled_prior_snapshot.
+
+I. CI unit tests & validation (cover cryo_allzero, age_under5_all_zero, top1_dominance, top1_outlier)
+- Unit tests:
+  - Correct computation of cryo_allzero_flag, top1_share, top1_dominance_flag, all_zero_flag, age_bucket, and interactions.
+  - se_combined increases for cryo_allzero & high top1_share & novelty_flag.
+  - Calibrator widens p10/p90 for cryo_allzero and top1_dominance records.
+  - Pooled_prior blending prevents tiny N slices from dominating.
+  - Per_feature & total logit caps enforced.
+  - batch_frac_fragile ≥ threshold disables auto‑decisions.
+  - cohort contradiction detection holds cohort.
+  - Canaries (including 0182_01) must not be auto‑accepted during gating tests.
+- Regression tests:
+  - Global ECE, AUC, Brier degrade less than tolerance when gating enabled.
+  - Integration tests validate end‑to‑end persistence of imputation provenance and per_feature_logit contributions.
+
+J. Operational actions (0–72 hours) — precise timeline
+1) Immediate (0–6h)
+   - Deploy emergency gating patch blocking auto‑decisions for any n==1 record matching:
+       - (all_zero_flag AND (Age ≤ 5 OR CryoSleep == True)) OR
+       - (top1_spend ≥ TOP1_SPEND_GATE AND top1_share ≥ TOP1_DOMINANCE_THRESHOLD) OR
+       - sum_spend ≥ SUM_SPEND_HIGH OR
+       - num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD OR
+       - any per_channel_imputed_flag OR missingness_count ≥ 2
+     Route these to priority_audit. Add 0179_03, 0181_01, 0182_01 (and previous canaries) to canary list.
+   - Persist provenance and expose variance/SE components in outputs.
+2) Short‑term (6–24h)
+   - Implement new features: cryo_allzero_flag, cryo_x_allzero, cohort_transport_rate, family_group aggregates and retrain lightweight GLM_fallback on winsorized inputs.
+   - Implement batch‑level hold if batch_frac_fragile ≥ 5% and cohort contradiction detection.
+   - Instrument dashboards & alerts for cryo_all_zero_FN_rate, top1_share_FP_rate, age_under5_FN_rate.
+   - Start targeted label collection and active learning for cryo_allzero and age_under5_all_zero records.
+3) Mid‑term (24–72h)
+   - Retrain calibrator & GLM_fallback with updated inputs and upweight schedule; run 14–28 day shadow‑run with gating active.
+   - Publish pooled‑prior snapshots for cryo_allzero and related slices.
+   - Run CI/regression tests; tune winsorization cap, cryo thresholds & se_kappa values based on shadow diagnostics.
+
+K. Per‑record provenance to log (required & extended)
+- Raw per‑channel and imputation provenance: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck (value + imputed_flag + imputation_method + source_date).
+- Cryo & name: CryoSleep, Age, Age_bucket, family_name, family_group_size, cabin_id, cabin_group_size.
+- Transforms & flags: winsorized_spend[channel], winsorized_sum_spend, log1p_transforms, is_winsorized_flag, all_zero_flag, cryo_allzero_flag, age_x_allzero, top1_channel, top1_spend, top1_share, top1_share_bucket, top1_dominance_flag.
+- Aggregates & dominance: sum_spend, top1_outlier_flag, dominance_sign_consistency_score.
+- Novelty & anomaly: outlier_score, novelty_distance_norm, spend_cluster_id.
+- Model internals: per_feature_logit_contributions (map), per_feature_logit_caps_triggered, pooled_prior_snapshot_id, μ_slice, τ_slice_blend.
+- Variances: var_age_small, var_all_zero, var_cryo_allzero, var_top1_share, var_top1_outlier, var_multi_spend, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, p_final_sd, quantile_width, gating_reasons, routing_decision, scorer_version, calibrator_version, provenance_hash.
+
+L. Initial hyperparameters (start values; sweepable)
+- AGE_INFANT_THRESHOLD = 5
+- TOP1_DOMINANCE_THRESHOLD = 0.6
+- TOP1_SPEND_GATE = 250
+- CHANNEL_HIGH_THRESHOLD = 100
+- MULTI_HIGH_THRESHOLD = 2
+- SUM_SPEND_HIGH = 500
+- TOP1_SPEND_OUTLIER_THRESHOLD = 1000
+- GLOBAL_SPEND_UPPER = 2000
+- CAP_PER_FEATURE_LOGIT (spend baseline) = 1.2
+- CAP_TOP1_SPEND_LOGIT = 1.5
+- CAP_TOP1_SHARE_LOGIT = 1.0
+- CAP_SUM_SPEND_LOGIT = 2.0; CAP_TOTAL_SPEND_LOGIT = 2.5
+- BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+- N0_cryo_allzero = 300; N0_child = 800; N0_top1_share = 1200; N0_top1 = 1000
+- N_min_cryo_allzero = 100; N_min_child = 120
+- Z_high_slice = 0.95; A_high = 0.995
+- SE_accept_cryo_slice = 0.12; se_floor_n1_cryo = 0.50
+- κ_age_small = 0.25; κ_all_zero = 0.20; κ_cryo_allzero = 0.30; κ_age_allzero = 0.30; κ_top1 = 0.28; κ_top1_share = 0.22; κ_imputation = 0.10
+
+M. CI canaries & expected behavior
+- Add 0182_01 (CryoSleep=True, all_zero) to canary set.
+  - Expected: route -> priority_audit during emergency gating; after calibrator/GLM changes it may be auto‑decided only if pooled_prior + GLM + ensemble agree and se_combined tight.
+- 0179_03 (Age=3, all_zero): keep as canary.
+- 0181_01 (dominant Spa): keep as canary.
+- Unit tests assert cohorts are held, and all canaries audited under gating.
+
+N. Concise gating pseudocode (updated)
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag_v5)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD:
+      route all r in B -> priority_audit; continue
+  - for each record r in B:
+      fragile_flag_v5 = cryo_allzero_flag OR (all_zero_flag AND Age ≤ AGE_INFANT_THRESHOLD) OR top1_outlier_flag OR high_total_spend_flag OR multi_high_flag OR (top1_spend ≥ TOP1_SPEND_GATE AND top1_share ≥ TOP1_DOMINANCE_THRESHOLD) OR any per_channel_imputed_flag OR missingness_count ≥ 2 OR dominance_sign_consistency_score < 0.7
+      if n_batch == 1 and fragile_flag_v5:
+         if (pooled_prior_tau ≥ Z_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice):
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if cohort_id or family_name present and exists conflicting sign predictions:
+         route cohort -> priority_audit
+
+O. Why this will reduce batch errors (short)
+- Addresses brittle negative case (all_zero combined with CryoSleep or child age) by:
+  - Introducing cryo_allzero as an explicit feature and pooled prior bucket so the model learns its true conditional effect;
+  - Inflating variance and widening calibrated uncertainty for the slice so the model is not overconfident in n==1 cases;
+  - Preventing n==1 auto‑decisions for fragile records without corroboration.
+- Keeps prior fixes for brittle positive cases (top1_dominance) in place. Together these reduce both false negatives and false positives in 1‑record batches.
+
+P. Tradeoffs & operational notes
+- Immediate increase in audited records (human review) — prepare triage & labeling capacity for cryo_allzero and dominance cases.
+- More conservative gating will reduce risky auto‑decisions but may slightly lower throughput; shadow runs will quantify the trade.
+- Additional logging increases storage and compute; tune retention for canaries and fragile slices.
+
+Q. Next steps / deliverables (choose)
+- Option A (Immediate, 0–3h, recommended): Deliver emergency gating patch (code + unit tests) implementing fragile_flag_v5 and add canary tests for 0179_03, 0181_01, 0182_01 plus deploy checklist.
+- Option B (24–72h): Deliver full retrain recipe: heteroskedastic quantile calibrator training script, GLM_fallback spec with cryo_allzero and age_allzero interactions, upweight schedule, CV design and hyperparameter sweep matrix, shadow‑run dashboard spec and acceptance metrics.
+- Which do you want first? I recommend Option A now to stop further n==1 brittle auto‑decisions, then Option B to improve the model and calibrator.
+
+Immediate one‑line corrective action (deploy now)
+- Deploy emergency gating: route any n==1 record with (all_zero_flag AND (Age ≤ 5 OR CryoSleep == True)) OR (top1_spend ≥ 250 AND top1_share ≥ 0.6) OR sum_spend ≥ 500 OR num_high_spend_channels ≥ 2 OR any per_channel_imputed_flag OR missingness_count ≥ 2 to priority_audit; add 0179_03, 0181_01, 0182_01 (plus existing canaries) to the canary list.
+
+If you want, I will:
+- produce the exact gating code + unit tests and CI changes (Option A), or
+- produce the full retraining pipeline, calibrator + GLM_fallback code + sweep matrix and shadow‑run dashboard (Option B).
+
+Which should I prepare and deliver first?
+
+============================================================

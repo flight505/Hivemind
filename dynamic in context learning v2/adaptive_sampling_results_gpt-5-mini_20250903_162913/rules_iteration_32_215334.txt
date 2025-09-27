@@ -1,0 +1,42 @@
+PREDICTIVE RULES - ITERATION 32
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. [Treat CryoSleep = True as a strong positive only when accompanied by an absence of spending: if CryoSleep = True AND (all spending categories RoomService, FoodCourt, ShoppingMall, Spa, VRDeck are 0 or missing) then predict Transported = True.]
+
+2. [When CryoSleep = True but any spend > 0, do NOT automatically predict False; instead classify the spend into non-luxury (RoomService + FoodCourt + ShoppingMall) and luxury (Spa + VRDeck) and apply spending-pattern rules (see rules 6–9) before deciding.]
+
+3. [Define two spend aggregates: non_luxury = RoomService + FoodCourt + ShoppingMall; luxury = Spa + VRDeck. Use these aggregates as primary signals for CryoSleep = False cases: if CryoSleep = False AND non_luxury > 1000 then increase probability → predict Transported = True (high engagement in core services correlates with transported in many cases).]
+
+4. [Luxury-dominant behavior signals not transported: if luxury > non_luxury * 2 AND luxury > 500 then predict Transported = False (spending concentration in luxury amenities relative to core services is characteristic of not-transported profiles).]
+
+5. [When spends are concentrated in a single luxury category at extreme values (Spa > 3000 OR VRDeck > 3000) treat as anomalous high-luxury and predict Transported = False unless there are two independent positive indicators for transported (CryoSleep True, non_luxury > 500, VIP True, or cabin-majority True).]
+
+6. [Non-luxury domination signals transported: if non_luxury >= 500 AND non_luxury >= luxury then predict Transported = True, with stronger confidence when non_luxury > 1000. This corrects false negatives where strong FoodCourt/ShoppingMall/RoomService engagement is associated with transported.]
+
+7. [Moderate mixed spending (250 <= non_luxury < 500 or 250 <= luxury < 500) is ambiguous — require two supporting signals to predict True: supporting signals = {CryoSleep = True, VIP = True, non_luxury >= 250, cabin-majority predicted Transported = True, Age < 18}. If at least two supporting signals present predict Transported = True, else predict False.]
+
+8. [VIP = True increases probability of Transported but is not decisive alone: if VIP = True AND (non_luxury >= 250 OR CryoSleep = True OR cabin-majority predicted Transported = True) then predict Transported = True; if VIP = True AND luxury > non_luxury * 2 (see rule 4) then predict Transported = False (luxury anomaly overrides VIP).]
+
+9. [Age effects: treat minors and infants as higher baseline transported probability if low engagement or CryoSleep present — specifically, if Age < 18 AND (CryoSleep = True OR non_luxury == 0 OR cabin-majority predicted Transported = True) then predict Transported = True. For Age >= 60, require stronger evidence (CryoSleep = True with non_luxury == 0 OR cabin-majority True) to predict Transported = True; otherwise bias toward False for older adults.]
+
+10. [Destination modulation: adjust CryoSleep and spend thresholds by destination. For PSO J318.5-22, CryoSleep = True alone is less reliable — require at least one additional supporting signal (non_luxury >= 250 OR VIP = True OR cabin-majority True) to predict Transported = True. For TRAPPIST-1e and 55 Cancri e, CryoSleep = True is a stronger indicator and may predict True when paired with low or zero spend.]
+
+11. [Handle missing CryoSleep conservatively: when CryoSleep is missing, treat as False by default unless at least two independent positive indicators exist among {VIP = True, non_luxury >= 500, cabin-majority predicted Transported = True, Age < 18 with non_luxury == 0}; in that case predict Transported = True.]
+
+12. [Cabin/group propagation: when multiple passengers share the same Cabin identifier, propagate a Transported = True label to cabin-mates only when at least one cabin member has a strong, non-contradictory positive signal (CryoSleep = True with zero spend OR non_luxury >= 1000 OR VIP = True with non_luxury >= 250). Do not force unanimous labels from weak/contradictory signals.]
+
+13. [Missing demographic fields (HomePlanet, Age): base prediction on ordered robust signals — priority order: CryoSleep + spend-pattern classification + VIP + cabin-majority + destination. Require at least two supporting signals before predicting Transported = True when key demographics are missing.]
+
+14. [Resolve conflicts between CryoSleep and spending: if CryoSleep and spending pattern disagree, prioritize structured pattern rules: a) CryoSleep = True with zero spend → True (rule 1); b) CryoSleep = True with non_luxury dominance → True (rule 6); c) CryoSleep = True with clear luxury-dominance or extreme single-category luxury → False (rules 4 and 5).]
+
+15. [Extreme total-spend exceptions: do not use a single blanket rule that very large total_spend always implies not transported. Instead, inspect distribution: if total_spend > 3000 AND non_luxury >= luxury then predict Transported = True; if total_spend > 3000 AND luxury > non_luxury then predict Transported = False.]
+
+16. [Small/sporadic spend patterns: if all spends == 0 AND CryoSleep = False AND VIP = False AND Age is unknown or > 50 then predict Transported = False (absence of engagement + no CryoSleep + older/unknown age biases to not transported).]
+
+17. [Tie-breaking requirement for predicting Transported = True: require at least two independent affirmative signals from the set {CryoSleep = True, non_luxury >= 500, VIP = True, cabin-majority True, Age < 18} except in the special case CryoSleep = True with all spends == 0 which alone suffices (rule 1).]
+
+18. [Label robustness: when a single strong signal indicates transported but multiple other moderate signals indicate not transported (or vice versa), prefer the aggregated view of spend-pattern + destination + cabin consistency rather than single-field dominance; implement as: predict Transported = True only if (rule-based score from CryoSleep + non_luxury/luxury pattern + VIP + cabin + age + destination) crosses a 2-signal threshold as defined above.]
+
+============================================================

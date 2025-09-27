@@ -1,0 +1,36 @@
+PREDICTIVE RULES - ITERATION 4
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. If Age <= 7 then Predict Transported = True.
+
+2. If Age >= 60 then Predict Transported = True.
+
+3. Define total_onboard_spend = sum(RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) treating missing/NaN as 0. If multiple passengers share the same cabin and at least one cabin mate meets any "strong-True" criterion (Age <= 7, Age >= 60, VIP == True with CryoSleep or zero spend, or CryoSleep == True with zero spend AND HomePlanet in {Europa, Mars}), then Predict Transported = True for all cabin mates (cabin group propagation).
+
+4. CryoSleep zero-spend rule (strong): If CryoSleep == True AND total_onboard_spend == 0 or missing, then Predict Transported = True only when any of: HomePlanet in {Europa, Mars}; Age <= 12; VIP == True; or Destination in {TRAPPIST-1e, 55 Cancri e}. If none of those hold, Predict Transported = False.
+
+5. CryoSleep tiny-spend exception: If CryoSleep == True AND 0 < total_onboard_spend <= 50, then Predict Transported = True if HomePlanet in {Europa, Mars} OR Age <= 12 OR VIP == True; otherwise Predict Transported = False.
+
+6. Concentrated single-amenity rule (non-cryo): If CryoSleep == False AND total_onboard_spend >= 1000 AND the largest single amenity (max of RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) >= 0.7 * total_onboard_spend AND that dominant amenity is FoodCourt OR VRDeck OR ShoppingMall, then Predict Transported = True.
+
+7. Large single-amenity outlier rule (non-cryo): If CryoSleep == False AND (FoodCourt >= 2000 OR VRDeck >= 1000 OR ShoppingMall >= 1500) then Predict Transported = True, except when total_onboard_spend >= 8000 and spending is spread across at least three amenities each > 500 (see rule 9).
+
+8. Moderate concentrated spender rule (non-cryo): If CryoSleep == False AND 1000 <= total_onboard_spend < 5000 AND the largest single amenity >= 0.5 * total_onboard_spend, then Predict Transported = True.
+
+9. Very-high multi-amenity veto: If total_onboard_spend >= 8000 AND at least three amenities are each > 500, then Predict Transported = False (very large, multi-venue spenders are less likely to be Transported).
+
+10. VIP handling: If VIP == True AND (CryoSleep == True OR total_onboard_spend == 0) then Predict Transported = True, unless VRDeck >= 2000 OR total_onboard_spend >= 5000, in which case Predict Transported = False (VIPs who actively spend extremely are treated as non-preserved).
+
+11. HomePlanet baseline adjustment: Treat HomePlanet == Europa as a positive signal for Transported; when HomePlanet == Europa combine with CryoSleep zero-spend or concentrated spending signals (rules 4, 6–8) to prefer Predict Transported = True. For HomePlanet == Earth be more conservative for CryoSleep==True cases: require an additional strong signal (Age <=12, VIP, concentrated spending, or cabin propagation) before predicting True.
+
+12. Destination adjustment: If CryoSleep == False AND Destination in {55 Cancri e, TRAPPIST-1e} AND total_onboard_spend >= 500 AND the largest amenity >= 0.4 * total_onboard_spend, then Predict Transported = True (destination-linked concentrated activity increases transport likelihood).
+
+13. Cabin location tie-breaker (deck heuristic): When CryoSleep == True with zero spend and HomePlanet is ambiguous (e.g., Earth), use deck letter as a tie-breaker: if deck letter ∈ {A,B,C,D,E} (inner/central decks) then Predict Transported = True; otherwise require one of the other strong signals in rules 4–5.
+
+14. Mixed-signal resolution priority: When multiple rules apply and they conflict, resolve in this priority order: (1) Age extremes and cabin-family propagation (rules 1–3), (2) CryoSleep zero/tiny-spend rules combined with HomePlanet/VIP (rules 4–5,11), (3) concentrated single-amenity spending and destination signals (rules 6–8,12), (4) VIP exceptions (rule 10), (5) very-high multi-amenity veto (rule 9). Break ties in favor of Predict Transported = True for Age <=7 and Age >=60.
+
+15. Default fallback: If none of the above rules applies, Predict Transported = False.
+
+============================================================

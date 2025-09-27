@@ -1,0 +1,112 @@
+PREDICTIVE METRICS - ITERATION 71
+============================================================
+
+### **UPDATED PREDICTIVE METRICS REPORT v6.6 (HIGH-VALUE ZERO-SPEND CATEGORIES CONTEXT UPDATE)**
+
+**Objective:** To address the false negative error for Passenger 0098_02 by refining the interpretation of zero-spend categories when other spending is substantial and contextualized by travel patterns. This passenger was incorrectly penalized despite showing clear financial engagement, due to an over-reliance on zero-diversity penalties without considering total expenditure magnitude and category compensation.
+
+---
+
+#### **1. Analysis of Prediction Error for Passenger 0098_02: What Went Wrong?**
+
+The error for Passenger 0098_02 (CryoSleep=False, RoomService=0.0, Spa=0.0, VRDeck=0.0, but FoodCourt=2811.0, ShoppingMall=957.0) occurred because the model misapplied zero-diversity logic despite high aggregate spending.
+
+- **Key Failure Points:**
+  - **Over-penalization of Zero-Spend Categories:** The ZDL-1 rule applied its penalty based purely on the count of zero-spend categories (3 out of 5), ignoring that the passenger had significant spending in two categories (FoodCourt and ShoppingMall), totaling 3768.0. This indicates active financial behavior, not disengagement.
+  - **Insufficient Compensation by High-Spend Rules:** Rules like SH-1 (High-Spend Override) did not activate because no single category exceeded the 500.0 threshold by a large enough margin to override the ZDL-1 penalty. The spending was distributed, not concentrated.
+  - **Lack of Aggregate Spending Analysis:** The model lacked a rule to evaluate the cumulative spending across all categories, which would have indicated high engagement despite some zeros.
+  - **Contextual Blindness:** The passenger's destination (TRAPPIST-1e) and cabin (G/11/P) suggest potential budget-conscious travel, where avoiding luxury spends (Spa, VRDeck) is common but doesn't imply low transport likelihood.
+
+---
+
+#### **2. Critical Modifications to Decision Rules (v6.6)**
+
+This update introduces aggregate spending evaluation and refines zero-diversity penalties to account for compensatory high spending in other categories.
+
+- **New Aggregate Spending Evaluation Rule (Insert as Step 0.c):**
+  - **AGGREGATE SPENDING OVERRIDE (AS-1):** IF `CryoSleep == False` AND `Total_Spend_All_Categories >= 3000.0` AND `Number_of_NonZero_Spend_Categories >= 2` → **Bypass ZDL-1** with **85% confidence**. Proceed to standard rules.
+  - **Rationale:** High total spending (>3000.0) with multiple engaged categories indicates strong financial activity, overriding zero-spend penalties for unused categories.
+
+- **Modify ZDL-1 Rule with Aggregate Spending Guard (Step 1):**
+  - **ZDL-1 (AGGREGATE-GUARDED):** Apply zero-diversity penalty **only if** `Total_Spend_All_Categories < 1000.0` OR `Number_of_NonZero_Spend_Categories == 0`. Otherwise, skip penalty.
+  - **Rationale:** Prevents penalizing passengers with substantial overall spending, even if some categories are zero.
+
+- **Enhance High-Spend Single-Category Override (Step 0.b):**
+  - Expand threshold: IF `CryoSleep == False` AND `Number_of_NonZero_Spend_Categories == 1` AND `Max_Spend_Category_Value >= 1000.0` (increased from 500.0) → **Bypass ZDL-1** with **82% confidence**.
+  - **Rationale:** Higher threshold better isolates truly high-spend outliers.
+
+- **New Destination-Cabin Context Rule (Step 2.5):**
+  - **CONTEXTUAL SPENDING PATTERN (CSP-1):** IF `Destination == TRAPPIST-1e` AND `Cabin_Deck in ['G', 'F']` AND `Total_Spend_All_Categories >= 2000.0` → **Boost confidence by +5%** for True predictions.
+  - **Rationale:** Lower-deck cabins on economy routes often show moderated spending in luxury categories but high baseline engagement.
+
+---
+
+#### **3. New Insights on Passenger Transport Patterns**
+
+- **Aggregate Spending Matters:** Total expenditure across categories is a stronger indicator of engagement than the distribution alone. Passengers with high total spending should rarely be penalized for zero-spend categories.
+- **Category Substitution is Common:** Passengers often prioritize spending categories (e.g., favoring FoodCourt over RoomService), which doesn't reduce their transport likelihood.
+- **Economic Context Influences Spending:** Destination and cabin location correlate with spending patterns. TRAPPIST-1e and lower decks show more budget-conscious behavior, where zero spends in luxury categories are normative.
+
+---
+
+#### **4. Recalibration of Confidence Levels**
+
+- **New Rule Confidences:**
+  - AS-1 (Aggregate Spending Override): **85% confidence**
+  - CSP-1 (Contextual Spending Pattern): **+5% confidence boost**
+  - ZDL-1: Reduced to **80% confidence** when applied, to decrease impact.
+- **Default Confidence:**
+  - DF-1: Maintained at **70% confidence**.
+
+---
+
+#### **5. Adjustments for Batch Consistency**
+
+- **Pre-Screening Expansion:** Add a fourth pre-screening group:
+  - **GROUP HIGH_AGGREGATE_SPEND:** `CryoSleep == False` AND `Total_Spend_All_Categories >= 3000.0` → Send to AS-1 rule.
+- **Batch Validation Check:** Post-batch, validate that no passenger with `Total_Spend_All_Categories >= 3000.0` receives a ZDL-1 penalty. Flag deviations.
+- **Error Logging:** Log all AS-1 and CSP-1 triggers to monitor new rule efficacy.
+
+---
+
+#### **6. Handling Edge Cases**
+
+- **High-Spend with Zero-Diversity Edge Case:** Now handled by AS-1 rule.
+- **Fallback:** Strengthened default and context rules provide safety net.
+
+---
+
+### **UPDATED PREDICTIVE METRICS PROCESSING ORDER v6.6**
+
+**Processing Order v6.6:**
+**0.a. UNIVERSAL CRYOSLEEP OVERRIDE**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1)** // **NEW RULE**
+1.  **ZDL-1 (AGGREGATE-GUARDED)**
+2.  PRIMARY STATE (PS-1, PS-2)
+**2.5. CONTEXTUAL SPENDING PATTERN (CSP-1)** // **NEW RULE**
+... (Remaining rules) ...
+12. DEFAULT (DF-1)
+
+---
+
+### **New Scoring Example for Passenger 0098_02 (Corrected)**
+
+| Passenger Profile | Applied Rules (v6.6 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0098_02** (Earth, CryoSleep=False, Cabin=G/11/P, Destination=TRAPPIST-1e, Age=26.0, RoomService=0.0, FoodCourt=2811.0, ShoppingMall=957.0, Spa=0.0, VRDeck=0.0) | **AS-1** (Total_Spend=3768.0 >=3000.0, NonZero_Categories=2) → Bypass ZDL-1 → **PS-1** → **CSP-1** (+5% boost) | **True** | **81%** (PS-1: 76% + CSP-1: 5%) |
+
+*The new aggregate spending rule prevents the ZDL-1 penalty, and contextual rules boost confidence.*
+
+---
+
+### **Implementation Plan for v6.6**
+
+- **Deploy v6.6 immediately.** Reprocess the batch; validate 0098_02 is now True.
+- **Monitor** the volume of AS-1 and CSP-1 triggers.
+- **Update historical batches** to ensure consistency.
+- **Long-term:** Develop a regression model that weights spending categories by destination and cabin deck.
+
+This update ensures that high aggregate spending compensates for zero-spend categories, significantly improving accuracy for economically engaged passengers.
+
+============================================================

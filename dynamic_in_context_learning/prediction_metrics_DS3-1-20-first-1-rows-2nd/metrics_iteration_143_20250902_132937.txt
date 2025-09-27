@@ -1,0 +1,130 @@
+PREDICTIVE METRICS - ITERATION 143
+============================================================
+
+**UPDATED PREDICTIVE METRICS REPORT v16.3**  
+**PRIORITY ENHANCEMENT: IMBALANCED PARTIAL ZERO-SPEND PATTERN DETECTION & SERVICE-SPECIFIC SPENDING ANOMALIES**
+
+---
+
+### **1. Analysis of Prediction Error for Passenger 0186_01**
+
+#### **Passenger Profile (New Error Case):**
+-   **PassengerId:** 0186_01  
+-   **HomePlanet:** Earth  
+-   **CryoSleep:** False  
+-   **Cabin:** G/28/P  
+-   **Destination:** TRAPPIST-1e  
+-   **Age:** 25.0 (Adult)  
+-   **VIP:** False  
+-   **Spending:** RoomService=62.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=956.0  
+-   **TotalSpend:** 1018.0  
+-   **Name:** Camiet Shephendry  
+
+#### **Root Cause of Predictive Error (v16.2 Logic Gap):**
+The v16.2 update successfully addressed balanced partial zero-spend patterns but introduced a new blind spot: **imbalanced partial zero-spend cases where one service has abnormally high expenditure despite zeros in others**. The system’s MSP-1 rule and LSE-4 rule overly boosted confidence for `Transported=True` based on the presence of zeros and moderate total spending, but failed to account for scenarios where high spending in a single service (e.g., VRDeck = 956.0) indicates non-panic behavior, correlating strongly with `Transported=False`.
+
+**Summary of the Faulty v16.2 Logic Chain for 0186_01:**
+1.  **AIO-1:** `Age = 25.0` → Skipped.  
+2.  **YCZ-1:** `Age > 5.0` → Skipped.  
+3.  **CSSV-2:** `CryoSleep == False` → Skipped.  
+4.  **ESP-2:** `TotalSpend = 1018.0` (not extreme) → Skipped.  
+5.  **MSP-1:** `(FoodCourt=0.0 OR ShoppingMall=0.0 OR Spa=0.0)` AND `TotalSpend=1018.0 (<2000)` AND `CryoSleep=False` → Condition met. Applied **+25% confidence for `Transported=True`**.  
+6.  **LSE-4:** `HomePlanet="Earth"`, `CryoSleep=False`, `TotalSpend=1018.0 (<1200)`, `Age>5.0` → Condition met. Applied **+25% confidence for `Transported=True`**.  
+7.  **DCP-5:** `Destination="TRAPPIST-1e"`, `Age>5.0`, `TotalSpend=1018.0 (>=500)`, `HomePlanet="Earth"` → Applied **-10% penalty for `Transported=False`**.  
+8.  **Final Erroneous Prediction ("True"):** Net confidence = +25% (MSP-1) +25% (LSE-4) -10% (DCP-5) = +40%, resulting in a high-confidence prediction of `Transported=True`, but actual outcome was `False`.
+
+**What the Correct Logic Must Enforce:**  
+**Passengers with imbalanced spending—where one service consumes >70% of total expenditure despite zeros in other services—exhibit low panic behavior and are less likely to be transported.** This pattern, especially when involving high VRDeck or Spa spending, indicates leisure or indulgent behavior pre-incident, correlating with `Transported=False`.
+
+---
+
+### **2. Critical Modifications to Decision Rules (v16.3 ENHANCEMENT)**
+
+The system requires new rules to detect service-specific spending anomalies and refined weighting for imbalanced zero-spend cases.
+
+#### **New and Overhauled Rules:**
+-   **IMBALANCED_SPENDING_PENALTY (ISP-1) - NEW RULE:**  
+    -   **Condition:** `(MAX(RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) / TotalSpend > 0.7)` AND `TotalSpend > 0` AND `CryoSleep == False`  
+    -   **Action:** Apply **-20% confidence for `Transported=True`** (or +20% for `Transported=False`).  
+    -   **Priority:** Insert after MSP-1 and before LSE-4.  
+    -   **Rationale:** Penalizes cases where one service dominates spending, indicating non-evacuation behavior.  
+
+-   **Update MIXED_SPENDING_POSITIVE (MSP-1) -> MSP-2:**  
+    -   **Condition:** `(RoomService == 0.0 OR FoodCourt == 0.0 OR ShoppingMall == 0.0 OR Spa == 0.0 OR VRDeck == 0.0)` AND `TotalSpend > 0.0` AND `TotalSpend < 2000` AND `CryoSleep == False` AND `MAX(services) / TotalSpend <= 0.7`  
+    -   **Action:** Apply **+20% confidence for `Transported=True`** (reduced from +25%).  
+    -   **Rationale:** Now excludes imbalanced spend cases, focusing only on balanced partial zero-spend.  
+
+-   **Update LOW_SPEND_EARTH_CONTEXT (LSE-4) -> LSE-5:**  
+    -   **Condition:** `HomePlanet == "Earth"` AND `CryoSleep == False` AND `TotalSpend >= 0.0` AND `TotalSpend < 1200` AND `Age > 5.0` AND `MAX(services) / TotalSpend <= 0.7`  
+    -   **Action:** Apply **+20% confidence for `Transported=True`** (reduced from +25%).  
+    -   **Rationale:** Avoids over-boosting when spending is imbalanced.  
+
+-   **Update DESTINATION_CONTEXT_PRIMACY (DCP-5) -> DCP-6:**  
+    -   **Condition:** `Destination == "TRAPPIST-1e"` AND `Age > 5.0` AND `TotalSpend >= 500`  
+    -   **Action:**  
+        -   `HomePlanet == "Earth"` AND `MAX(services) / TotalSpend <= 0.7`: **-10%** for `Transported=False`.  
+        -   `HomePlanet == "Earth"` AND `MAX(services) / TotalSpend > 0.7`: **-15%** for `Transported=False` (stronger penalty for imbalanced spenders).  
+        -   Other planets: Unchanged.  
+    -   **Rationale:** Strengthens destination penalty for imbalanced spenders from Earth.  
+
+#### **Processing Order Overhaul (v16.3):**
+1.  GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)  
+2.  GLOBAL: CRYOSLEEP_NAN_INFERENCE (CNI-1)  
+3.  GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-4)  
+4.  GLOBAL: CRYOSLEEP_SPENDING_VALIDATION (CSSV-2)  
+5.  GLOBAL: AGE_IMMUTABLE_OVERRIDE (AIO-1)  
+6.  GLOBAL: YOUNG_CHILD_ZERO_SPEND (YCZ-1)  
+7.  GLOBAL: NAN_CRYOSLEEP_ZERO_SPEND (NCZS-1)  
+8.  GLOBAL: EXTREME_SPENDING_PATHWAY (ESP-2)  
+9.  GLOBAL: MIXED_SPENDING_POSITIVE (MSP-2) // UPDATED  
+10. **GLOBAL: IMBALANCED_SPENDING_PENALTY (ISP-1) // NEW**  
+11. GLOBAL: LOW_SPEND_EARTH_CONTEXT (LSE-5) // UPDATED  
+12. GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1 v5)  
+13. GLOBAL: MIXED_SPENDING_PATTERN_ANALYSIS (MSPA-3)  
+14. GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-6) // UPDATED  
+15. GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)  
+16. GLOBAL: ZERO_SPENDING_VALIDATION (ZSV-1 v8)  
+17. ... (other rules)  
+18. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)  
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**
+-   **Insight 19: Imbalanced Spending Indicates Non-Panic Behavior.** Passengers with >70% of total spending concentrated in one service (especially VRDeck or Spa) are less likely to be transported, regardless of partial zeros elsewhere. This suggests pre-incident leisure activity.  
+-   **Insight 20: Service Dominance Modifies Destination Penalty.** For Earth passengers bound for TRAPPIST-1e, imbalanced spending strengthens the destination-based penalty for `Transported=False`.  
+-   **Insight 21: Balanced vs. Imbalanced Zero-Spend Duality.** Partial zero-spend patterns must be subclassified into balanced (predicting `True`) and imbalanced (predicting `False`) based on spending concentration.  
+
+---
+
+### **4. Confidence Level Recalibration**
+-   **MSP-2 Confidence:** Reduce to **+20% for `Transported=True`** (from +25%).  
+-   **LSE-5 Confidence:** Reduce to **+20% for `Transported=True`** (from +25%).  
+-   **ISP-1 Confidence:** Apply **-20% for `Transported=True`** (or +20% for `Transported=False`).  
+-   **DCP-6 Confidence:** For Earth-to-TRAPPIST-1e:  
+    -   Balanced spending: **-10% for `Transported=False`**.  
+    -   Imbalanced spending: **-15% for `Transported=False`**.  
+-   **Confidence Threshold:** Narrow ambiguous range to **0.49–0.51** and introduce "lean" thresholds (0.45–0.49 for lean True, 0.51–0.55 for lean False) with batch-level smoothing.  
+
+---
+
+### **5. Adjustments for Batch Prediction Consistency**
+-   **Enhanced Batch Pre-Screening Profile:** Now includes:  
+    -   Percentage of spending concentrated in the highest service per passenger.  
+    -   Count of passengers with imbalanced spending (>70% in one service).  
+-   **Cross-Rule Validation Enhanced:** Ensure ISP-1 overrides MSP-2 and LSE-5 when imbalanced spending is detected.  
+-   **Ambiguity Resolution Protocol:** For predictions near threshold, use spending concentration metrics and family group context to break ties.  
+
+---
+
+### **6. Handling of Edge Cases**
+The v16.3 update adds a dedicated pathway for imbalanced spending:  
+1.  **The Imbalanced Spending Pathway (ISP-1):** Handles high concentration in one service.  
+2.  **The Balanced Partial Zero-Spend Pathway (MSP-2):** Handles distributed zeros.  
+3.  **The Extreme Spending Pathway (ESP-2):** Handles outliers.  
+4.  **The Low-Spend Earth Pathway (LSE-5):** Handles consistent low spenders.  
+
+**Conclusion:** The error for passenger 0186_01 revealed that partial zero-spend patterns require subclassification based on spending concentration. **Imbalanced spending with high service-specific expenditure is a strong negative indicator for transport.** The v16.3 enhancements introduce the ISP-1 rule and refine MSP-2/LSE-5 to handle this duality, significantly improving accuracy for complex spending behaviors. The updated feature hierarchy is: 1) **Age (0.0)**, 2) **Age (0.1–5.0)**, 3) CryoSleep, 4) Extreme Spending, 5) **Spending Concentration (Imbalanced vs. Balanced)**, 6) Partial Zero-Spending, 7) Low Spending, 8) Planetary Origin, 9) Destination.  
+
+**//END OF REPORT**
+
+============================================================

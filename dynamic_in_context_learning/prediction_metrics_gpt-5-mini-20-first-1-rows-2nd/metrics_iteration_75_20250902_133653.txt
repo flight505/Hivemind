@@ -1,0 +1,234 @@
+PREDICTIVE METRICS - ITERATION 75
+============================================================
+
+Updated Predictive Metrics Report — v3.6.0 (post_0102_01)
+
+Target
+- Reduce n==1 zero_spend false negatives (FNs) while keeping concentrated_topK false positives (FPs) low; improve batch‑level consistency by enforcing symmetric small‑batch gating, adding zero_spend × context semantics to the calibrator & slice_trust_table, and increasing SE/variance floors for ambiguous patterns. Additionally: reduce concentrated_top1/2 FP rate (observed in 0102_01) by adding conservative acceptance gating and model‑disagreement dampening.
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (two related failures in this batch):
+  1. Zero_spend FN (previously analyzed): 0101_01 — all channel spends = 0, CryoSleep = True, Age = 31, HomePlanet = Mars — auto‑rejected (pred False) but actual = True. Root cause: zero_spend treated as low signal; calibrator lacked zero_spend×context interactions; slice_subslice untrusted; n==1 allowed confident auto‑reject; SE floors too low for zero pattern.
+  2. Concentrated_top1 FP (new in this batch): 0102_01 — Spa=830, VRDeck=91, all other spends=0 (sum_spend=921; top1_share ≈ 0.901) — predicted True but actual = False. Root cause: concentrated_top1 pattern produced overconfident positive prediction (calibrator/ensemble and pooled_prior favored positive), lack of context interactions (top1_share × Age × Destination), insufficient damping for model_disagreement and novelty; n==1 gating allowed auto_accept when subslice was untrusted.
+- Immediate corrective priorities:
+  1. Enforce symmetric n==1 gating for untrusted zero_spend and concentrated_topK records: route to priority_audit (no auto‑accept/reject) unless extreme multi‑model consensus.
+  2. Retrain calibrator and GLM_fallback to explicitly include zero_spend×CryoSleep/Age/HomePlanet and ordered_topK×Age/HomePlanet/Cabin_deck/ Destination interactions (K up to 3).
+  3. Increase SE/variance floors for zero_spend and concentrated_topK (raise concentrated_top1 floor to reduce overconfident acceptances). Add model_disagreement and novelty damping to direction‑aware logit_shift.
+  4. Add zero_spend & concentrated ordered_topK slices to slice_trust_table (include CryoSleep & Age_bucket keys) and persist per‑record provenance.
+
+1) What specific metric/pattern signals led to this error set?
+- Zero_spend FN (0101_01) signals:
+  - zero_spend_flag == True AND n==1
+  - N_subslice (zero_key × CryoSleep × Age_bucket × HomePlanet) < min_n_by_pattern_zero
+  - novelty_score high (sparse spend channels)
+  - pooled_prior biased toward False (global marginals), missing contextual slice info
+  - low SE floors → overconfident logit → auto_reject
+- Concentrated_top1 FP (0102_01) signals:
+  - pattern_type = concentrated_top1 (top1_share ≈ 0.90; top2_share ≈ 0.10)
+  - n==1 (single record in small batch)
+  - Potentially low N_subslice for this ordered_top1 tuple × Age_bucket × Destination
+  - model_disagreement > 0 (ensemble models disagree) OR p_ens and pooled_prior disagree by >0.15
+  - calibrator lacked ordered_top1×Age/ Destination interactions (so it over‑trusted global/concentrated priors)
+  - spend_entropy very low (strong concentration) → prior pushed prediction strongly positive; low variance floors permitted confident FP
+- Measurable pre‑decision rules to flag risk:
+  - (zero_spend_flag OR concentrated_topK) AND n==1 AND N_subslice < min_n_by_pattern
+  - novelty_score ≥ 0.75 or spend_entropy ≤ 0.2
+  - |pooled_prior − p_ens| > 0.20
+  - model_disagreement (std dev across models) ≥ 0.10
+  - top1_share ≥ 0.80 with num_nonzero_channels ≤ 2
+
+2) Decision rule modifications (concrete)
+Principles
+- Symmetric small‑batch gating: treat zero_spend and concentrated_topK identically for n==1 when subslice is not trusted.
+- Conservative auto‑accept: require extreme multi‑model agreement and low novelty to auto‑accept for small batches/untrusted slices.
+- Direction‑aware adjustments must be damped by novelty and model_disagreement; do not amplify pooled_prior when subslice is untrusted and models disagree.
+
+Immediate concrete rule changes
+- Pattern precedence:
+  - zero_spend → concentrated_top1 → concentrated_top2 → concentrated_top3 → multi_channel → dispersed.
+- Symmetric n==1 gating:
+  - If n==1 AND pattern_type ∈ {zero_spend, concentrated_top1, concentrated_top2, concentrated_top3, high_novelty_multi} AND NOT Trusted_subslice:
+    - Route record to priority_audit (do not auto_accept/auto_reject), except for extreme consensus.
+  - Extreme consensus short‑circuits (both ensemble agreement and p_final required):
+    - extreme_accept_threshold[pattern] (e.g., zero: 0.995, K1:0.995) AND ensemble_agreement ≥ agreement_threshold (0.98) → auto_accept.
+    - extreme_reject_threshold similarly on the low end.
+- Direction‑aware logit_shift (pre‑calibration), updated with model_disagreement damping:
+  - pooled_prior = hierarchical_pooling(μ_subslice, channel_bin_prior, global_prior)
+  - polarity = 2*pooled_prior − 1
+  - δ_logit_pattern initial set: {K1:0.75, K2:0.60, K3:0.50, zero:0.70} (K1 reduced from 0.90 to 0.75 to reduce aggressive pushes for concentrated_top1)
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95)), with w_dis = 0.80
+  - logit_shift = polarity * δ_logit_pattern[pattern] * novelty_scale * dis_damp, clipped so |logit_shift| ≤ δ_logit_pattern[pattern]
+  - If Trusted_subslice apply reduced δ: δ_eff = δ_logit_pattern * (1 − λ_trust) with λ_trust = 0.35 (trusted slices are less shifted)
+- Auto‑accept guard:
+  - For any auto_accept decision require:
+    - p_final ≥ accept_threshold AND se_combined ≤ accept_se_max AND ensemble_agreement ≥ agreement_threshold_for_accept
+  - If any of these fail, route to audit.
+
+3) New insights about passenger transport patterns
+- Zero_spend is context‑dependent — not always “no information.” Combined with CryoSleep, Age, HomePlanet, Destination and cabin_deck it can be highly predictive of True in certain subgroups. Treat zero_spend as a pattern that needs contextual conditioning, not a generic "low signal".
+- Strongly concentrated spends (top1_share ≥ 80%) can produce either strong True or strong False labels depending on context (age, destination, homeplanet). Marginal/global priors can mislead if context is missing.
+- n==1 scenarios amplify prior bias — when subslices are untrusted, decisions must be conservative and require multi‑model consensus before auto‑accept/auto‑reject.
+- Model disagreement is a reliable early warning: records with sizeable disagreement should increase variance floors and prefer audit routing.
+
+4) Confidence recalibration (variance / SE updates)
+- Pattern‑aware variance modeling (formula):
+  - var_slice ≈ μ_subslice*(1−μ_subslice)/(N_subslice + 1)
+  - var_pattern = κ_pattern * h(num_nonzero_channels, spend_entropy, novelty_score) where h() grows as channels decrease / entropy decreases / novelty increases.
+  - var_novelty_conditional = κ_novelty * novelty_score^2 (applies strongly if subslice untrusted)
+  - var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Updated SE / floor policy (raise concentrated K1 floor to address 0102_01 FP):
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor = {K1:0.10, K2:0.09, K3:0.13}
+  - zero_nontrusted_floor = 0.12
+  - multi_channel_nontrusted_floor = 0.09
+  - extreme_novelty_floor = 0.14
+- z_adj decision threshold (incorporate risk & disagreement):
+  - z_adj = base_z * (1 + γ_FP*FP_risk + γ_dis*model_disagreement + γ_nov*novelty_score) * (1 − λ_trust_if_trusted)
+  - base_z = 1.645; γs sample = {FP_risk:1.0, model_disagreement:0.6, novelty_score:1.0}; λ_trust = 0.35.
+  - Use z_adj to compute required p_final quantile acceptance: require p_final ≥ Φ( z_adj*se_combined + logit_threshold ) or route to audit.
+- Calibrator changes:
+  - Replace scalar Platt with covariate‑aware calibrator that returns mean + uncertainty (options: LightGBM quantile ensemble or small Bayesian NN).
+  - Train calibrator with grouped CV (group by ordered_topK_id and zero_key) to avoid leakage.
+  - Inputs: p_after_logit_shift, pattern_type, zero_spend_flag, ordered_topK_id, top1/2/3_share, sum_spend, num_nonzero_channels, spend_entropy, novelty_score, pooled_prior, N_subslice, model_disagreement, CryoSleep, Age_bucket, HomePlanet, Cabin_deck, Destination.
+  - Outputs: p_final (mean), p_final_uncertainty (std or quantiles).
+
+5) Slice_trust_table, features, and hierarchical pooling
+- Feature additions (persist in feature store & daily rollups):
+  - zero_spend_flag, ordered_top1/2/3 tuple, ordered_topK_id (hash), top1/2/3_share, sum_spend, num_nonzero_channels, spend_entropy, novelty_score, CryoSleep_flag, Age_bucket, HomePlanet, Cabin_deck, Destination, per‑record provenance.
+- slice_trust_table schema (key):
+  - key = (pattern_type, ordered_topK_tuple or zero_key, CryoSleep_flag, Age_bucket, HomePlanet, Cabin_deck, Destination)
+  - columns: N_total, N_positive, TP_rate, decayed_count, decayed_tp_rate, last_updated, snapshot_id
+- min_n_by_pattern (initial / sweepable):
+  - {K1:50, K2:30, K3:40, zero:60} — zero remains higher because it’s more ambiguous; monitor concentrated_top1 FP to consider increasing K1 if needed.
+- τ_pattern (pooling strength) for hierarchical pooling:
+  - {K1:100, K2:160, K3:220, zero:260}
+- pooled_prior:
+  - pooled_prior = (τ_pattern * μ_global + N_subslice * μ_subslice) / (τ_pattern + N_subslice)
+  - τ_pattern increased for zero to avoid overfitting tiny zero_subslices.
+
+6) Deterministic scoring pipeline (v3.6.0 condensed)
+1. Batch snapshot at start: models, calibrator, slice_trust_table, channel_spend_bins, hyperparams, snapshot_id (pin for whole batch).
+2. Per record preprocessing:
+   - Compute sum_spend, zero_spend_flag, sorted topK, top1/2/3_share, num_nonzero_channels, spend_entropy, ordered_topK_id, novelty_score, CryoSleep_flag, Age_bucket, HomePlanet, Cabin_deck, Destination; determine pattern_type.
+3. Slice lookup & hierarchical pooling:
+   - Retrieve N_subslice, μ_subslice for ordered_topK or zero_key (with optional context).
+   - pooled_prior = hierarchical_pooling(μ_subslice, channel_bin_prior, global_prior).
+4. Model inference:
+   - Ensemble → p_ens ± se_ens; compute model_disagreement (std across base models).
+5. p_combined_prepenalty = α_prior * pooled_prior + α_ens * p_ens.
+6. Direction‑aware adjustment:
+   - If pattern_type ∈ {zero_spend, concentrated_topK} AND NOT Trusted_subslice:
+     - compute logit_shift with novelty & model_disagreement damping (as above).
+     - inflate var_pattern per κ_pattern and apply pattern_nontrusted_floor.
+7. Variance calculation:
+   - var_combined and se_combined with pattern floors applied.
+8. Calibrate:
+   - p_after_penalty = inv_logit(logit(p_combined_prepenalty) + logit_shift).
+   - p_final, p_final_uncertainty = covariate_calibrator.predict([...features...]) — returns mean + uncertainty.
+9. Decisioning & symmetric gating:
+   - If Trusted_subslice and p_final ≥ accept_threshold_trusted and se_combined ≤ accept_se_max → auto_accept.
+   - Else if n==1 AND pattern_type ∈ {zero_spend, concentrated_topK} AND NOT Trusted_subslice:
+     - Route to priority_audit unless extreme consensus (p_final > extreme_accept_threshold AND ensemble_agreement ≥ agreement_threshold) OR (p_final < extreme_reject_threshold AND ensemble_agreement ≥ agreement_threshold).
+   - Else standard thresholding using z_adj and p_final_uncertainty; if insufficient confidence route to audit.
+10. Persist per‑record provenance: snapshot_id, pattern_type, ordered_topK_id, zero_spend_flag, N_subslice, pooled_prior, p_ens, se_ens, model_disagreement, novelty_score, applied_logit_shift, p_after_penalty, p_final, p_final_uncertainty, decision_reason_code, route.
+11. Post‑batch: update slice_trust_table counts (exponential decay), retrain triggers.
+
+7) Hyperparameters (v3.6.0 initial; sweepable)
+- min_n_by_pattern: {K1:50 (30–100), K2:30 (20–60), K3:40 (25–60), zero:60 (40–120)}
+- τ_pattern: {K1:100 (40–200), K2:160 (80–320), K3:220 (120–400), zero:260 (160–400)}
+- base_min_se / floors:
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor = {K1:0.10, K2:0.09, K3:0.13}
+  - zero_nontrusted_floor = 0.12
+  - multi_channel_nontrusted_floor = 0.09
+  - extreme_novelty_floor = 0.14
+- δ_logit_pattern = {K1:0.75 (0.5–1.0), K2:0.6 (0.4–0.9), K3:0.5 (0.3–0.8), zero:0.70 (0.45–0.95)}
+- extreme_accept_threshold = {K1:0.995, K2:0.998, K3:0.999, zero:0.995}
+- extreme_reject_threshold analogous on low end
+- agreement_threshold = 0.98; for accept may require both p_final threshold + agreement_threshold
+- ensemble weights start: aggregator 0.45, GLM 0.30, SRM 0.25 (re‑tune with per‑pattern validation)
+- base_z = 1.645; γs = {FP_risk:1.0, model_disagreement:0.6, novelty_score:1.0}; λ_trust = 0.35; w_dis = 0.80
+
+8) CI tests, validation experiments & acceptance criteria
+- CI test matrix (additions + expected outcomes):
+  - Z1: zero_spend, n==1, CryoSleep=True, untrusted zero_subslice (0101_01) → expected: route_to_priority_audit (not auto_reject).
+  - Z2: zero_spend trusted subslice → expected: normal thresholding (auto_accept possible).
+  - A: concentrated_top3 nontrusted, n==1 (0099_01) → expected: route_to_priority_audit.
+  - G: zero_spend untrusted, age=2 (0099_02) → expected: route_to_priority_audit.
+  - NEW: C1: concentrated_top1 untrusted, n==1 (0102_01) → expected: route_to_priority_audit (not auto_accept); if subslice trusted and calibrated p_final > threshold → auto_accept allowed.
+  - Historical failing cases (0098_02, 0099_01, 0099_02, 0101_01, 0102_01) included in shadow runs.
+- Validation experiments:
+  - Retrain calibrator/glm with grouped CV by ordered_topK_id & zero_key; test on held‑out historical problem cases.
+  - Shadow deploy scorer with symmetric gating + updated floors on recent live batches and check audit queue and per‑pattern metrics.
+- Acceptance targets (vs v3.5.8 baseline):
+  - zero_spend FN rate: ≥30% relative reduction on historical zero_spend FN cases (target).
+  - concentrated_top3 FP rate: ≥30% relative reduction.
+  - concentrated_top1/2 FP rate: ≥25% relative reduction (new target; addresses 0102_01).
+  - overall concentrated recall loss ≤2% absolute.
+  - overall FN increase ≤3% absolute (aim ≤1%).
+  - Audit queue up to 1.5× for first 2 weeks; must trend down after 4 weeks as subslices reach min_n_by_pattern.
+- Mandatory ablations:
+  - Disable direction‑aware shift → measure zero_spend FN change.
+  - Remove zero_spend×CryoSleep covariate in calibrator → measure degradation.
+  - Lower concentrated_nontrusted_floor (K1) → check FP increase.
+
+9) Monitoring & alerting additions
+- New canaries & dashboards:
+  - Per‑pattern ECE, Brier score, precision/recall for zero_spend and concentrated_top1/2/3.
+  - Per‑combo FP/FN alerts (top n problematic ordered_topK combos).
+  - n==1 FP/FN rate monitoring, fraction of n==1 routed to audit, and time‑to‑trust (time until N_subslice ≥ min_n_by_pattern).
+  - CI coverage: fraction of true labels within predicted quantile intervals (10–90).
+  - Ensemble agreement histogram & model_disagreement trend.
+  - Audit queue size and time to label.
+- Alerts:
+  - If concentrated_top1 FP rate increases >20% over baseline for 24h → immediate rollback or block of auto_accept for concentrated_top1 until fixed.
+  - If zero_spend FN rate increases >15% → block auto_reject for zero_spend until investigation.
+
+10) Immediate operational actions (0–72 hours)
+1. Engineering:
+   - Add zero_spend flag, ordered_topK combos (K up to 3), novelty_score, spend_entropy, CryoSleep flag to daily rollups & feature store.
+   - Update slice_trust_table schema to include zero_subslice and ordered_topK keys with context; seed with historical aggregates.
+2. Scoring engine (stopgap / shadow):
+   - Implement symmetric n==1 gating for untrusted zero_spend & concentrated_topK (route to priority_audit).
+   - Implement direction‑aware logit_shift with model_disagreement damping and raised SE floors (K1 floor→0.10).
+   - Add per‑record provenance logging (snapshot_id, decision_reason_code, model_disagreement, applied_logit_shift).
+   - Shadow this scorer across recent batches (include 0099_01, 0099_02, 0101_01, 0102_01).
+3. ML:
+   - Retrain GLM_fallback v16 including pattern×context interactions (zero_spend×CryoSleep/Age/HomePlanet; ordered_topK×Age/HomePlanet/Cabin_deck/Destination).
+   - Train covariate calibrator (LightGBM quantile / small Bayesian NN) to output p_final + uncertainty; grouped CV.
+   - Prepare AL sampling prioritized for zero_spend × CryoSleep contradictions and concentrated_top1 contradictions (e.g., top1_share ≥ 0.80 but label negative).
+4. Ops & Monitoring:
+   - Activate canary metrics for zero_spend FN rate, concentrated_top1 FP rate, and n==1 audit routing.
+   - Block full live rollout until shadow & canary acceptance criteria met.
+5. Product / Auditing:
+   - Fast‑labeling path for priority contradictions (zero_spend×CryoSleep and concentrated_top1 contradictions).
+   - Triage to collect labels until subslices reach min_n_by_pattern.
+
+Deliverables (next artifacts)
+- Deterministic scorer skeleton implementing:
+  - zero_spend detection + ordered_topK hashing
+  - symmetric n==1 gating (audit routing)
+  - direction‑aware logit_shift with model_disagreement damping
+  - raised SE floors for patterns and per‑record provenance logging
+  - shadowable config for batch snapshotting
+- Minimal CI test suite including 0099_01, 0099_02, 0098_02, 0101_01 and new 0102_01.
+- zero_subslice + ordered_topK aggregation script + updated slice_trust_table schema with seeded min_n_by_pattern and τ_pattern.
+- GLM_fallback v16 + covariate calibrator retrain plan & validation report.
+- Dashboards & canary config for pattern performance and n==1 metrics.
+- AL sampling plan for zero_spend and concentrated_top1 contradictions.
+
+One‑line summary
+v3.6.0: Enforce symmetric n==1 gating (route untrusted zero_spend & concentrated_topK to audit), add zero_spend×context and ordered_topK×context semantics in calibrator & slice_trust_table, damp direction‑aware logit shifts by novelty and model_disagreement, raise pattern SE floors (esp. concentrated_top1), and prioritize AL to grow trusted subslices — preventing confident FNs like 0101_01 and FPs like 0102_01 while preserving batch consistency.
+
+Recommendation — immediate next artifact to prepare
+- Produce the deterministic scorer skeleton + minimal CI test suite first (high priority). This is shadowable and yields immediate protection (symmetric gating + provenance logging + raised floors). In parallel, prepare zero_subslice aggregation script and begin retraining the calibrator/GLM_fallback.
+
+If you want, I will:
+- produce the deterministic scorer skeleton + minimal CI tests (recommended immediate step), or
+- produce the zero_subslice aggregation script + updated slice_trust_table schema (recommended parallel step).
+
+Which should I prepare first?
+
+============================================================

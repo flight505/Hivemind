@@ -1,0 +1,38 @@
+PREDICTIVE RULES - ITERATION 3
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. If two or more passengers share the same Cabin identifier, treat them as a group and assign the same Transported label to all cabin‑mates; derive the group's prediction by majority vote of the members' signals, and break ties in favor of "Transported" when the group majority has near‑zero total onboard spending or includes an infant (Age ≤ 2) or a majority of CryoSleep=True.
+
+2. If Age ≤ 2, Predict Transported = True.
+
+3. If 3 ≤ Age ≤ 17 and the passenger shares a cabin with at least one adult who is predicted Transported = True, then Predict Transported = True; if no cabin adult information is available but the child's total onboard spending (RoomService + FoodCourt + ShoppingMall + Spa + VRDeck) is very low (≤ 10), Predict Transported = True.
+
+4. If Age ≥ 60, Predict Transported = True.
+
+5. Define "very low total spending" as total onboard spending ≤ 10 and "small nonzero spending" as total ≤ 100. If CryoSleep = True AND total spending ≤ 10 AND (HomePlanet is a historically high‑preservation planet OR the cabin majority are CryoSleep=True OR Age ≤ 4 OR VIP = True), then Predict Transported = True.
+
+6. If CryoSleep = True AND total spending ≤ 10 AND none of the supportive signals in rule 5 (no high‑preservation HomePlanet, no cabin CryoSleep majority, not very young, not VIP) are present, then Predict Transported = False.
+
+7. If CryoSleep = True AND total spending > 10, Predict Transported = False, except allow an override to True when HomePlanet is a high‑preservation planet AND total spending is still only a small nonzero amount (≤ 100) AND the cabin majority are CryoSleep=True.
+
+8. If CryoSleep is False or missing AND total spending ≤ 10 AND (HomePlanet is a historically high‑preservation planet OR Age ≤ 12 OR VIP = True OR the cabin majority also have near‑zero spending), then Predict Transported = True.
+
+9. Treat high VRDeck usage as a strong "active / not transported" signal: if VRDeck spending ≥ 1000, Predict Transported = False, unless the passenger is an infant/toddler (Age ≤ 2) or the VRDeck amount is the only nonzero spend and the cabin majority are CryoSleep=True.
+
+10. Modulate aggregate spending thresholds by HomePlanet: compute total onboard spending. For HomePlanets with stronger active‑usage patterns (e.g., Earth, Mars) treat total_spend ≥ 1,500 as a Not‑Transported signal; for HomePlanets with stronger preservation patterns (e.g., Europa) raise the threshold so that total_spend ≥ 6,000 is required before treating it as a Not‑Transported signal.
+
+11. For very large single‑amenity excursions (FoodCourt, ShoppingMall, Spa), treat extreme one‑amenity spikes as Not‑Transported for Earth/Mars at lower cutoffs (e.g., ≥ 3,000); for preservation‑biased HomePlanets raise those single‑amenity cutoffs (e.g., ≥ 8,000) before calling Not‑Transported.
+
+12. Modulate spending thresholds by Destination: if Destination historically correlates with high onboard activity (higher active usage), reduce the "Not‑Transported" spending thresholds by ~25% (more likely Not‑Transported at lower spend); if Destination correlates with low onboard activity/preservation, increase spending thresholds by ~25% (require more spend to mark Not‑Transported).
+
+13. VIP handling: treat VIP with caution — if VIP = True and total spending > 0, default to Predict Transported = False unless there is strong preservation evidence (CryoSleep=True with supportive homeplanet/cabin signals or Age ≤ 4 or cabin majority Transported) in which case allow Predict = True.
+
+14. Mixed‑signal tie‑breaking priority: when features conflict, resolve in this order — (a) cabin/group consensus and family/age signals, (b) CryoSleep combined with sustained near‑zero spending and HomePlanet preservation tendency, (c) very high VRDeck or extreme amenity spikes, (d) aggregate total spending thresholds adjusted by HomePlanet/Destination. Use the highest‑priority applicable rule to decide.
+
+15. Missing data handling: when CryoSleep, HomePlanet, or Destination are missing, rely first on cabin‑level consensus (rule 1); if no cabin information, use age and total_spend heuristics (very low spend + child/senior → Transported; very high VRDeck/total_spend → Not‑Transported).
+
+16. Default fallback: if none of the above rules apply, Predict Transported = False.
+
+============================================================

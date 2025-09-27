@@ -1,0 +1,282 @@
+PREDICTIVE METRICS - ITERATION 61
+============================================================
+
+Updated Predictive Metrics Report — v3.5.3 (post_0086_01)
+
+Version & high‑level goal
+- Version: v3.5.3 (post_0086_01).
+- High‑level goal: preserve prior v3.5.2 improvements (per‑channel spend bins, conditional concentrated‑spend penalties, trusted‑slice exceptions, extended zero_spend subslice trust) and simultaneously:
+  - restore recall for legitimate concentrated‑spend positives (fixed in post_0084_01 plan),
+  - reduce false positives on high multi‑channel spend records (new failure 0086_01),
+  - introduce multi‑channel subslice trust and pattern‑type aware calibration,
+  - implement context‑aware small‑batch gating that prevents single‑record FP/ FN extremes,
+  - prioritize active learning for concentrated and multi‑channel contradictions.
+
+Executive summary — immediate takeaway and top priorities
+- New failure observed (batch error): 0086_01 — RoomService=211, Spa=638, VRDeck=513, all other spends 0, CryoSleep=False, Age=43, Cabin=F/17/P, Destination=TRAPPIST-1e → predicted True, actual False (FP).
+- Why this matters: v3.5.* had corrections to reduce FPs for concentrated single‑channel extremes; however, this FP shows that high total spend distributed across multiple premium channels can produce strong positive signals in the ensemble/calibrator, but may be non‑predictive (or even negatively correlated) in certain contexts. We must (a) distinguish concentrated_top1 patterns from multi‑channel high spend patterns, (b) learn slice priors for multi‑channel combos (top2/top3), and (c) make calibrator/outlier penalties pattern type aware.
+- Root causes (short):
+  - slice_trust_table lacked multi‑channel subslice definitions (only zero_spend & concentrated_top1 targeted in prior update),
+  - calibrator/GLM did not include spend_entropy / num_nonzero_channel features or multi‑channel combo covariates → allowed global positive boost for high total_spend,
+  - ensemble variance/SE underestimated uncertainty for rare multi‑channel combos → overconfident p_final,
+  - single‑record (n==1) gating allowed auto decisions without contextual trust checks.
+- Top immediate priorities:
+  1. 0–48h: Add multi_channel_subslice aggregation (top2/top3 combos) and trust scoring; block auto‑accept for single records with high multi‑channel spend unless subslice trusted.
+  2. 2–14d: Retrain GLM_fallback and covariate calibrator to include pattern_type (zero/concentrated/multi), spend_entropy, num_nonzero_channels, and multi_channel_subslice ids; use stratified CV emphasizing these slices.
+  3. Weekly: Active learning to prioritize multi_channel contradictions and concentrated contradictions.
+  4. Monitor: concentrated FP control while restoring concentrated recall; track multi‑channel FP reduction.
+
+Primary error details (concrete)
+- 0086_01 features: total_spend = 1362 (RoomService 211 + Spa 638 + VRDeck 513), num_nonzero_channels = 3, top_channel = Spa, top2 = VRDeck/RoomService, top_channel_percentile >0.99, spend_entropy = medium/high, CryoSleep=False, Age=43, Cabin=F/17/P, Destination=TRAPPIST-1e.
+- Model outcome: ensemble produced strong positive signal → p_final high → pred True. Actual was False → FP.
+- This contrasts with previously addressed FN 0084_01 (extremely concentrated RoomService) which required reducing blanket outlier penalties.
+
+Answers to the six questions (detailed)
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Pattern: high total_spend distributed across multiple premium channels (Spa + VRDeck + RoomService), not a single concentrated channel.
+- Why the model overpredicted:
+  - Global features like total_spend and absolute spend magnitudes were overweighted by models/calibrator without enough conditioning on the pattern shape (entropy, num_nonzero_channels) and contextual slice priors (age_bucket × deck × destination).
+  - No multi_channel_subslice prior existed, so the model relied on sparse per‑channel priors and ensemble signals; ensemble variance underestimated uncertainty for rare multi‑channel combos.
+  - Small‑batch logic allowed an auto decision for a single record with high but unsupported multi‑channel signal, increasing FP risk.
+- Measurable indicators in metrics:
+  - High model agreement on positive class but low slice N (i.e., bin_n small for that precise combination),
+  - High novelty_score for the multi‑channel combo despite high absolute spend,
+  - Low slice_trust_score (no matching multi‑channel subslice),
+  - Low posterior_se inclusion from slices → se_combined too small → z_adj insufficient.
+
+2) How should decision rules be modified to prevent similar errors?
+Principles:
+- Differentiate pattern types: zero_spend, concentrated_top1, multi_channel_high_spend (top2/top3), dispersed lowspend. Apply distinct priors, penalties, and calibrator corrections per pattern_type.
+- Make outlier/novelty penalties conditional on (trusted) subslice presence and pattern type. If no trusted subslice, inflate SE and apply logit_shift, proportional to novelty and sparsity.
+- For n==1 batches, be conservative for nontrusted multi_channel/extreme records: prefer audit or require stronger ensemble consensus.
+
+Concrete rule changes:
+- Extend slice_trust_table to include:
+  - multi_channel_subslice keys: ordered top2_combo_id (e.g., Spa+VRDeck), ordered top3_combo_id,
+  - multi_channel_subslice candidates formed by topK channels with thresholds on per‑channel percentile (e.g., channel >= 0.2 of total_spend) or absolute spend bins.
+- Trust logic (hierarchical):
+  - For any matched subslice (zero, concentrated, multi): if N_slice ≥ slice_trust_min_n_pattern and TP_rate ≥ slice_trust_TP_threshold → Trusted.
+  - Pattern‑specific min_n: concentrated_min_n = 50, multi_channel_min_n = 30, zero_spend_min_n = 50 (tunable).
+- Penalty & SE rules:
+  - If pattern_type == multi_channel AND no trusted subslice:
+    - Apply multi_channel_logit_shift (δ_logit_multi, init 1.0) scaled by novelty_score,
+    - Increase var_novelty_component (var_multi) to reflect combination sparsity,
+    - Raise base_min_se for multi_channel_nontrusted (init 0.06–0.08).
+  - If pattern_type == concentrated AND trusted_subslice: do NOT apply logit_shift_outlier and lower base_min_se (0.02–0.03).
+- Small‑batch n==1 gating:
+  - If n==1 and pattern_type in {multi_channel, concentrated} and NOT trusted: do NOT auto‑accept on p_final alone. Route to priority_audit unless p_combined_after_penalty > extreme_high_conf_threshold (e.g., 0.98) AND ensemble agreement extremely high and past similar slices have reliable TP.
+- Prior fusion:
+  - Combine channel_bin priors and any matching subslice priors via hierarchical weights:
+    - w_slice = min(1.0, N_slice/(N_slice + τ_slice_pattern)) with τ_slice_pattern pattern specific (τ_multi smaller to allow some contribution from rarer combos).
+  - If multiple subslices match (e.g., RoomService×Age and Spa+VRDeck pair), use hierarchical specificity: more specific subslice gets higher weight.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Multi‑channel premium spenders are a distinct behavioral pattern from concentrated spenders. They do not simply amplify the signal of "spend = transported"; their predictive direction depends heavily on demographic/contextual factors (age, cabin deck, destination).
+- Trust must be pattern‑aware: both extremes (zero_spend and concentrated_top1) and dispersed multi_channel high spend can be predictive, but only in contextually supported slices.
+- Calibration should be covariate‑aware — one‑size global penalization or boosting by spend magnitude yields both FNs and FPs depending on pattern type.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Introduce pattern‑aware variance terms. Let pattern ∈ {zero, concentrated, multi, dispersed}. Compute:
+  - var_slice (per matched subslice) ≈ posterior_mean_slice*(1−posterior_mean_slice)/(N_slice + 1).
+  - var_pattern = κ_pattern * f(n_nonzero, spend_entropy, novelty_score), where κ_pattern tuned per pattern_type.
+- Combined variance:
+  - var_combined = α_prior^2 * var_prior + α_ens^2 * var_ensemble + var_novelty_conditional + β_slice * var_slice + β_pattern * var_pattern
+  - var_novelty_conditional = var_novelty if no trusted subslice for that pattern_type; else a small floor (e.g., 1e‑6).
+- SE floor contextualization (n==1):
+  - trusted_slice floor = 0.02
+  - multi_channel_nontrusted = 0.06 (init; tune)
+  - concentrated_nontrusted = 0.05
+  - high_novelty & not trusted = 0.08–0.10
+- z_adj scaling (decision margin) computed as:
+  - z_adj = base_z * (1 + γ1 * FP_risk + γ2 * model_disagreement + γ3 * novelty_score)
+  - If trusted_slice_flag True → z_adj *= (1 − λ_trust)
+- Replace simple Platt scaling with a covariate‑aware calibrator that consumes:
+  - [p_combined_after_penalty, novelty_score, pattern_type, spend_entropy, num_nonzero_channels, top_channel_percentile, model_disagreement, subslice_id_flag]
+  - This allows the calibrator to learn different mapping for concentrated vs multi_channel patterns and to reduce global positive bias on multi_channel high spenders.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Deterministic snapshotting: snapshot channel_spend_bin, slice_trust_table (zero/concentrated/multi), calibrator weights, hyperparams at batch start; tag outputs with snapshot_id.
+- Deterministic gating rules for small batches: no auto‑accept if n==1 & pattern is multi_channel or concentrated and subslice not trusted.
+- Provenance & audit logging per record: record pattern_type, subslice matches, N_slice(s), posterior_slice_mean/SE, p_prior, p_ens, p_combined_prepenalty, logit_shift_amounts, var_components, se_combined, p_final, decision_reason_code.
+- CI unit tests & regression cases including both FNs (0084_01) and FPs (0086_01); maintain stable behavior across snapshotting.
+- Canary & rollout: block deployment if multi_channel FP rate increases > 8% absolute vs. canary baseline or concentrated recall decreases > 2% absolute.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New per‑record features to persist and monitor:
+  - num_nonzero_channels, spend_entropy (Shannon over normalized spends), topK_combo_id (ordered), total_spend, top_channel_share, top2_share, pattern_type flag.
+- Model & training changes:
+  - GLM_fallback v13 → v14:
+    - Add features: pattern_type (onehot), num_nonzero_channels, spend_entropy, ordered top2/top3_combo IDs (embedding/ordinal), interactions: pattern_type × age_bucket, pattern_type × cabin_deck, pattern_type × destination, novelty_score.
+    - Use stratified sampling oversampling small positive‑but‑predictive subslices (concentrated and multi_channel).
+  - Calibrator: covariate‑aware GBM/monotonic logistic calibrated with group CV by subslice_id and pattern_type.
+- Active learning & labeling prioritization:
+  - Prioritize contradictions for:
+    - concentrated contradictions (pred False, actual True),
+    - multi_channel contradictions (pred True, actual False) — this FP type,
+    - zero_spend contradictions.
+  - Upweight these in subsequent retrain cycles to accelerate trust formation for multi_channel subslices and correct false positive weights.
+- Preprocessing:
+  - Preserve raw spends for bin lookup; feed winsorized/log1p spends to models to reduce leverage from extreme outliers.
+- Smoothing & partial pooling:
+  - Use empirical Bayes or hierarchical smoothing for subslice priors to share strength across similar subslices (e.g., Spa+VRDeck in deck F shares info with Spa+VRDeck in deck G via higher level groups such as top2_combo × deck_group).
+
+Updated deterministic scoring pipeline (v3.5.3 post_0086_01) — condensed flow
+1. Snapshot load at batch start: channel_spend_bin, channel_spend_stats, slice_trust_table (zero_spend, concentrated_subslices, multi_channel_subslices), models & calibrators, hyperparams, snapshot_id.
+2. Preprocessing per record:
+   - Compute total_spend, num_nonzero_channels, zero_spend_flag, concentrated_top1_flag, multi_channel_flag (num_nonzero ≥ 2 and topK shares meet thresholds), topK ordered combos, top_channel_percentile, spend_entropy, Age_bucket, Cabin_deck, Destination, HomePlanet.
+   - Pattern_type = argmax in {zero, concentrated, multi, dispersed} based on rules.
+   - Generate subslice candidate keys (zero_splice keys, concentrated keys, multi_channel combo keys).
+   - Compute novelty_score; set novelty_contribution near 0 if any matching trusted subslice found.
+3. Prior lookups:
+   - Lookup channel_spend_bin posterior_mean & SE, any matching subslice posterior_mean & SE; compute hierarchical slice_prior using pattern_type weights and N_slice/(N_slice+τ_pattern).
+4. Model inference:
+   - Run GLM_fallback v14, aggregator, SRM; obtain per‑model p ± SE and model_disagreement.
+5. P_prior & p_combined_prepenalty:
+   - P_prior = weighted combination of channel_bin priors and subslice priors.
+   - p_combined_prepenalty = α_prior * P_prior + α_ens * E.
+6. Outlier & pattern handling:
+   - If pattern_type == concentrated AND no trusted_subslice: apply concentrated logit_shift_outlier (δ_logit_conc * novelty_scale) and var_novelty increase.
+   - If pattern_type == multi AND no trusted_subslice: apply multi_channel_logit_shift_outlier (δ_logit_multi * novelty_scale) and larger var_novelty (var_multi).
+   - If any_trusted_subslice_flag True: suppress logit_shift_outlier and reduce var_novelty; subslice_prior contributes more strongly.
+7. Variance & SE:
+   - Compute var_prior (including var_slice), var_ensemble, var_novelty_conditional; var_combined = α_prior^2*var_prior + α_ens^2*var_ensemble + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern.
+   - se_combined = sqrt(max(var_combined, base_min_se(context)^2)).
+8. Calibrate:
+   - Input to covariate_calibrator: [p_combined_after_penalty, novelty_score, pattern_type, spend_entropy, num_nonzero_channels, top_channel_percentile, model_disagreement, subslice_trust_score].
+   - p_final = calibrator.predict(...)
+9. Decisioning & gating:
+   - If trusted_subslice_flag True and p_final ≥ accept_threshold_trusted → auto‑accept.
+   - Else if n==1 & pattern_type in {multi, concentrated} & NOT trusted → route to priority_audit unless p_final > extreme_consensus_threshold.
+   - Else standard thresholding with z_adj pattern corrections.
+10. Persist per‑record provenance fields and append contradictions to active learning queues.
+11. After batch: update slice_trust_table & channel_spend_bin counts with labeled results (exponential decay); schedule retrain if contradictions exceed thresholds.
+
+Default hyperparameters (initial; tuning required)
+- slice_trust_min_n:
+  - zero_spend: 50
+  - concentrated: 50
+  - multi_channel: 30
+- slice_trust_TP_threshold = 0.70
+- τ_slice (pooling factor):
+  - concentrated τ_conc = 100
+  - multi τ_multi = 60 (lower to allow some pooling for rarer combos)
+- channel_spend_bin_min_n = 30
+- extreme_percentile_threshold = 0.995
+- top2_share_concentrated = 0.95
+- δ_logit_outlier:
+  - concentrated (if no trust) δ_logit_conc = 0.8
+  - multi_channel (if no trust) δ_logit_multi = 1.0–1.2 (sweep)
+- β_slice = 1.0
+- β_pattern initial = 1.0
+- small_batch_min = 10
+- base_min_se (n==1):
+  - trusted_slice floor = 0.02
+  - multi_channel_nontrusted = 0.06
+  - concentrated_nontrusted = 0.05
+  - novelty_high & not trusted = 0.08
+- z parameters:
+  - base_z = 1.645; γ1 = 1.0; γ2 = 0.6; γ3 = 1.0; λ_trust = 0.35
+- calibrator: covariate GBM/monotonic logistic; group CV by subslice_id & pattern_type
+- ensemble weights start: aggregator 0.45, GLM 0.3, SRM 0.25
+- var_novelty κ initial = 0.015; var_multi scale factor larger (×1.5–2.0)
+
+Validation experiments & acceptance criteria
+- Stratified validation slices:
+  - zero_spend × CryoSleep, concentrated_spend × top_channel × Age_bucket × Cabin_deck, multi_channel × (Spa+VRDeck, Spa+VRDeck+RoomService) × Age_bucket × Cabin_deck.
+- Test sets to include failing batches: 0069_01..0086_01 (include 0084_01 FN and 0086_01 FP), plus synthetic multi_channel OOD cases.
+- Metrics to evaluate:
+  - Per‑slice recall & precision, Brier score, ECE, CI coverage, audit precision/recall, small‑batch FP/FN rates.
+- Acceptance criteria (vs. v3.5.1 baseline):
+  - zero_spend subslice recall (for N ≥ slice_trust_min_n): no recall drop >1% absolute.
+  - concentrated_spend trusted subslice recall: no recall drop; ideally improvement vs. v3.5.2.
+  - multi_channel FP rate (for multi_channel patterns) reduction: ≥30% relative decrease on historical FP cases (including 0086_01) in validation.
+  - Overall FN increase ≤5% (with per‑slice constraints).
+  - Audit load allowed up to 1.5× initially; must reduce within 4 weeks.
+- Parameter sweeps:
+  - slice_trust_min_n_multi ∈ {20,30,50}, δ_logit_multi ∈ {0.8,1.0,1.2}, base_min_se_multi ∈ {0.04,0.06,0.08}, τ_multi ∈ {40,60,100}.
+- Ablation experiments:
+  - Remove multi_channel subslice → measure FP re‑increase,
+  - Calibrator w/o pattern covariates → measure calibration deterioration on multi_channel group.
+
+Unit test matrix (add to CI)
+- Case A (audit expected): concentrated extreme RoomService (e.g., RoomService=7406, others 0) → route to priority_audit (no auto‑accept).
+- Case B (trusted accept expected): zero_spend & CryoSleep True → auto‑accept.
+- Case C (trusted accept expected): zero_spend child deck F → auto‑accept if subslice trusted.
+- Case D (concentrated accept expected): 0084_01 (RoomService=688, VRDeck=17, Age=24, Cabin G) → if concentrated_subslice trusted → auto‑accept; if not trusted → audit (not auto‑reject).
+- Case E (nontrusted concentrated): concentrated_top1 unusual channel & no supporting slice → audit.
+- Case F (multi_channel FP case): 0086_01 (RoomService=211, Spa=638, VRDeck=513, Age=43, Cabin F) → expect: reduced p_final; ideally route to priority_audit OR predict False depending on retrained calibrator; at minimum must avoid confident FP auto‑accept.
+- Case G (OOD synthetic): many extreme multi‑channel spends unseen ranges → verify logit penalty, increased SE, audit routing.
+- Case H (regression): ensure concentrated_spend FP/FN and zero_spend metrics do not regress beyond thresholds.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+  - Generate daily multi_channel_subslice aggregation (top2/top3 combos): compute N_slice, TP_rate, posterior_mean, posterior_se; append to slice_trust_table.
+  - Expose low‑latency lookup for new subslice table and per‑record pattern_type flags.
+2. Scoring engine:
+  - Implement preprocessor update to compute spend_entropy, num_nonzero_channels, topK combos and pattern_type.
+  - Implement conditional novelty/outlier penalty suppression for trusted_subslices (zero/concentrated/multi).
+  - Implement small‑batch gate: block auto‑accept for single nontrusted multi/concentrated records.
+  - Add per‑record provenance logging fields.
+  - Shadow run v3.5.3 (post_0086_01) for last N batches including failing ones.
+3. ML:
+  - Retrain GLM_fallback v14 and covariate calibrator including new features & pattern_type.
+  - Run parameter sweeps for δ_logit_multi and base_min_se_multi.
+4. Ops/SRE:
+  - Add canary metrics for multi_channel FP & concentrated recall; block rollout until acceptance criteria met.
+5. Product/ops:
+  - Update human audit triage to prioritize multi_channel contradictions and concentrated contradictions.
+6. Monitoring:
+  - Dashboards: multi_channel FP rate, concentrated recall, novelty distribution for multi_channel records, audit queue composition, ECE by pattern_type.
+
+How the updated pipeline would handle concrete cases
+- 0086_01 (RoomService=211, Spa=638, VRDeck=513) — new FP:
+  - Preprocess: pattern_type detected as multi_channel (num_nonzero=3, top2_combo Spa+VRDeck).
+  - Lookup: if multi_channel_subslice Spa+VRDeck × deck F × Age_bucket 40–50 is not trusted (likely small N) → apply multi_channel_logit_shift and inflate SE via var_multi_component.
+  - Calibrator (pattern aware) reduces global positive boost due to spend_entropy and multi_channel signature, producing lower p_final; small‑batch gating (n==1) will route to priority_audit rather than auto‑accept unless p_final extremely confident and ensemble consensus high.
+  - Expected outcome: prevent confident FP; either audit or corrected probability (lower p_final) → aligns decision with actual False more often.
+- 0084_01 (concentrated RoomService=688) — prior FN:
+  - Preprocess: pattern_type concentrated_top1 (RoomService).
+  - Lookup: concentrated_subslice RoomService × Age_bucket 20–30 × deck G matches trusted_subslice (if available from prior updates) → suppress outlier logit_shift, include slice_prior with lowered SE; calibrator trained to respect concentrated positive slices will increase p_final → auto‑accept. If subslice not yet trusted but broader RoomService×Age 20–30 exists → partial prior weight and likely route to audit instead of reject.
+  - Expected outcome: reduce FN while not increasing FP.
+
+Expected tradeoffs & mitigations
+- Tradeoffs:
+  - Audit volume may increase temporarily for nontrusted multi_channel combos while trust accumulates.
+  - Additional complexity in slice_trust_table growth and maintenance; tracking top2/top3 combos increases storage and lookup cardinality.
+- Mitigations:
+  - Use lower slice_trust_min_n for multi_channel combos (30) and hierarchical pooling (τ_multi) so related slices contribute; active learning to label contradictions quickly and accelerate trust formation.
+  - Conservative initial trust thresholds and strong canary gating to prevent runaway FP/recall regressions.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudocode implementing pattern‑aware logic (preprocessing, priors, conditional outlier penalty suppression, covariate calibrator call, gating).
+- multi_channel_subslice aggregation & retention/decay policy (daily update script).
+- slice_trust_table extension with multi_channel subslices and decayed counts.
+- Retrain artifacts: GLM_fallback v14 + covariate calibrator + stratified validation report.
+- CI unit test suite including 0084_01 and 0086_01 test cases.
+- Dashboard & canary configuration for multi_channel FP and concentrated recall.
+- 72‑hour implementation checklist mapped to owners.
+
+Pseudocode skeleton (high level)
+- For each record:
+  - compute spends, total_spend, num_nonzero, spend_entropy, topK_combo
+  - determine pattern_type ∈ {zero, concentrated, multi, dispersed}
+  - lookup slice_priors for matching channel_bin and any subslices (zero, concentrated, multi)
+  - form P_prior via hierarchical weighting
+  - run ensemble → p_ens ± se_ens
+  - if NOT trusted_subslice and pattern_type==multi: apply logit_shift_multi (scaled by novelty) and increase var_multi
+  - compute var_combined including var_pattern
+  - se_combined = sqrt(max(var_combined, base_min_se(pattern_type, trusted)))
+  - p_after_penalty = apply_logit_shift(p_combined_prepenalty)
+  - p_final = covariate_calibrator.predict([p_after_penalty, pattern_type, spend_entropy, ...])
+  - if n==1 and pattern_type in {multi, concentrated} and NOT trusted: route to priority_audit unless p_final > extreme_consensus
+  - else decide using p_final and z_adj
+  - persist provenance
+
+One‑line summary
+v3.5.3 (post_0086_01) augments v3.5.2 by adding pattern_type awareness (including multi_channel subslice trust), pattern‑aware outlier/novelty penalties, covariate‑aware calibration that includes spend_entropy and multi_channel features, deterministic small‑batch gating, and active‑learning prioritization — preventing confident multi_channel FPs like 0086_01 while preserving recall gains for legitimate concentrated positives like 0084_01.
+
+Recommended immediate next action
+Implement multi_channel_subslice table + trusted_subslice lookup and pattern_type detection in a shadow scorer (0–48h); simultaneously prepare GLM_fallback v14 and covariate calibrator retraining with pattern covariates (2–14d). I can deliver the deterministic scorer skeleton (Python pseudocode) and a minimal CI test suite (including 0084_01 and 0086_01) next — which would you like first?
+
+============================================================

@@ -1,0 +1,248 @@
+PREDICTIVE METRICS - ITERATION 134
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short):
+  - A 1‑record batch (Passenger 0174_01) was auto‑predicted Transported=True but actual=False (false positive). Root causes: permissive n==1 auto‑decision logic + over‑reliance on aggregated spend features (multi‑channel high spend) → model produced an overconfident positive logit; calibrator underestimated uncertainty for this multi‑channel / high‑sum novelty slice; pooled‑priors did not provide adequate counter‑evidence for the rare spend pattern; per‑feature and total‑logit caps were too permissive for multi‑channel spend aggregation.
+- Immediate priority (0–6h):
+  - Stop n==1 auto‑decisions for fragile_flag that includes high_total_spend and multi_high_channel patterns; add 0174_01 to the canary list and route to priority_audit. Persist raw spends, per‑feature logit contributions, imputation provenance, pooled_prior snapshot id and cohort_id for 0174_01 and similar canaries.
+
+Concise answers to the six required questions (batch accuracy focus)
+1) What specific patterns caused this error?
+- Multi‑channel high spending (RoomService=287, VRDeck=175, Spa=115, sum_spend=593) produced a large positive spend signal even though no single channel dominated. Model summation of spend logits exceeded sensible bounds → high p_model. Calibrator and pooled priors were insufficiently conservative for this rare multi‑channel, high‑sum pattern in an n==1 batch.
+
+2) How should decision rules be modified to prevent recurrence?
+- Treat multi‑channel high‑sum records as fragile. For n==1 batches require strong multi‑model/cohort backing (high pooled_prior_tau & sufficient N_slice, GLM_fallback agreement, ensemble agreement, and low se_combined and tight quantile width) before auto‑decision. Otherwise route to priority_audit.
+
+3) What new insights about transport patterns?
+- Aggregate spend intensity across multiple channels is not equivalent to single‑channel dominance — it is a distinct slice with different transport behavior and higher variance. Multi‑channel high spend can correlate differently with Transported depending on cohort, age, HomePlanet and destination; treating it like a simple additive positive signal causes brittle decisions.
+
+4) How should confidence levels be recalibrated?
+- Use heteroskedastic, slice‑aware calibration (CQR or quantile head + variance net) that explicitly inflates uncertainty for:
+  - high_total_spend slices,
+  - multi_high_channel slices,
+  - small‑N slices and n==1,
+  - high novelty_distance records.
+  - Output p10/p50/p90 + sd and apply conservative se_floors for these fragile slices.
+
+5) What adjustments are needed for batch consistency?
+- Add batch_frac_fragile checks (if fraction fragile in batch ≥ threshold, hold auto‑decisions for entire batch). Make cohort a unit — conflicting cohort predictions hold the whole cohort. Persist transforms/provenance to avoid silent drift between scorer/calibrator/gate.
+
+6) How can metrics be improved to handle edge cases?
+- Add explicit slices and KPIs: high_total_spend_FP_rate, multi_high_channel_FP_rate, n==1_highsum_FP_rate, novelty_FP_rate. Add pooled priors stratified by sum_spend_bucket and multi_high_flag, per‑feature & total_logit caps, multi‑spend variance term, and sign‑consistency checks for multi‑channel patterns. Upweight these slices when retraining calibrator/model.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Feature engineering updates (v→v+1)
+- Persist raw inputs (required): RoomService, FoodCourt, ShoppingMall, Spa, VRDeck (value + imputation provenance).
+- New / persisted flags:
+  - sum_spend = sum of five channels (raw & log1p)
+  - num_high_spend_channels = count(ch in channels where spend ≥ CHANNEL_HIGH_THRESHOLD)
+  - multi_high_flag = num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD
+  - high_total_spend_flag = sum_spend ≥ SUM_SPEND_HIGH
+  - all_zero_flag, cryo_all_zero_flag, cryo_imputed_zero_flag (as before)
+  - per_channel_imputed_flags, missingness_count, num_nonzero_channels
+- Channel dominance & interaction features:
+  - top1_channel, top1_spend, top1_share, top2_spend, topk_share, spend_entropy_norm
+  - multi_channel_pair_sign_consistency (how often top2 pair correlated with transported historically)
+  - dominance_sign_consistency_score extended → multi_channel_sign_consistency_score
+- Novelty & cohort features:
+  - novelty_distance_norm to spend centroids (Mahalanobis or kNN)
+  - spend_cluster_id (kmeans/hdbscan), spend_cluster_transport_rate (smoothed)
+  - cohort_id, cohort_transport_consistency_score, in_batch_cohort_contradiction_flag
+- Recommended initial thresholds (sweepable):
+  - CHANNEL_HIGH_THRESHOLD = 100 (captures 0174_01 channels)
+  - MULTI_HIGH_THRESHOLD = 2
+  - SUM_SPEND_HIGH = 500
+
+B. Pooled priors (expanded stratification)
+- Add slice stratification for priors by:
+  - CryoSleep × all_zero_flag (existing)
+  - sum_spend_bucket (low / med / high), multi_high_flag, top1_channel, top1_share_bucket, HomePlanet, Age_bucket.
+- Empirical Bayes blend unchanged but increase N0 for fragile slices:
+  - N0_multi_high = 400 (start; sweepable)
+  - N0_high_total_spend = 400
+  - Continue backoff approach: if N_slice small, back off to coarser stratification before trusting tiny N.
+- Blend formula: μ_blend = τ_slice * μ_slice + (1−τ_slice) * μ_global, τ_slice = N_slice/(N_slice + N0_slice).
+
+C. Per‑feature logit caps & sign‑consistency down‑weighting
+- Caps (start values; sweepable):
+  - CAP_PER_FEATURE_LOGIT (spend features) = 2.0 (lowered)
+  - CAP_PER_FEATURE_LOGIT (VRDeck & Spa) = 1.8
+  - CAP_CRYOSLEEP_LOGIT = 2.0
+  - CAP_SUM_SPEND_LOGIT = 2.0
+  - CAP_TOTAL_SPEND_LOGIT = 2.5 (hard clamp on sum of spend logits)
+- Enforcement: compute per_feature_logit = clamp(raw_logit_contribution, −cap, +cap). For spend features, apply monotonic transform log1p(spend) before weight.
+- Down‑weighting rules:
+  - If multi_high_flag True and multi_channel_sign_consistency_score < 0.75 → scale spend contributions by max(0.4, sign_consistency_score).
+  - If high_total_spend_flag True and cohort_transport_consistency_score low/unknown → scale spend logits ×0.5–0.8.
+  - If any per_channel_imputed_flag True → downweight spend logits ×0.6–0.8.
+
+D. Variance / SE model (add multi‑spend terms)
+- Variance components (add to existing set):
+  - var_multi_spend = κ_multi * min(num_high_spend_channels, 3)
+  - var_total_spend = κ_total * log1p(sum_spend)
+  - var_channel_incoherence = κ_channel_incoh * (1 − multi_channel_sign_consistency_score)
+- Keep previously listed var_cryo, var_dom_channel, var_novelty, var_missingness, var_cohort_uncertainty, var_sign_inconsistency.
+- Combine:
+  - var_combined = var_base + dispersion + var_multi_spend + var_total_spend + ...; se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- Starting κ (conservative; sweepable):
+  - κ_multi = 0.18; κ_total = 0.12; κ_channel_incoh = 0.10
+  - κ_cryo = 0.25; κ_novel = 0.14; κ_high_spend = 0.12; κ_miss = 0.06; κ_sign = 0.08; κ_cohort = 0.05
+- SE floors:
+  - n==1 & (high_total_spend OR multi_high_flag): se_floor = 0.30–0.50
+  - n==1 & cryo_all_zero: se_floor = 0.30–0.50
+  - stable slices: se_floor = 0.06–0.10
+
+E. Decision‑gating (pattern‑aware + batch/cohort aware)
+- Fragile_flag (v2):
+  - cryo_all_zero_flag OR top1_dom_flag (top1_share ≥ 0.60) OR high_total_spend_flag OR multi_high_flag OR high_novelty_flag OR any per_channel_imputed_flag OR missingness_count ≥ 2 OR dominance_sign_consistency_score < 0.7 OR multi_channel_sign_consistency_score <0.75 OR in_batch_cohort_contradiction_flag
+- Batch/cohort checks:
+  - batch_frac_fragile = (#fragile_records_in_batch)/batch_size
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 0.05): pause auto‑decisions for entire batch; route to priority_audit/shadow.
+  - If cohort present and any members have contradictory predictions: route whole cohort → priority_audit.
+- n==1 gating for fragile_flag:
+  - If fragile_flag and n_batch==1, require ALL:
+      - pooled_prior_tau ≥ Z_high_slice AND N_slice ≥ N_min_slice
+      - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice)
+      - ensemble_agreement ≥ A_high
+      - se_combined ≤ SE_accept_slice AND quantile_width ≤ QW_accept_slice
+    Otherwise route → priority_audit.
+- Example initial thresholds:
+  - SUM_SPEND_HIGH = 500, CHANNEL_HIGH_THRESHOLD = 100, MULTI_HIGH_THRESHOLD = 2
+  - N_min_high_sum = 120; N_min_cryo = 100
+  - Z_high_slice = 0.95; A_high = 0.995
+  - SE_accept_high_sum = 0.10; se_floor_n1_highsum = 0.30–0.50
+  - BATCH_FRAGILE_THRESHOLD = 0.05
+
+F. Calibrator & GLM_fallback retrain plan (multi‑spend & novelty focused)
+- Calibrator:
+  - Heteroskedastic calibrator that outputs p10/p50/p90 & sd via CQR or quantile head + variance network.
+  - Inputs: raw_logit, sum_spend, num_high_spend_channels, multi_high_flag, per_channel_imputed_flags, top1_channel, top1_spend, top1_share, dominance_sign_consistency_score, multi_channel_sign_consistency_score, missingness_count, novelty_distance, cohort features.
+  - Loss: quantile pinball + ECE penalty + Brier. Upweight fragile slices:
+    - multi_high ×10, high_total_spend ×8, cryo_all_zero ×10.
+- GLM_fallback:
+  - Interpretable ElasticNet logistic with enforced per‑feature caps and key interactions (sum_spend × Age_bucket, sum_spend × HomePlanet, multi_high_flag × top1_channel).
+  - GLM_fallback_agrees when |p_model − p_glm| ≤ δ (start δ=0.06 for fragile slices).
+- Training:
+  - Rolling window 18–36 months; stratified CV ensuring fragile slices in each fold (oversample/stratify).
+  - Shadow run: 14–28 days with gating active and canaries blocked from auto‑accept.
+- Acceptance criteria (shadow run):
+  - high_total_spend FN/F P rates improve: e.g., high_total_spend_FP_rate ↓ ≥ 40–60%
+  - multi_high_FP_rate ↓ ≥ 40%
+  - cohort contradiction rate ↓ ≥ 50%
+  - global ECE not worse by >0.5% absolute
+
+G. Monitoring, metrics & alerts (batch‑focused)
+- Per‑slice KPIs:
+  - high_total_spend_FP_rate, multi_high_channel_FP_rate, multi_high_FN_rate, cryo_all_zero_FN_rate
+  - top1_dom_FP_rate_by_channel, novelty_FP_rate, n==1_auto_accept_rate
+- Batch KPIs:
+  - Batch_auto_decision_rate, Batch_frac_fragile, Batch_provenance_consistency_rate, Cohort_contradiction_rate.
+- Alerts:
+  - Any canary auto‑accepted → immediate page ML/Ops.
+  - high_total_spend_FP_rate increase > baseline + X% over 24h → page.
+  - batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD → automatically hold auto‑decisions & notify.
+  - Same‑cohort contradictory auto‑accept → page.
+- Canary list to add immediately: 0174_01 (current FP), 0172_01, 0171_01, 0170_01.
+
+H. CI unit tests & validation (cover multi_high, high_total_spend, cryo_all_zero, top1_dom, novelty, cohort)
+- Unit tests:
+  - multi_high_flag and high_total_spend_flag computed identically across scorer/calibrator/gate.
+  - se_combined increases for multi_high_flag & high_total_spend & novelty_flag.
+  - calibrator widens p10/p90 for multi_high and high_total_spend records.
+  - pooled_prior blending respects large N0_high_total and prevents tiny N slices from dominating.
+  - per_feature & total spend logit caps enforced.
+  - batch_frac_fragile ≥ threshold disables auto‑decisions.
+  - cohort contradiction detection holds cohort.
+  - Canaries (0174_01, 0172_01, 0171_01, 0170_01) must not be auto‑accepted during gating tests.
+- Regression tests:
+  - Global ECE, AUC, Brier degrade less than tolerance when gating enabled.
+  - Integration tests validate end‑to‑end persistence of imputation provenance and per_feature_logit contributions.
+
+I. Operational actions (0–72 hours) — precise timeline
+1) Immediate (0–6h)
+   - Deploy gating patch: block auto‑decisions for any n==1 record with fragile_flag including high_total_spend_flag OR multi_high_flag; add 0174_01 & previously listed canaries to canary list and block them.
+   - Persist provenance fields: per‑channel raw spends (observed vs imputed), per‑feature logit contributions, pooled_prior_snapshot_id, cohort_id.
+   - Enforce temporary per‑feature logit caps: spend per_feature cap 2.0; VRDeck/Spa 1.8; CAP_SUM_SPEND_LOGIT = 2.0; CAP_TOTAL_SPEND_LOGIT = 2.5.
+   - Escalate: any auto‑accept for fragile_flag → priority_audit page.
+2) Short‑term (6–24h)
+   - Expose variance components (var_multi_spend, var_total_spend, var_cryo, var_novelty, se_combined) in scoring output for debugging.
+   - Implement batch‑level check to pause auto‑decisions if batch_frac_fragile ≥ 5% and cohort contradiction detection.
+   - Instrument dashboards for high_total_spend_FP_rate and multi_high_channel_FP_rate; set alerts.
+3) Mid‑term (24–72h)
+   - Retrain calibrator & GLM_fallback with updated inputs and upweight schedule; run 14–28 day shadow‑run with gating active.
+   - Publish pooled‑prior snapshots for high_total_spend and multi_high slices.
+   - Seed active label queue with multi_high & high_total_spend cases for rapid labeling & human review.
+   - Run CI/regression tests to ensure no materially negative global impacts.
+
+J. Per‑record provenance to log (required & extended)
+- Raw per‑channel and imputation provenance: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck (value + imputed_flag + imputation_method + source_date).
+- Aggregates: sum_spend, sum_spend_log, sum_spend_bucket, num_high_spend_channels, multi_high_flag.
+- Dominance: top1_channel, top1_spend, top1_share, top2_channel, top2_spend.
+- Flags: all_zero_flag, cryo_all_zero_flag, cryo_imputed_zero_flag, per_channel_imputed_flags, missingness_count, num_nonzero_channels.
+- Novelty & consistency: spend_entropy_norm, dominance_sign_consistency_score, multi_channel_sign_consistency_score, novelty_distance_norm, spend_cluster_id, cohort_transport_consistency_score, in_batch_cohort_contradiction_flag.
+- Model internals: per_feature_logit_contributions (map), pooled_prior_snapshot_id, μ_slice, τ_slice_blend.
+- Variances: var_multi_spend, var_total_spend, var_cryo, var_dom_channel, var_high_spend, var_novelty, var_missingness, var_sign_inconsistency, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, p_final_sd, quantile_width, gating_reasons, routing_decision, scorer_version, calibrator_version, provenance_hash.
+
+K. Initial hyperparameters (start values; sweepable)
+- CHANNEL_HIGH_THRESHOLD = 100
+- MULTI_HIGH_THRESHOLD = 2
+- SUM_SPEND_HIGH = 500
+- TOP1_DOM_THRESHOLD = 0.60
+- TOP1_SPEND_HIGH = 400 (kept)
+- CAP_PER_FEATURE_LOGIT (spend) = 2.0; VRDeck/Spa = 1.8; CryoSleep = 2.0
+- CAP_SUM_SPEND_LOGIT = 2.0; CAP_TOTAL_SPEND_LOGIT = 2.5
+- BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+- N0_multi_high = 400; N0_cryo_all_zero = 300
+- N_min_high_sum = 120; N_min_cryo = 100
+- Z_high_slice = 0.95; A_high = 0.995
+- SE_accept_high_sum = 0.10; se_floor_n1_highsum = 0.30–0.50
+- κ_multi = 0.18; κ_total = 0.12; κ_cryo = 0.25; κ_novel = 0.14; κ_miss = 0.06; κ_sign = 0.08
+- GLM_agreement_delta δ = 0.06 (fragile slices) / 0.12 (non‑fragile)
+
+L. CI canaries & expected behavior (add 0174_01 + others)
+- 0174_01 (RoomService=287, VRDeck=175, Spa=115, sum_spend=593):
+  - Expected: route -> priority_audit (unless pooled_prior/GLM/ensemble/backing present and se_combined very small). Must not be auto‑accepted in tests/gating.
+- 0172_01 / 0171_01 / 0170_01: cryo_all_zero & VRDeck dominance examples:
+  - Expected: route -> priority_audit until slice N and τ high & models agree.
+- Unit tests assert these behaviors automatically each CI run.
+
+Immediate one‑line corrective action
+- Deploy gating patch: route any n==1 record with sum_spend ≥ 500 OR num_high_spend_channels ≥ 2 OR cryo_all_zero_flag OR any per_channel_imputed_flag OR missingness_count ≥ 2 to priority_audit; add 0174_01, 0172_01, 0171_01, 0170_01 to canary list.
+
+Concise gating pseudocode
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD: route all r in B -> priority_audit; continue
+  - for each record r in B:
+      fragile_flag = cryo_all_zero_flag OR top1_share ≥ TOP1_DOM_THRESHOLD OR sum_spend ≥ SUM_SPEND_HIGH OR num_high_spend_channels ≥ MULTI_HIGH_THRESHOLD OR novelty_flag OR any per_channel_imputed_flag OR missingness_count ≥ 2 OR dominance_sign_consistency_score < 0.7 OR multi_channel_sign_consistency_score < 0.75
+      if n_batch == 1 and fragile_flag:
+         if (pooled_prior_tau ≥ Z_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice):
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if cohort_id present and exists conflicting sign predictions: route all cohort members -> priority_audit
+
+Why this will reduce batch errors (short)
+- Identifies multi‑channel high‑sum records as a brittle slice and prevents overconfident single‑record flips by:
+  - Blocking fragile n==1 auto‑decisions until multiple corroborating signals exist (priors/GLM/ensemble/low se).
+  - Enforcing per‑feature & total logit caps plus downweighting to stop additive spend blowups.
+  - Increasing uncertainty (variance terms & elevated se_floors) for high_total_spend and multi_high slices so calibrator produces wider quantiles.
+  - Stratified pooled priors with larger N0 stop tiny‑N slices from swinging posterior strongly.
+  - Monitoring and canaries (0174_01) detect regressions quickly.
+
+Tradeoffs & operational notes
+- Blocking more n==1 auto‑decisions (especially high_total_spend multi_channel) increases human review workload. Prepare prioritized labeling, temporary staffing or accelerated active labelling for these slices.
+- Upweighting fragile slices speeds correction but risks overfitting; use stratified CV and shadow runs.
+- Logging richer provenance increases storage and engineering cost but is required to debug brittle edge cases rapidly.
+
+Next steps / offers
+- Option A (0–3h, recommended): I can produce the exact gating patch (code pseudocode + test vectors), unit tests (including canaries 0174_01, 0172_01, 0171_01, 0170_01) and a tight deploy checklist to implement the stopgap immediately.
+- Option B (24–72h): I can produce the full retrain recipe: calibrator training plan, GLM_fallback specs, upweight schedule, CV folds & fold seeds, hyperparameter sweep matrix, shadow‑run dashboard spec and label acquisition plan.
+
+Which do you want first? If you want the stopgap deployed this hour I will produce the gating patch + unit tests + deploy checklist immediately.
+
+============================================================

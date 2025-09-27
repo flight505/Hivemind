@@ -1,0 +1,296 @@
+PREDICTIVE METRICS - ITERATION 90
+============================================================
+
+Updated Predictive Metrics Report — v3.11.0 (post_0113_01 triage)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A single-record batch (PassengerId 0113_01) was predicted False but label=True. Pattern = concentrated_spend on ShoppingMall (ShoppingMall=804, other channels 0, top1_share ≈ 1.0) but sum_spend < global S_high (1000), so v3.10.0’s concentrated_high logic did not trigger. The scorer therefore treated this as a low-evidence / novelty case and under-weighted the channel-specific positive signal. Root causes: (a) a global absolute S_high threshold that missed channel-relative concentration, (b) pooled_prior and GLM_fallback missing channel×age×homeplanet directionality for ShoppingMall, and (c) variance/gating not sensitive to high top1_share when absolute spend is below S_high → allowed unsafe auto-decision on n==1.
+- Immediate implication: v3.10.0 improvements (channel-aware conc_shift_frac, pooled_prior channel_hp_vip) prevented some failures but did not capture relative concentration patterns. Single-record gating must treat "concentration relative to channel norms" as first-class and be stricter for n==1 batches that exhibit high top1_share even if absolute spend < S_high.
+- Top priorities (0–72h):
+  1. Implement "relative concentration" detection: per-channel S_high (quantile-based) + top1_share threshold so concentrated patterns are caught even at lower absolute spend.
+  2. Expand pooled_prior and GLM_fallback interactions to include top1_channel × Age_bucket × HomePlanet (and VIP where relevant).
+  3. Add var_top1_share and var_rel_concentration to variance; make SE floors dynamic by channel_consistency and by concentration_type (absolute vs relative).
+  4. Harden n==1 gating for high top1_share (relative_concentration_flag) — require fallback agreement or high ensemble consensus; otherwise priority_audit.
+  5. Persist per-record provenance: concentration_type (abs/rel), channel_S_high_used, top1_share, conc_shift_frac_used, channel_consistency_score, gating_reasons.
+  6. Add CI canary 0113_01 (ShoppingMall concentrated, Age 64) with NO auto-reject expectation and shadow-deploy changes.
+
+Direct answers to the six requested questions (concise)
+1) Signals that led to this error
+   - High top1_share on ShoppingMall (≈1.0) but sum_spend = 804 < global S_high (1000) → concentrated pattern not flagged.
+   - pooled_prior lacked top1_channel × Age_bucket × HomePlanet interaction (ShoppingMall+Age64+Earth had positive historical association not captured).
+   - Calibrator/GLM_fallback did not include top1_share-relative features (or channel-normalized spend), so fallback either disagreed or was not enforced by gating.
+   - Variance lacked var_top1_share / var_rel_concentration → se_combined underestimated the risk of a single-record decision in this slice, enabling an unsafe auto-decision.
+
+2) Decision-rule changes to prevent recurrence
+   - Introduce relative_concentration_flag: top1_share ≥ T_ch (e.g., 0.85) AND sum_spend ≥ channel_S_high_quantile (e.g., 90th percentile by channel) OR normalized_spend_by_channel ≥ m (e.g., 2× median).
+   - For n == 1 AND (absolute_concentrated_high OR relative_concentrated_high):
+       - If strong_consistent_channel (channel_consistency_score ≥ 0.80 & N_conc_samples ≥ 15):
+           - Allow auto-accept only when (ensemble_agreement ≥ 0.99 AND se_combined ≤ 0.08) OR GLM_fallback agrees.
+       - Else → priority_audit (stopgap).
+   - Always log gating_reasons; block auto-reject for such concentration cases unless strict consensus/fallback criteria met.
+   - For n ≤ 3 use intermediate stricter thresholds (agreement +0.002, se −0.01).
+
+3) New pattern insights
+   - Concentration must be treated both absolutely and relatively (per-channel norms). Some channels (e.g., FoodCourt) have large absolute spend, others (ShoppingMall, Spa) have lower absolute medians but strong signal when concentrated relative to their own distribution.
+   - Age_bucket and HomePlanet interactions can flip polarity within the same concentrated channel (e.g., older Earth-based shoppers in ShoppingMall slices show different label odds than younger or non-Earth passengers).
+   - Single-record fragility is not just about sum_spend magnitude — top1_share and channel-normalized spend are key features.
+
+4) Confidence recalibration summary
+   - Add var_top1_share and var_rel_concentration to the variance model.
+   - Dynamic SE floors:
+       - absolute_concentrated_high & strong_consistent_channel → floor = 0.06
+       - relative_concentrated_high & strong_consistent_channel → floor = 0.07
+       - relative_concentrated_high & weak_consistent_channel → floor = 0.20
+       - default base_min_se(context) remains applied for other cases.
+   - Retrain calibrator to output p10/p50/p90 and sd and to include top1_share, normalized_spend_by_channel, and concentration_type as inputs.
+
+5) Consistency adjustments
+   - Standardize concentration detection (abs/rel) across scorer, pooled_priors, calibrator, and gating so directionality is consistent across all channels and contexts.
+   - Compute and persist per-channel S_high_quantile (Q90/Q95) and median to enable reproducible relative thresholds.
+   - Seed slice_trust_table with channel × HomePlanet × Age_bucket × VIP consistency stats.
+
+6) Metric improvements for edge cases
+   - Create "relative_concentrated_high" slices per channel (top1_share deciles × spend quantile) and track ECE/Brier/FP/FN trends.
+   - Canaries: add 0113_01 (ShoppingMall concentrated, Age 64, VIP False) and similar ShoppingMall/VRDeck/Spa relative-concentration records.
+   - Fast-label active learning for channels with rising relative_concentrated contradictions.
+
+Detailed failure chain (what went wrong, why) — 0113_01
+- Record snapshot (computed):
+  - PassengerId: 0113_01
+  - HomePlanet: Earth
+  - CryoSleep: False
+  - Cabin: F/23/P
+  - Destination: TRAPPIST-1e
+  - Age: 64.0
+  - VIP: False
+  - RoomService: 0.0
+  - FoodCourt: 0.0
+  - ShoppingMall: 804.0
+  - Spa: 0.0
+  - VRDeck: 0.0
+  - sum_spend = 804.0
+  - top1_channel = ShoppingMall; top1_share = 1.0
+  - num_nonzero_channels = 1
+  - n_batch = 1
+- Why it failed:
+  1. Concentration detection: With global S_high = 1000 the record was not flagged as absolute_concentrated_high despite top1_share=1.0. v3.10.0 logic therefore treated it as a non-concentrated case.
+  2. Pooled prior: μ_channel_homeplanet_vip existed for FoodCourt cases but ShoppingMall×Age/HP interactions were sparse in the pooled table (no μ_channel_homeplanet_age term in production) → positive local signal for ShoppingMall+Age64+Earth not injected.
+  3. Calibrator/GLM_fallback: lacked top1_share / normalized_spend_by_channel and top1_channel × Age_bucket interactions; fallback either disagreed or was not used due to gating thresholds.
+  4. Variance: missing var_top1_share/var_rel_concentration → se_combined underestimated uncertainty for a single-record novelty-type concentrated case.
+  5. Gating: n==1 gating applied only for absolute_concentrated_high; since flag was false, auto-decision was permitted with insufficient checks.
+  6. Outcome: ensemble mean and final score leaned negative → predicted False (FN).
+
+Revised pattern & signal definitions (v3.11.0; first-class)
+- absolute_concentrated_high (unchanged): top1_share ≥ T_ch_abs AND sum_spend ≥ S_high_channel_abs (S_high_global default = 1000, but channel override allowed).
+- relative_concentrated_high (new): top1_share ≥ T_ch_rel AND (sum_spend ≥ channel_S_high_quantile_Qp OR normalized_spend_by_channel ≥ m_rel)
+  - top1_share threshold T_ch_rel default = 0.85
+  - channel_S_high_quantile_Qp default = Q90 (per-channel)
+  - normalized_spend_by_channel = sum_spend / median_sum_spend_by_channel
+  - m_rel default = 2.0 (≥2× median)
+- channel_consistency_score (smoothed; track separately for absolute and relative cases):
+  - consistency_channel_abs = (α + pos_count_abs) / (α + pos_count_abs + neg_count_abs)
+  - consistency_channel_rel = (α + pos_count_rel) / (α + pos_count_rel + neg_count_rel)
+  - α default = 20; track N_conc_samples_abs and N_conc_samples_rel
+- strong_channel_directionality_flag: consistency ≥ 0.80 AND N_conc_samples ≥ 15 (tracked independently for abs/rel).
+
+Channel-aware pooled_prior (v3.11.0)
+- Add μ_channel_homeplanet_age and μ_channel_homeplanet_vip_age interaction terms and τ weights:
+  - pooled_prior = (τ_pattern*μ_pattern + τ_channel*μ_channel + τ_channel_hp_vip*μ_channel_hp_vip + τ_channel_hp_age*μ_channel_hp_age + N_subslice*μ_subslice + τ_spend_bucket*μ_spend_bucket + τ_missing*μ_missing + τ_channel_risk*μ_channel_risk + τ_cryo*μ_cryo) / (denominator)
+- Rationale: ShoppingMall+Age64+Earth signal will be represented even for low-absolute-spend cases if historical evidence exists.
+
+Direction-aware, channel-adaptive logit_shift (v3.11.0)
+- Add top1_share and normalized_spend effects into conc_shift_frac_channel:
+  - conc_shift_frac_channel = clamp(base_conc_shift_frac + w_dir*(consistency_score − 0.5)*2 + w_share*(top1_share − T_ch_baseline), min, max)
+  - When relative_concentration_flag is true, boost conc_shift_frac_channel (i.e., allow more influence) if channel_consistency_rel is high.
+- Raw_shift pipeline (summary):
+  - polarity = 2 * pooled_prior − 1
+  - sum_damp = clamp(sum_spend / log(1 + S_damp), ε, 1.0)
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - concentration_damp = conc_shift_frac_channel (abs or rel depending on which flag triggered)
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp * concentration_damp * missing_cat_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- Rationale: permit concentrated_rel signals to move the prediction appropriately when channel history justifies it.
+
+VARIANCE / SE MODEL (explicit additions)
+- New variance terms:
+  - var_top1_share = κ_t1 * (top1_share)^2 * (sum_spend / S_scale) * (1 − channel_consistency_rel_or_abs)
+  - var_rel_concentration = κ_rel * (1 − channel_consistency_rel) * f(interaction_weight(Age_bucket, HomePlanet, VIP, top1_channel))
+- Combined var_combined includes these new terms; se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Dynamic SE floors:
+  - absolute_concentrated_high & strong_channel_directionality → 0.06
+  - relative_concentrated_high & strong_channel_directionality → 0.07
+  - relative_concentrated_high & weak_directionality → 0.20–0.22 (depending on missingness/imputation)
+  - imputed_zero_nontrusted_floor = 0.22 (unchanged)
+- Rationale: capture uncertainty for high top1_share even when absolute spend is low.
+
+DECISION GATING (coherent, channel-aware)
+- New gating tiers use concentration_type (abs vs rel), channel_consistency_abs and channel_consistency_rel, and N_conc_samples_abs/rel.
+- High-level gating pseudocode:
+  1. If Trusted_subslice AND p_final_mean ≥ accept_threshold_trusted AND se_combined ≤ accept_se_max_trusted AND ensemble_agreement ≥ general_agreement_threshold → auto_accept.
+  2. Else if n == 1 AND (absolute_concentrated_high OR relative_concentrated_high):
+       - If strong_consistent_channel_abs_or_rel:
+           - Auto-accept allowed if (ensemble_agreement ≥ 0.99 AND se_combined ≤ 0.08) OR GLM_fallback agrees.
+           - Else → priority_audit.
+       - Else if N_conc_samples_rel_or_abs < N_min → priority_audit.
+       - Else → require (GLM_fallback agrees OR ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06) else priority_audit.
+  3. Else apply existing rules (true_zero/imputed_zero/cryo_zero).
+  4. For n ≤ 3, use stricter thresholds (agreement +0.002, se −0.01).
+  5. Always persist gating_reasons; do not auto-decision when gating_reasons non-empty.
+- Rationale: avoid overlooking relative concentrations and avoid symmetric FP/FN trade-offs.
+
+Calibrator & GLM_fallback retrain plan (24–72h)
+- Calibrator:
+  - Outputs: p10/p50/p90 and sd.
+  - Features add: top1_share, normalized_spend_by_channel, relative_concentration_flag, channel_consistency_rel/abs, channel_S_high_used, Age_bucket, HomePlanet, VIP, p_after_logit_shift, ensemble_agreement.
+  - Loss: quantile losses + ECE regularizer. Upweight concentrated_rel contradictions and ShoppingMall/VRDeck/Spa slices.
+  - CV grouping: by (top1_channel, sum_spend_bucket, HomePlanet).
+- GLM_fallback:
+  - Add interactions: top1_channel × Age_bucket × HomePlanet; top1_channel × top1_share × VIP; relative_concentration_flag × missingness.
+  - Retrain with L1/L2 and monitor coefficient sign stability.
+- Acceptance: calibrator reduces relative_concentrated contradictions by ≥30% on holdout and produces credible p90–p10 spreads for concentrated_rel slices.
+
+Monitoring, metrics & alerts (what to add)
+- New slice monitors:
+  - relative_concentrated_high per top1_channel: ECE, Brier, FP, FN, contradiction counts; breakdown by Age_bucket/HomePlanet/VIP.
+  - top1_share decile tracking with per-channel error rates.
+  - channel_consistency_score_abs & _rel drift & N_conc_samples.
+  - n==1 routing: fraction auto_accepted vs routed_to_audit by slice.
+- Alerts:
+  - relative_concentrated_high FP rate > 20% above baseline for any channel over 24h → block auto_accept for that channel.
+  - relative_concentrated_high FN rate > 15% above baseline for any channel over 24h → block auto_reject for that channel + urgent triage.
+  - channel_consistency_rel drop > 0.1 over 7 days for top channel → retrain candidate.
+  - sudden increase in high top1_share cases in n==1 batches → alert (possible upstream change).
+- Dashboards:
+  - per-channel relative_concentration heatmap (top1_share × spend_quantile) with gating outcomes and audit queue inflow.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- CI changes:
+  - Add canary test 0113_01 (ShoppingMall concentrated, Age 64): expect NO auto-reject. If channel_consistency_rel ≥ 0.80 and GLM_fallback agrees, allow auto-accept; CI asserts conditional auto-accept only.
+  - Keep prior canaries incl 0112_01, 0110_01, 0108_02/03.
+- Validation experiments:
+  - Retrain calibrator + GLM_fallback with grouped CV; measure concentrated_abs & concentrated_rel ECE/Brier per channel.
+  - Shadow deploy for 14 days; track audit queue size, per-slice contradictions, and acceptance targets.
+- Acceptance targets (vs baseline v3.10.0):
+  - relative_concentrated contradictions: ≥30–40% relative reduction on test set (priority on top-10 channels).
+  - concentrated_abs contradictions: ≥30–40% relative reduction.
+  - overall FN increase ≤ 3 percentage points absolute (aim ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+
+Operational actions (0–72 hours) — prioritized
+1. Engineering (0–24h):
+   - Compute and ingest channel_S_high_quantile (Q90, Q95) and median; expose to scorer.
+   - Implement relative_concentration_flag and persist channel_S_high_used, normalized_spend_by_channel, concentration_type.
+   - Implement stopgap gating: n==1 & top1_share ≥ 0.85 → priority_audit unless channel_consistency_rel_high & fallback/consensus criteria met. Default: route to audit.
+   - Persist gating_reasons/provenance fields.
+2. Scoring engine (24–48h; shadow):
+   - Add var_top1_share and var_rel_concentration into variance calc.
+   - Apply channel-adaptive conc_shift_frac that considers top1_share and relative flags; record raw_shift components.
+   - Expose per-channel metrics in scorer logs.
+3. ML (24–72h):
+   - Retrain GLM_fallback & calibrator incl new features & quantiles.
+   - Seed active-label queue for relative_concentrated contradictions (ShoppingMall, Spa, VRDeck) and run fast-label workflow.
+4. Ops & Monitoring (24–72h):
+   - Deploy dashboards, canaries (0113_01, 0112_01, 0110_01) and alerts; monitor shadow-run ≥72h before promotion.
+5. Product / Audit (24–72h):
+   - Implement fast-label workflows for relative_concentrated contradictions prioritized by Age/HomePlanet combinations.
+6. Release criteria:
+   - Shadow metrics meet acceptance targets and audit queue manageable.
+
+Per-record provenance to log (required additions)
+- Alongside prior fields add:
+  - concentration_type {none, absolute, relative}
+  - channel_S_high_used (quantile and timestamp)
+  - normalized_spend_by_channel
+  - top1_share
+  - channel_consistency_score_abs, channel_consistency_score_rel
+  - N_conc_samples_abs, N_conc_samples_rel
+  - conc_shift_frac_used (value and formula version)
+  - μ_channel_homeplanet_age (pooled sub-component used) and τ_channel_hp_age
+  - var_top1_share, var_rel_concentration
+  - GLM_fallback_probs, GLM_fallback_agreement_flag
+  - p10/p50/p90, p_final_sd
+  - gating_reasons (explicit text codes)
+  - scorer_version, pooled_prior_snapshot_id, channel_S_high_snapshot_id
+
+Updated hyperparameters (v3.11.0 initial; sweepable)
+- base_conc_shift_frac = 0.6
+- w_dir = 0.45
+- w_share = 0.25
+- conc_shift_frac_min = 0.50
+- conc_shift_frac_max = 1.00
+- α_consistency = 20
+- N_min_conc_samples = 15
+- channel_consistency_high (C_high) = 0.80
+- top1_share_threshold_abs (T_ch_abs) = 0.90
+- top1_share_threshold_rel (T_ch_rel) = 0.85
+- channel_S_high_quantile = 0.90
+- normalized_spend_mult (m_rel) = 2.0
+- S_high_global = 1000 (legacy absolute)
+- S_damp = 200
+- w_dis = 0.80
+- κ_t1 = 0.045
+- κ_rel = 0.03
+- accept_se_max_trusted = 0.06
+- accept_se_max_general = 0.05
+- concentrated_consistent_agreement = 0.99
+- concentrated_inconsistent_agreement = 0.999
+
+CI TESTS (explicit expected outcomes; include 0113_01)
+- New/updated canaries:
+  - 0113_01 (ShoppingMall concentrated, Age 64): NO auto-reject; expect priority_audit by default unless channel_consistency_rel ≥ 0.80 & GLM_fallback agrees.
+  - 0112_01 (FoodCourt concentrated VIP+Europa): conditional auto-accept as specified in v3.10.0.
+  - 0110_01 / 0110_04 / 0108_02 / 0108_03 remain as priority_audit/strict gating canaries.
+- Trusted subslice variations → allow calibrated auto-decisions.
+
+Monitoring & Alerting (exact triggers)
+- For each top1_channel:
+  - relative_concentrated_high FP rate > 20% above baseline over 24h → block auto_accept for that channel + alert.
+  - relative_concentrated_high FN rate > 15% above baseline over 24h → block auto_reject for channel + urgent triage.
+  - channel_consistency_rel drop > 0.1 over 7 days for a top channel → retrain flag.
+- n==1 audit routing fraction < expected threshold → alert.
+- mismatch between batch_snapshot_id and per-record provenance → alert.
+
+Acceptance criteria (post-shadow -> live)
+- relative_concentrated contradictions: ≥30–40% relative reduction across top-10 channels.
+- absolute_concentrated contradictions: ≥30–40% relative reduction.
+- imputed_zero & cryo_zero contradictions: maintain prior targets.
+- overall FN increase ≤ 3% absolute (aim ≤1).
+- Audit queue ≤1.5× baseline for first 2 weeks, trending down.
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.11.0) implementing:
+   - channel_S_high_quantile ingestion & relative_concentration flag
+   - channel-adaptive conc_shift_frac including top1_share
+   - var_top1_share & var_rel_concentration
+   - n==1 relative_concentration stopgap gating + provenance logging
+2. CI updates adding 0113_01 and updating 0112_01 expectations.
+3. Slice_trust_table seeding with per-channel abs & rel consistency metrics and Age/HomePlanet interactions.
+4. GLM_fallback + calibrator retrain plan + grouped CV validation report (quantiles).
+5. Dashboards & canary configuration for relative_concentration per channel.
+6. Active learning labeling plan for relative_concentrated contradictions.
+
+One-line corrective action recommendation (now)
+- Implement relative concentration detection and n==1 stopgap gating (route to priority_audit unless strong per-channel consistency + GLM fallback or near-perfect ensemble agreement), plus per-channel S_high quantiles — build scorer skeleton and CI canary (include 0113_01) immediately as the smallest, highest-leverage change.
+
+Quick triage checklist to run now for 0113_01 (operational)
+1. Compute channel_S_high_quantile(Q90/Q95) and median for ShoppingMall from historical records (last 90 days).
+2. Compute channel_consistency_rel for ShoppingMall (pos/neg counts for relative_concentrated cases).
+3. Inspect pooled_prior components used for this record (was μ_channel_homeplanet_age present? what was pooled_prior value?).
+4. Inspect GLM_fallback output and agreement flag for this record.
+5. Inspect se_combined and var_top1_share (if present) and gating_reasons stored.
+6. If pooled_prior lacked μ_channel_homeplanet_age and channel_consistency_rel < C_high, mark as candidate for priority_audit and add to active-label queue.
+
+Why this will reduce batch errors going forward
+- Detecting concentration relative to channel norms catches cases like 0113_01 that are strong signals but below a global absolute threshold.
+- Expanding pooled priors and fallback interactions ensures local context (Age, HomePlanet) is injected into single-record pools so the scorer is not blind to consistent channel×age patterns.
+- Adding top1_share-based variance increases uncertainty when channel history is weak, preventing unsafe auto-decisions on n==1 novelty cases.
+- Persisting enriched provenance enables faster triage and closed-loop learning (automatically seeding labeling and model updates for failure slices).
+
+If you want, I will:
+- implement the deterministic scorer skeleton + CI updates (recommended immediate artifact), or
+- produce the channel_S_high seeding script and slice_trust_table update in parallel.
+
+Recommendation: implement the deterministic scorer skeleton + CI updates first (includes 0113_01 canary), then run a 72-hour shadow to validate behavior while ML retrains calibrator and fallback in parallel.
+
+============================================================

@@ -1,0 +1,237 @@
+PREDICTIVE METRICS - ITERATION 25
+============================================================
+
+Executive summary — immediate takeaway and top priorities
+- Immediate cause: 0044_02 is a zero‑spend false negative. The pipeline routed the case down the “all_spend_zero → segment prior” path and the (shrunk) segment prior + CryoSleep signal produced a confident negative. The model under‑weighted Age/CryoSleep interactions for young passengers and had no contradiction/GLM fallback for small or inconsistent segment priors → confident False (predicted False, actual True).
+- Top priorities (deploy in order):
+  1. Harden the all_spend_zero path: add GLM fallback + conservative decision rules for negative predictions; require corroboration for confident negatives when spends are zero.
+  2. Add CryoSleep × Age interactions and extend child multipliers to 4–12; reduce CryoSleep absolute weight for young children.
+  3. Increase min_bin_count and tighten small‑n pooling/shrinkage logic; route under‑supported segments to fallback instead of relying on noisy segment priors.
+  4. Add contradiction guard (non‑spend corroboration check) that forces Abstain/GLM when non‑spend signals and segment prior disagree.
+  5. Strengthen monitoring for all_spend_zero FNR, CryoSleep–age miscalibration, and per‑segment CI coverage; block commits on large distribution shifts.
+
+1) What specific patterns in the current metrics led to this prediction error?
+- All_spend_zero routing: all spend channels were zero, so the pipeline relied on the segment prior. That prior was either small‑n or differently pooled and pulled the probability down.
+- Small‑n / shrinkage mismatch: the segment’s observed n or pool structure produced a shrunk prior that did not reflect the true local behavior (high variance in small segments).
+- Missing CryoSleep × Age interaction: CryoSleep was treated uniformly; for young children CryoSleep’s predictive relationship with Transported differs and the current model weighed CryoSleep too strongly in the negative direction for this age.
+- Lack of contradiction guard / GLM fallback: no separate model was asked to validate a segment‑prior based decision when non‑spend features (Age, Cabin, VIP, CryoSleep) provided conflicting evidence.
+- Low tolerance for low‑support negatives: T_low and negative thresholds allowed confident negative predictions with insufficient non‑spend corroboration.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+- All_spend_zero special path (NEW)
+  - If all spend channels == 0:
+    - If segment_n >= min_bin_count AND |p_segment_shrunk − p_age_shrunk| < delta_consistency → use segment_prior path.
+    - Else → route to GLM_fallback (regularized logistic trained on Age_bucket, Cabin_deck, Destination, CryoSleep, VIP, HomePlanet, Side). Use GLM for decision and for uncertainty (bootstrap or analytic).
+    - Decision for all_spend_zero:
+      - Positive: require p_lower_glm ≥ p_lower_zero_pos (default 0.60).
+      - Negative: require p_upper_glm ≤ p_upper_zero_neg (default 0.30). Otherwise Abstain.
+- Contradiction guard (GENERAL)
+  - Compute nonspend_support_pos and nonspend_support_neg (sum of absolute signed deltas excluding spend channels).
+  - If top_contrib_source = SegmentPrior (or SpendingGroup) and sign conflicts with nonspend_support and nonspend_support_abs ≥ nonspend_support_min (default 0.06) → Abstain/GLM.
+- CryoSleep × Age interactions
+  - Implement per‑age bucket CryoSleep effect adjustments:
+    - If Age ≤ 3: child_infant_flag → infant CryoSleep weight = base * 1.2 (if historically reinforced), else specialize.
+    - If Age ∈ [4,12]: reduce CryoSleep weight by factor cryo_child_factor (default 0.6).
+    - Recompute signed contributions accordingly.
+- Strengthen small‑n pooling/smoothing
+  - Increase min_bin_count and increase shrinkage k for segments; if n_b < min_bin_count → automatically route to GLM_fallback rather than trusting noisy p_b_shrunk.
+- Conservative negative thresholds for low‑spend
+  - Increase T_low (support_abs_total) and require stricter p_upper for negatives if spends are zero or low. Prefer Abstain over confident False when contradictory signals exist.
+- Persist decision provenance: every all_spend_zero case must include segment_n, p_segment_shrunk, p_age_shrunk, GLM_fallback_prob, and contradiction_flag in the diagnostics.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Zero spend does not equal not transported: children and specific cabins/destinations may have very low or zero spend but high transported probability (e.g., guardians using parental payments, tickets with no onboard spending).
+- CryoSleep’s predictive sign and magnitude varies with age; uniform CryoSleep weighting hides important interactions.
+- Segment priors for fine-grained bins (Age × Deck × Destination) are fragile when sparse — behavior of small segments can be counterintuitive and should not be used without fallbacks.
+- Both tails (extreme spenders and zero spenders) require explicit and distinct logic (we already have spend-outlier rules; now we add a symmetric zero‑spend pathway).
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Define p_lower and p_upper:
+  - p_lower = p_calibrated − z * se_mapped (lower bound)
+  - p_upper = p_calibrated + z * se_mapped (upper bound)
+  - Use z_normal = 1.28 (90% band) by default; for special cases inflate z to increase conservatism.
+- Two‑stage calibration:
+  - Global Platt scaling on raw model logits → p_calibrated.
+  - Per‑segment (Age_bucket × SpendingGroup) Platt offsets or isotonic adjustments for segments with > min_platt_n (default 200).
+- Tiered thresholds (initial defaults; tune on validation)
+  - Regular predictions:
+    - High‑confidence Positive: p_lower ≥ 0.75
+    - High‑confidence Negative: p_upper ≤ 0.25
+    - Medium: p_lower ∈ [0.60, 0.75) or p_upper ∈ (0.25, 0.40]
+    - Abstain otherwise
+  - Spend‑dominant: raise thresholds by +0.05 for both sides
+  - All_spend_zero: be more conservative for negatives:
+    - Positive (from GLM or aggregated): p_lower ≥ 0.60
+    - Negative: require p_upper ≤ 0.30 (not 0.25) and GLM_concurrence if segment_n < min_bin_count
+  - Use z_spend_special/z_zero_special = 1.64 for spend_dominant or zero‑spend special cases when computing p_lower/p_upper.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Deterministic snapshoting:
+  - Persist snapshot_id containing bin boundaries, pooled merges and Corr_ij. Use snapshot_id for an entire batch commit (no ad‑hoc re‑pooling mid‑batch).
+- GLM fallback service:
+  - Ship a small, deterministic GLM_fallback model versioned with the snapshot; all under‑supported or zero‑spend cases call the same GLM.
+- Pre‑commit distribution checks:
+  - Block commit if fraction_all_spend_zero > baseline*2 or median_age shifts > X years or cryosleep fraction shifts > 2× baseline.
+- Audit queue:
+  - Route all_glm_fallback_used, contradiction_flagled, all_spend_zero predicted False with p_upper > 0.25, and top_contrib_share > 0.45 to human review.
+- Deterministic pooling & merge logs:
+  - Record pooling path and pooled_bin_source per prediction; use identical pooling across training/validation/inference.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- Persist per‑prediction diagnostics (new fields)
+  - all_spend_zero_flag, segment_n, p_segment_shrunk, p_age_shrunk, GLM_fallback_prob, GLM_p_lower/p_upper, contradiction_flag, cryo_child_adjust_applied, top_contrib_source, top_contrib_share, support_abs_total, reliable_nonspend_count, snapshot_id, calibration_version.
+- GLM fallback & bootstrap uncertainty
+  - Train a compact regularized GLM (or shallow tree) specifically for low‑spend / small‑n segments. Use bootstrap to estimate se for GLM outputs and incorporate into p_lower/p_upper.
+- Age bucketing & child multipliers
+  - Keep [0–3, 4–12, 13–24, 25–44, 45–64, 65+] buckets but apply child multipliers for 4–12 as well (smaller than infant multiplier).
+- Per‑segment Platt and targeted isotonic calibrators
+  - For segments that show systematic miscalibration (all_spend_zero FNR or spend_dominant FPR) fit local Platt calibrators.
+- Decision provenance for audits
+  - Persist the why: which rule was used, which fallback, and which contradictions triggered Abstain/Audit.
+
+Updated deterministic scoring pipeline (v2.3) — production‑ready outline
+1. Baseline priors
+   - p0_global = (T + 1)/(N + 2); logit0_global = ln(p0_global/(1 − p0_global)).
+   - Compute p0_age_bucket and p0_segment with Laplace smoothing (alpha = 1) and hierarchical pooling where applicable.
+2. Age bucketing & child multipliers
+   - Buckets: [0–3, 4–12, 13–24, 25–44, 45–64, 65+].
+   - child_multiplier:
+     - Age ≤ 3 → 1.40
+     - Age ∈ [4,12] → 1.20 (applied conditionally when r_age ≥ 0.4)
+3. Spending preprocessing & outlier detection
+   - Winsorize per‑channel at 0.995; s_i = log1p(x_winsorized); TotalSpend_log1p = Σ s_i.
+   - Compute robust median & MAD per segment; spend_robust_z = (TotalSpend_log1p − median)/MAD.
+   - spend_outlier = (spend_robust_z ≥ 3.0) OR (TotalSpend_log1p ≥ global_99pct_threshold).
+   - all_spend_zero = all s_i == 0.
+4. Per‑bin smoothing & hierarchical pooling
+   - p_b_smoothed = (t_b + alpha)/(n_b + 2*alpha); shrinkage r_b = n_b/(n_b + k) with k_segment = 10.
+   - min_bin_count = 20; min_age_n = 30.
+5. All_spend_zero special path (NEW)
+   - If all_spend_zero:
+     - If n_segment ≥ min_bin_count AND |p_segment_shrunk − p_age_shrunk| < delta_consistency (0.15) → use segment prior branch.
+     - Else → compute GLM_fallback_prob (versioned). Get p_glm, p_lower_glm/p_upper_glm via bootstrap.
+     - Decision:
+       - If p_lower_glm ≥ 0.60 → Predict True.
+       - If p_upper_glm ≤ 0.30 → Predict False.
+       - Else → Abstain (send to audit if required).
+6. Raw deltas and clipping
+   - raw_delta_b = ln(p_b_shrunk/(1 − p_b_shrunk)) − logit0_effective (Age‑conditioned).
+   - Clip:
+     - max_delta_nonspend = ±0.8
+     - max_delta_spend_channel = ±0.6
+7. CryoSleep × Age adjustments (NEW)
+   - Compute cryo_adjust_factor:
+     - Age ≤ 3: 1.0 (or boosted if validated)
+     - Age ∈ [4,12]: cryo_child_factor = 0.6 (reduce CryoSleep contribution)
+     - Apply cryo_adjust to signed CryoSleep delta.
+8. Grouped spending aggregation & uncertainty
+   - n_effective_spend = Σ pooled n_channel.
+   - Corr_spend default = 0.8; propagate covariance to get se_logit_final.
+   - If spend_outlier True → apply spend_outlier_factor = 0.5 OR route to spend-outlier fallback.
+9. Rebalanced base weights (starting defaults)
+   - CryoSleep = 0.20 (age adjusted)
+   - Cabin/Deck = 0.22
+   - Age = 0.16
+   - HomePlanet = 0.09
+   - SpendingGroup = 0.08
+   - Destination = 0.09
+   - Side = 0.03
+   - VIP = 0.02
+   - Normalize weights and apply child_multiplier when triggered.
+10. Dominance & contradiction guards
+    - Compute top_contrib_share = |signed_contrib_top| / Σ|signed_contrib_i|.
+    - If top_contrib_source == SpendingGroup and top_contrib_share ≥ 0.45 → spend_dominant rules (as v2.2).
+    - If top_contrib_source == SegmentPrior and contradiction with non‑spend support (nonspend_support_abs ≥ 0.06) → Abstain/GLM.
+11. Final aggregation, calibration & decision
+    - logit_final = logit0_effective + Σ signed_contrib_i (with adjustments).
+    - se_logit_final via covariance propagation; use z = 1.28 normally; use z = 1.64 for spend_dominant, spend_outlier, or all_spend_zero special decisions.
+    - p_raw = sigmoid(logit_final); p_calibrated = Platt_map(p_raw) + per‑segment offsets where available.
+    - Compute p_lower and p_upper and apply tiered thresholds above.
+    - Decision priority:
+      - If all_spend_zero → follow the all_spend_zero path decision.
+      - Else if spend_dominant → apply spend‑dominant acceptance rules (p_lower thresholds increased).
+      - Else follow standard thresholds (positive if p_lower ≥ 0.75; negative if p_upper ≤ 0.25; medium ranges lead to Abstain).
+    - Persist diagnostics.
+
+Concrete parameter defaults (v2.3)
+- Laplace alpha = 1; shrinkage k_segment = 10; k_age = 10
+- min_bin_count = 20; min_age_n = 30
+- winsor_pct = 0.995; max_delta_spend = ±0.6; max_delta_nonspend = ±0.8
+- Corr_spend default = 0.8; group k2_group = 7
+- spend_outlier_z = 3.0; spend_outlier_factor = 0.5
+- dominance_top_share_threshold = 0.45; n_effective_spend_secondary = 8
+- p_lower_spend_strong = 0.75; p_lower_spend_secondary = 0.68
+- p_lower_pos_threshold = 0.75; p_upper_neg_threshold = 0.25
+- p_lower_zero_pos = 0.60; p_upper_zero_neg = 0.30
+- T_low = 0.05; support_pos_min = 0.06
+- z_normal = 1.28; z_spend_special = 1.64
+- child multipliers: Age ≤3 = 1.40; Age 4–12 = 1.20
+- cryo_child_factor = 0.6
+
+Validation & experiments to run immediately
+- LOO evaluation on full labeled set using v2.3 (no weight retrain initially). Report:
+  - Brier, accuracy, recall, precision, abstain fraction, per‑age bucket confusion, per‑spending profile confusion.
+  - Confirm behavior on 0044_02 and previously failing cases 0034_01/0035_01.
+- All_spend_zero FNR test:
+  - Extract historical all_spend_zero cases and compute FNR/FPR under v2.3 vs v2.2.
+  - Sweep GLM thresholds (p_lower_zero_pos ∈ {0.55,0.60,0.65}, p_upper_zero_neg ∈ {0.25,0.30,0.35}).
+- CryoSleep × Age ablation:
+  - Test cryo_child_factor ∈ {0.5,0.6,0.8,1.0} and child multipliers to find optimal balance.
+- Small-n pooling sensitivity:
+  - min_bin_count ∈ {10,20,30} and k_segment ∈ {5,10,15}.
+- Calibration experiments:
+  - Global Platt vs isotonic; per‑segment Platt for Age_bucket × SpendingGroup; compute ECE per segment.
+- Coverage bootstrap:
+  - Verify nominal CI coverage (90%/95%) across spend_dominant, spend_outlier, zero_spend, and regular segments.
+
+Monitoring & alerts (fields to compute & thresholds)
+- Persist per prediction:
+  - p_calibrated, p_lower, p_upper, se_logit_final, support_pos/neg/abs_total, reliable_nonspend_count, top_contribs & top_contrib_share, spend_robust_z, all_spend_zero_flag, GLM_fallback_used, GLM_p, segment_n, p_segment_shrunk, p_age_shrunk, contradiction_flag, cryo_child_adjust_applied, snapshot_id, calibration_version.
+- Dashboards + alerts:
+  - All_spend_zero FNR & FPR (alert if FNR increases by >10%).
+  - Spend_dominant FPR & spend_outlier fraction (alert if > baseline*2).
+  - Fraction of GLM_fallback_used per batch (alert if > baseline*1.5).
+  - Per‑segment ECE & CI coverage (alert if coverage drops > 5%).
+  - Batch precommit: block if fraction_all_spend_zero > baseline*2 or median_age shifts by >2 years.
+- Audit triggers:
+  - All GLM_fallback_used, contradiction_flag cases, all_spend_zero predicted False with p_upper > 0.30, and spend_dominant predicted True with p_lower < 0.75.
+
+Case‑level diagnosis — 0044_02 and expected outcomes under v2.3
+- Why it failed originally:
+  - all_spend_zero path used a (shrunk) segment prior that favored False; CryoSleep weighted negatively; no GLM fallback or contradiction guard existed to detect the conflicting non‑spend evidence (Age = 4).
+- v2.3 handling:
+  - all_spend_zero == True → check segment_n and consistency with Age prior.
+  - If segment_n < min_bin_count OR |p_segment_shrunk − p_age_shrunk| ≥ 0.15 → GLM_fallback used.
+  - GLM will evaluate Age=4, CryoSleep True, Cabin and Destination; likely yields higher p_glm for transported → p_lower_glm ≥ 0.60 → Predict True (or else Abstain).
+  - CryoSleep contribution is reduced for Age 4 via cryo_child_factor → lower negative pull.
+- Expected outcome: Predict True or Abstain (preferred over confident False). The false negative should be eliminated.
+
+Expected tradeoffs
+- Short term: increase in Abstain/GLM_fallback use and audit volume; modest decrease in auto negative predictions for zero‑spend cases (lower FNR).
+- Medium term: better overall calibration and lower FNR on zero‑spend / child segments; small decrease in spend‑driven recall due to stronger spend outlier protections.
+- Long term: after per‑segment calibration and retraining/refitting of base weights the abstain rate should come down and stable Brier/ECE will improve.
+
+Rollout checklist (prioritized)
+Immediate (24–48h)
+1. Implement all_spend_zero detection + GLM_fallback + conservative negative thresholds; deploy GLM as service/versioned artifact.
+2. Add CryoSleep × Age adjustments and child multipliers.
+3. Increase min_bin_count and change k_segment to 10. Persist additional diagnostics.
+4. Run quick LOO test and check 0044_02 and prior failing cases.
+Near term (1–2 weeks)
+1. Tune GLM thresholds and cryo_child_factor on validation folds.
+2. Add per‑segment Platt calibrators; build dashboards and audit queue for GLM_fallback and contradiction cases.
+3. Add deterministic snapshoting and precommit checks.
+Medium term (after +50 labels)
+1. Refit base_weights with constrained supervised optimization and regularization.
+2. Implement hierarchical Bayesian pooling for more principled small‑n behavior.
+Long term
+1. Consider small supervised ensemble that learns to combine the deterministic rules with GLM outputs and abstain costs.
+2. Continual retraining cadence with human in the loop for audits.
+
+Immediate action I can take for you
+- Provide deterministic Python scorer implementing v2.3 (all_spend_zero + GLM_fallback integration stub, deltas clipping, covariance handling, Platt calibration and diagnostics).
+- Run LOO evaluation on your labeled set and produce the validation report (Brier, ECE, accuracy, recall, per‑segment confusion matrices) and confirm the corrected behavior on 0044_02 and prior cases.
+
+Which would you like first — the scorer code, the LOO report, or both?
+
+============================================================

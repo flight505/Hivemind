@@ -1,0 +1,298 @@
+PREDICTIVE METRICS - ITERATION 104
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A small-batch (n==1) false negative occurred for Passenger 0133_01. Pattern: sum_spend == 0 (all_zero), CryoSleep=True, HomePlanet=Mars, Age=19. The model treated zero spend as a strong negative signal without a slice-aware prior or inflated uncertainty, allowed auto-decision on a 1-record batch, and missed an actual transported=True label. This repeats the same fragile “all_zero → confident negative” failure mode seen previously (e.g., 0126_01).
+- Immediate implication: small batches (especially n==1) + all_zero or other fragile patterns (single-feature dominance, high absolute spend) are high-risk. Stopgap: block auto-decisions for these patterns unless strict consensus/context support exists. Persist pattern flags and variance components in provenance, inflate uncertainty for fragile slices, retrain calibrator/GLM with explicit interactions and upweight contradictory examples, and add canaries including 0133_01.
+- Top priorities (0–72h):
+  1. Enforce n==1 stopgap gating: auto-decision blocked for all_zero_flag==True OR (top1_share ≥ TOP1_CONC_THRESHOLD OR sum_spend ≥ ABS_SPEND_HIGH OR feature_dom_fraction ≥ FEATURE_DOMINANCE_THRESH) unless strict consensus and context score ≥ Z_high.
+  2. Persist pattern flags and context scores (all_zero_flag, zero_consistency_score, abs_spend_context_score, concentration_flag, feature_dom_fraction, spend_entropy_norm) in provenance immediately.
+  3. Inflate SE for fragile slices: add var_all_zero, var_concentration, var_abs_spend, var_feature_dom + dynamic SE floors.
+  4. Retrain calibrator & GLM_fallback with explicit interactions (all_zero × CryoSleep × HomePlanet × Age_bucket, abs_spend_bucket × Channel × Destination × Age_bucket), upweight contradictions ×3–5. Shadow-run ≥14 days.
+  5. Add canaries 0126_01, 0127_01, 0133_01; block auto-decisions for them until validations pass.
+
+1) What specific patterns caused this error?
+- Primary pattern: all_zero spend (sum_spend == 0, num_nonzero_channels == 0) with CryoSleep=True. Model applied a generic negative weight to zero spend without using a slice-aware pooled prior μ_zero_demo or sufficiently large var_all_zero — so the posterior was biased negative and under-uncertain. Because batch size was 1, gating allowed the model to auto-decision the record.
+- Contributing/systemic issues:
+  - SE model lacked all_zero-specific variance and dynamic SE floors; se_combined was too small.
+  - Pooled prior for zero-spend slices (μ_zero_demo) either missing or blended with too small weight due to overly-aggressive data-weight for n==1.
+  - Decision gating was too permissive for n==1; ensemble/GLM fallback consensus checks were not enforced for fragile slices.
+  - Feature semantics inconsistently handled downstream (top1_share computed non-null for sum_spend==0 in some components).
+
+2) How should decision rules be modified to prevent recurrence?
+- Make pattern flags first-class gating variables: all_zero_flag, concentration_flag, abs_spend_flag, single_feature_influence_flag.
+- Enforce stricter gating for n small:
+  - For n==1:
+    - If any fragile flag (all_zero_flag OR concentration_flag OR abs_spend_flag OR single_feature_influence_flag) is True:
+      - Allow auto-decision ONLY if all of:
+        - slice_context_score ≥ Z_high (e.g., 0.80)
+        - N_samples_in_slice ≥ N_min (pattern-dependent)
+        - ensemble_agreement ≥ A_high (e.g., 0.995)
+        - GLM_fallback_agrees
+        - se_combined ≤ SE_accept (e.g., 0.06)
+      - Else → priority_audit (block auto-decision)
+    - Else → normal gating
+  - For n ≤ 3: apply similar logic with slightly relaxed thresholds but higher se_floor and larger N_min.
+- Single-feature dominance gating: if feature_dom_fraction ≥ FEATURE_DOMINANCE_THRESH (e.g., 0.60) require ensemble + GLM consensus regardless of batch size.
+- Absolute-spend gating: if sum_spend ≥ ABS_SPEND_HIGH (initial 800–1000) and abs_spend_context_score low → require priority_audit unless consensus.
+
+Concrete pseudocode (simplified):
+- Inputs: n_batch, all_zero_flag, concentration_flag, abs_spend_flag, single_feature_influence_flag, slice_context_score, N_samples_in_slice, ensemble_agreement, GLM_fallback_agrees, se_combined
+- Thresholds (initial): TOP1_CONC_THRESHOLD=0.70, ABS_SPEND_HIGH=800, FEATURE_DOMINANCE_THRESH=0.60, Z_high=0.80, N_min=25 (pattern dependent), A_high=0.995, SE_accept=0.06
+- Logic:
+  If n_batch == 1:
+    If any fragile_flag:
+      If slice_context_score ≥ Z_high AND N_samples_in_slice ≥ N_min AND ensemble_agreement ≥ A_high AND GLM_fallback_agrees AND se_combined ≤ SE_accept:
+        allow_auto_decision()
+      Else:
+        priority_audit(gating_reason)
+    Else:
+      normal_gating()
+  Else if n_batch ≤ 3:
+    apply tightened thresholds (increase se_floor, increase N_min)
+  Else:
+    normal_gating()
+
+3) What new insights does this error reveal about passenger transport patterns?
+- All-zero spend is not uniformly negative. Interaction with CryoSleep, HomePlanet, Age_bucket and cabin types can flip the sign. Example: CryoSleep=True + all_zero may indicate bunked in stasis and possibly correlated with higher transported rates in some subpopulations (e.g., Mars-origin groups).
+- Age direction varies — not strictly older=more transported; different all_zero×CryoSleep×Age strata behave differently. So μ_zero_demo must be stratified.
+- Small batches amplify slice-specific idiosyncrasies: a single all_zero record without pooled context + low SE gives brittle decisions.
+- Single-feature dominance and absolute spend exceptions are distinct error modes that require different handling than generic spend signals.
+
+4) How should confidence be recalibrated for more accurate batch predictions?
+- Expand SE model with pattern-specific variance components so fragile slices show larger uncertainty:
+  - Add var_all_zero, var_missingness, var_concentration, var_abs_spend, var_feature_dom.
+  - Example functional forms:
+    - var_all_zero = κ_zero * (1 − zero_consistency_score) * sqrt(1 + num_imputed_features)
+    - var_concentration = κ_conc * (1 − conc_consistency_score) * (top1_share^2) * log(1 + sum_spend)
+    - var_abs_spend = κ_abs * log(1 + sum_spend)/scale * (1 − abs_spend_context_score)
+    - var_feature_dom = κ_dom * max(0, feature_dom_fraction − FEATURE_DOMINANCE_BASE)
+  - Combine:
+    - var_combined = var_base + var_dispersion + var_spend_scale + var_all_zero + var_missingness + var_concentration + var_abs_spend + var_feature_dom
+    - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Dynamic SE floors depending on pattern/context:
+  - all_zero & weak_context → se_floor ~ 0.25–0.35
+  - all_zero & strong_context → se_floor ~ 0.06–0.10
+  - concentrated_high & weak_context → se_floor ~ 0.20–0.30
+  - abs_spend_high & weak_context → se_floor ~ 0.20–0.30
+  - single_feature_dom → se_floor ~ 0.20–0.35
+- Calibrator outputs: p10, p50, p90 (or sd) instead of a single point. Train the calibrator with quantile loss + ECE penalty and upweight contradictions from fragile slices ×3–5. Require p10/p90 to be used in gating decisions (e.g., if p90 < accept_threshold or p10 > reject_threshold then auto-decision may be allowed when consistent).
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Standardize feature computation across scorer, pooled_prior, GLM_fallback, calibrator — versioned feature spec. Key fields: sum_spend, top1_share, all_zero_flag, concentration_flag, abs_spend_bucket, spend_entropy_norm, feature_dom_fraction, missingness_profile.
+- When sum_spend==0: set top1_share=NULL; concentration_type='all_zero' in all components.
+- Pooled priors: introduce μ_zero_demo and μ_abs_spend_demo stratified by (CryoSleep × HomePlanet × Age_bucket × VIP × Cabin) to capture interactions.
+- Batch-aware blending: p_final = w_data * p_model + (1 − w_data) * p_pooled_prior with w_data = n / (n + N0_for_pattern). Use larger N0 for fragile patterns (all_zero N0 large) so pooled prior dominates small-batch single records.
+- Require ensemble/GLM fallback consensus and agreement for fragile slices, especially n ≤ 3.
+- Persist per-record provenance for gating, context scores, variance components, pooled prior weights so decisions are reproducible and audit-able.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New slice monitors and alerts:
+  - all_zero_by_ctx (CryoSleep × HomePlanet × Age_bucket): monitor ECE, Brier, FP, FN, contradiction_count, n==1_auto_accept_rate.
+  - concentrated_by_channel & abs_spend_bucket monitors: same metrics.
+  - single_feature_dominance monitor: fraction of records where feature_dom_fraction > FEATURE_DOMINANCE_THRESH and their error rates.
+  - n==1 auto_accept rate per slice and global.
+- Canaries & active learning:
+  - Add 0133_01, 0126_01, 0127_01 to canary set. Block auto-decisions for them until gating + retrain validated.
+  - Seed active-label queue with samples from all_zero×CryoSleep combos and abs_spend_high×Destination combos for faster label acquisition.
+- Retrain plan:
+  - Retrain calibrator & GLM_fallback with explicit interactions:
+    - all_zero_flag × CryoSleep × Age_bucket × HomePlanet
+    - abs_spend_bucket × Channel × Destination × Age_bucket
+    - feature_dom_fraction × Channel
+  - Upweight contradictions and rare-slice failures ×3–5. Use grouped CV stratified by (all_zero_flag, concentration_type, abs_spend_bucket, HomePlanet, Age_bucket).
+- Metrics to add:
+  - n==1_auto_accept_contradiction_rate (per slice)
+  - fraction_of_auto_decisions_explained_by_single_feature
+  - ECE_by_pattern and Brier_by_pattern
+  - pooled_prior_blend_weight distribution (debugging)
+
+Complete updated predictive metrics report — actionable components
+
+A. New / updated feature definitions (versioned v→v+1)
+- sum_spend = sum(RoomService, FoodCourt, ShoppingMall, Spa, VRDeck)
+- all_zero_flag = (sum_spend == 0 AND num_nonzero_channels == 0)
+- top1_channel, top1_spend, top1_share:
+  - If all_zero_flag: top1_share = NULL; concentration_type = 'all_zero'
+  - Else: top1_share = top1_spend / max(1, sum_spend)
+- concentration_flag = (top1_share ≥ TOP1_CONC_THRESHOLD) where TOP1_CONC_THRESHOLD = 0.70 (sweepable)
+- abs_spend_bucket & abs_spend_flag:
+  - abs_spend_bucket = bucket(sum_spend) (e.g., [0,50,200,500,800,1200,+])
+  - abs_spend_flag = (sum_spend ≥ ABS_SPEND_HIGH) with ABS_SPEND_HIGH initial = 800–1000
+- spend_entropy_norm = normalized Shannon entropy across channel spends
+- feature_dom_fraction = feature_contribution(top1_channel) / total_logit_contrib — if ≥ FEATURE_DOMINANCE_THRESH (0.60) then single_feature_influence_flag=True
+- missingness_profile = vector of booleans for key fields
+- zero_consistency_score = (α + pos_count_zero) / (α + pos_count_zero + neg_count_zero), α default = 20 (shrinkage)
+- abs_spend_context_score = (α + pos_count_abs_spend_bucket) / (α + pos_count + neg_count) computed per (abs_spend_bucket × HomePlanet × Destination × Age_bucket)
+- all_zero_context_score = blend(zero_consistency_score, slice-specific modifiers for CryoSleep, Age_bucket, HomePlanet)
+
+B. Pooled priors extension (all_zero and abs_spend-aware)
+- μ_zero_demo: pooled prior mean for all_zero records stratified by (CryoSleep × HomePlanet × Age_bucket × VIP × Cabin)
+- μ_abs_spend_demo: pooled prior mean for abs_spend_bucket stratified by (Channel_distribution × Destination × Age_bucket × VIP)
+- Blend rules: μ_blended = τ_local * μ_slice + (1 − τ_local) * μ_global; τ_local depends on N_samples_in_slice and observed variance. For small n batches weight μ_blended higher.
+
+C. Direction-aware logit shifts (pattern treatment)
+- Determine zero_shift_frac and abs_spend_shift_frac:
+  - zero_shift_frac = clamp(base_zero_shift + w_zero_ctx*(all_zero_context_score − 0.5)*2 + w_zero_age*age_norm, min, max)
+  - abs_spend_shift_frac similarly computed using abs_spend_context_score and channel context
+  - Apply damping if context_score low or N_samples small. Only apply shifts when se_combined indicates sufficient certainty.
+
+D. Variance / SE model (explicit)
+- New variance terms and example forms:
+  - var_all_zero = κ_zero * (1 − all_zero_context_score) * sqrt(1 + num_imputed_features)
+  - var_missingness = κ_miss * missingness_count * novelty_scale * (1 − zero_consistency_score)
+  - var_concentration = κ_conc * (1 − conc_consistency_score) * (top1_share^2) * log(1 + sum_spend)
+  - var_abs_spend = κ_abs * log(1 + sum_spend)/scale * (1 − abs_spend_context_score)
+  - var_feature_dom = κ_dom * max(0, feature_dom_fraction − FEATURE_DOMINANCE_BASE)
+  - var_spend_scale = κ_scale * log(1 + sum_spend)
+- Combine:
+  - var_combined = var_base + var_dispersion + var_spend_scale + var_all_zero + var_missingness + var_concentration + var_abs_spend + var_feature_dom
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Example κ defaults (sweepable):
+  - κ_zero = 0.05, κ_miss = 0.05, κ_conc = 0.06, κ_abs = 0.04, κ_dom = 0.07, κ_scale = 0.02
+- Dynamic SE floors as described previously.
+
+E. Decision-gating (pattern-aware; concrete)
+- Constants (initial; sweepable):
+  - TOP1_CONC_THRESHOLD = 0.70
+  - ABS_SPEND_HIGH = 800
+  - FEATURE_DOMINANCE_THRESH = 0.60
+  - Z_high = 0.80, N_min_zero_samples = 25
+  - N_min_abs_spend_samples = 50
+  - C_high = 0.80, N_min_conc = 25
+  - A_high = 0.995, SE_accept = 0.06
+- Pseudocode (n==1):
+  - If all_zero_flag:
+      If all_zero_context_score ≥ Z_high AND N_zero_samples ≥ N_min_zero_samples AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept AND GLM_fallback_agrees:
+        → allow auto_decision
+      Else → priority_audit (gating_reason='all_zero_stopgap')
+  - Else if concentration_flag OR abs_spend_flag OR single_feature_influence_flag:
+      If corresponding context_score ≥ C_high AND N_samples ≥ N_min_* AND ensemble_agreement ≥ A_high AND GLM_fallback_agrees AND se_combined ≤ SE_accept:
+        → allow auto_decision
+      Else → priority_audit (gating_reason='fragile_pattern_stopgap')
+  - Else → normal gating
+- For n ≤ 3: raise thresholds; increase se_floor; increase N_min_*.
+
+F. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Outputs: p10, p50, p90, sd
+  - Features: p_model_after_logit_shift, ensemble_agreement, all_zero_flag, concentration_flag, abs_spend_flag, spend_entropy_norm, num_nonzero_channels, feature_dom_fraction, missingness_profile, all_zero_context_score, abs_spend_context_score, CryoSleep, Age_bucket, HomePlanet, Destination, Cabin.
+  - Loss: quantile loss + ECE penalty; upweight contradictions in targeted slices ×3–5.
+  - CV: grouped by (all_zero_flag, concentration_flag, abs_spend_bucket, HomePlanet, Age_bucket).
+- GLM_fallback:
+  - Add interactions explicitly: all_zero_flag × CryoSleep × Age_bucket × HomePlanet × VIP; abs_spend_bucket × Channel × Destination × Age_bucket; feature_dom_fraction × Channel.
+  - Regularization: elastic net; include sign/stability checks and shrinkage for rare slices. Consider monotonicity constraints for spend features if domain supports, with interactions allowed to override.
+- Dataset augmentation:
+  - Oversample or upweight rare but crucial slices (all_zero transported, high_spend non_transport).
+  - Balanced sampling for grouped CV.
+- Shadow-run criteria: minimum 14 days; targets include reduction in targeted contradiction rates ≥30–40% and no unacceptable global regression.
+
+G. Monitoring, metrics & alerts
+- New slice monitors / dashboards:
+  - all_zero_by_ctx (CryoSleep × HomePlanet × Age_bucket): ECE, Brier, FP, FN, contradiction_count, n==1_auto_accept_rate
+  - concentrated_by_channel & abs_spend_bucket: same metrics
+  - single_feature_dom monitor: percent of records with feature_dom_fraction > threshold and their error rates
+  - global and per-slice n==1 auto_accept_rate
+- Alerts:
+  - all_zero_by_ctx FP/FN > 20% above baseline over 24h → block auto_accept + alert ops
+  - n==1 auto_accept_rate spike → hold gating + alert
+  - abs_spend_bucket contradiction rate > threshold → hold promotions and alert ML team
+- Canaries:
+  - Add 0126_01, 0127_01, 0133_01 to canary set. Expected behavior: blocked for auto-decision and routed to priority_audit unless criteria met.
+
+H. CI tests & validation
+- Unit tests:
+  - any record with all_zero_flag==True and n==1 → gating_reason 'all_zero_stopgap' unless all_zero_context_score ≥ Z_high AND GLM_fallback_agrees.
+  - top1_share is NULL when all_zero_flag==True.
+  - se_combined increases for all_zero, missingness, abs_spend_high, and feature_dom records.
+  - calibrator outputs wider quantile spreads for weak-context slices.
+- Shadow-run targets:
+  - contradictions in all_zero_by_ctx and abs_spend_by_ctx slices reduced ≥30–40%
+  - audit queue manageable and trending down after retrain
+  - global FP/FN within acceptable bounds (e.g., no > +1% absolute regression in overall FN/FP)
+
+I. Operational actions (0–72 hours)
+1. Immediate engineering (0–12h):
+   - Persist flags & context scores in predictions and provenance: all_zero_flag, concentration_flag, abs_spend_flag, feature_dom_fraction, spend_entropy_norm, zero_consistency_score, abs_spend_context_score.
+   - Enforce n==1 stopgap gating: block auto-decision for fragile patterns unless strict consensus.
+   - Add canaries 0126_01, 0127_01, 0133_01 and block auto-decisions for them.
+2. Scoring engine (12–48h):
+   - Expose var_all_zero, var_abs_spend, var_feature_dom in provenance; ensure top1_share is NULL for all_zero and downstream respect that.
+   - Provide per-feature logit contributions to compute feature_dom_fraction.
+3. ML pipeline (24–72h):
+   - Retrain calibrator + GLM_fallback with new features & interactions; upweight contradictions; start 14+ day shadow validation.
+   - Publish updated pooled priors & N_samples per slice daily.
+4. Monitoring & ops (24–72h):
+   - Deploy dashboards & alerts for new slices and canaries.
+5. Product/audit (24–72h):
+   - Fast-label UI for priority_audit; seed active-label queue with all_zero, abs_spend_high, and single_feature_dominant records.
+6. Promotion:
+   - Promote models + gating changes only after shadow-run acceptance targets are met and canaries behave as expected.
+
+J. Per-record provenance to log (required)
+- Raw spends: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck
+- sum_spend, abs_spend_bucket, all_zero_flag, concentration_type
+- top1_channel, top1_spend, top1_share (NULL for all_zero), top2_share, top3_share
+- spend_entropy_norm, num_nonzero_channels
+- missingness_profile, missingness_count
+- feature_dom_fraction, feature_dom_channel
+- zero_consistency_score, all_zero_context_score, abs_spend_context_score, channel_consistency_score
+- N_zero_samples, N_abs_spend_samples, N_conc_samples
+- zero_shift_frac_used, abs_spend_shift_frac_used, conc_shift_frac_used, disp_shift_frac_used (values & versions)
+- μ_zero_demo, μ_abs_spend_demo, μ_channel_conc_demo components and τ weights
+- var_all_zero, var_missingness, var_concentration, var_abs_spend, var_feature_dom, var_dispersion
+- se_combined
+- GLM_fallback_probs, GLM_fallback_agreement_flag
+- ensemble_probs, ensemble_agreement
+- p10/p50/p90, p_final_sd
+- gating_reasons
+- scorer_version, pooled_prior_snapshot_id, calibrator_version
+
+K. Hyperparameters (initial; sweepable)
+- TOP1_CONC_THRESHOLD = 0.70
+- ABS_SPEND_HIGH = 800 (sweep 600–1200)
+- FEATURE_DOMINANCE_THRESH = 0.60
+- Z_high = 0.80, N_min_zero_samples = 25
+- N_min_abs_spend_samples = 50, N_min_conc = 25
+- A_high = 0.995, SE_accept = 0.06
+- κ_zero = 0.05, κ_miss = 0.05, κ_conc = 0.06, κ_abs = 0.04, κ_dom = 0.07, κ_scale = 0.02
+- base_zero_shift = 0.35, base_abs_shift = 0.30, w_zero_ctx = 0.35, w_abs_ctx = 0.35
+- Batch blend N0 (pattern dependent): all_zero N0 = 25–100, abs_spend_high N0 = 50–200, default N0 = 3–10
+
+L. CI canaries & expected behavior (include problem IDs)
+- 0126_01 (all_zero, CryoSleep=True, Age 67): expected gating_reason 'all_zero_stopgap' and routed to priority_audit unless all_zero_context_score ≥ Z_high AND GLM_fallback_agrees.
+- 0127_01 (high sum_spend ≈ 1022, top1_share ≈ 0.685, top1_channel RoomService): expected gating_reason 'abs_spend_or_feature_dom_stopgap' and routed to priority_audit unless abs_spend_context_score ≥ C_high AND GLM_fallback_agrees.
+- 0133_01 (current error: sum_spend==0, CryoSleep=True, Age 19): expected gating_reason 'all_zero_stopgap' and routed to priority_audit unless all_zero_context_score ≥ Z_high AND GLM_fallback_agrees.
+- Add more historical problem IDs to canary set.
+
+M. Quick triage checklist for 0133_01 (immediate debugging)
+1. Verify computed fields: sum_spend == 0, all_zero_flag=True, num_nonzero_channels == 0, spend_entropy_norm undefined/low.
+2. Check zero_consistency_score for slice (all_zero × CryoSleep × HomePlanet=Mars × Age_bucket=18–25) and N_zero_samples in pooled priors. Is score high enough to justify model negative weight?
+3. Inspect μ_zero_demo usage and blending weight τ; was μ_zero_demo available and given sufficient weight for n==1?
+4. Inspect se_combined and var_all_zero; confirm whether se was increased and dynamic SE floor applied.
+5. Inspect GLM_fallback output & ensemble agreement; did fallback disagree?
+6. If context_score < Z_high or GLM_fallback disagrees → priority_audit + active-label queue; add record to canary set and flag for fast-label UI.
+
+Why these changes will reduce batch errors going forward
+- First-class pattern detection (all_zero, concentration, abs_spend_high, single_feature_dom) prevents a single generic spend weight from generating high-confidence erroneous predictions on brittle records.
+- Pattern-specific pooled priors (μ_zero_demo, μ_abs_spend_demo) encode slice-level transport tendencies (e.g., all_zero×CryoSleep×Mars×Age_bucket) and dominate single-record predictions when appropriate, reducing variance from a single model output.
+- Explicit variance components inflate uncertainty on fragile slices and prevent auto-decisions when data are insufficient — small-batch decisions will rely more on pooled priors and GLM fallback consensus.
+- Retraining calibrator & GLM_fallback with interactions and upweighted contradictions improves calibration on problematic slices and provides a stronger fallback.
+- Provenance, canaries, and targeted monitoring accelerate triage and active learning to close remaining gaps.
+
+Immediate one-line corrective action
+- Enforce n==1 gating: any record with all_zero_flag==True OR (top1_share ≥ 0.70 OR sum_spend ≥ 800 OR feature_dom_fraction ≥ 0.60) must be routed to priority_audit unless pattern_context_score ≥ 0.80 AND GLM_fallback/ensemble consensus — add 0126_01, 0127_01 and 0133_01 to canaries and block auto-accept.
+
+Acceptance criteria for promotion (recommended)
+- Shadow-run ≥14 days.
+- Target: contradictions in all_zero_by_ctx and abs_spend_by_ctx slices reduced ≥30–40%.
+- Global: overall ECE not worse than baseline by >0.5–1.0% absolute; targeted slice error reductions prioritized.
+- No canary should be auto-accepted; canary gating behavior consistent with spec.
+
+Next step I can generate (choose one)
+- Deterministic scorer skeleton: exact feature calculations + API spec + provenance JSON schema (engineering-ready)
+- Exact retrain spec for calibrator & GLM_fallback: dataset selection, upweighting schema, CV folds, hyperparameter sweeps, and acceptance criteria
+
+Which would you like me to produce now?
+
+============================================================

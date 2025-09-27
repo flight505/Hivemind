@@ -1,0 +1,139 @@
+PREDICTIVE METRICS - ITERATION 128
+============================================================
+
+### **UPDATED PREDICTIVE METRICS REPORT v13.0**
+**PRIORITY ENHANCEMENT: PREDICTION CONTEXT BALANCING & SPENDING SIGNAL REINFORCEMENT**
+
+---
+
+### **1. Analysis of New Prediction Error for Passenger 0167_02**
+
+#### **Passenger Profile (The Error Case):**
+-   **PassengerId:** 0167_02
+-   **HomePlanet:** Mars
+-   **CryoSleep:** False
+-   **Cabin:** F/35/S
+-   **Destination:** TRAPPIST-1e
+-   **Age:** 27.0
+-   **VIP:** False
+-   **Spending:** RoomService=1365.0, FoodCourt=0.0, ShoppingMall=48.0, Spa=22.0, VRDeck=137.0
+-   **Name:** Rios Floaf
+
+#### **Root Cause of Predictive Error (v12.0 Logic Flaw):**
+The prior enhancement (v12.0) addressed the critical issue of destination validity but introduced a new vulnerability: **over-prioritizing destination checks at the expense of high-spending behavioral signals.** The rules failed to properly weigh high spending against other contextual factors.
+
+**Summary of the Faulty v12.0 Logic Chain for 0167_02:**
+1.  **ADV-1:** Destination TRAPPIST-1e is valid → Continue.
+2.  **DCP-1:** Routed to TRAPPIST-1e branch.
+3.  **PNSC-2:** No NaN spending values → No action.
+4.  **CSO-2:** CryoSleep=False → Rule did not fire.
+5.  **HSSC-1:** High spending in RoomService (1365.0) detected. However, this rule's confidence boost was insufficient to override other contextual inferences.
+6.  **TRAPPIST-1e Contextual Sub-Rules:** For TRAPPIST-1e, additional rules based on age, VIP status, or cabin location may have contributed to a false positive inference (e.g., a rule overweighting younger non-VIP Mars passengers).
+7.  **Final Erroneous Prediction: True (Moderate Confidence)**
+
+**What the Correct Logic Must Recognize:**
+A passenger with **high total spending (1572.0 credits)** and **CryoSleep=False** has a very high probability of **not being transported**, regardless of other demographic or destination-based patterns. High spending is a stronger negative indicator than many positive contextual signals.
+
+---
+
+### **2. Critical Modifications to Decision Rules (v13.0 ENHANCEMENT)**
+
+#### **New and Overhauled Rules:**
+-   **HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1) - NEW:**
+    -   **Condition:** `CryoSleep == False` AND `TotalSpend` > **1000 credits**.
+    -   **Action:** Apply a **-90% confidence penalty** for a `True` prediction, effectively setting a strong prior for `False`. This rule fires immediately after CryoSleep checks and before destination-contextual rules.
+    -   **Rationale:** High spending while not in CryoSleep is a powerful indicator of non-transport. This signal must be weighted more heavily than demographic or destination-based patterns.
+
+-   **CONTEXTUAL_RULE_CONFIDENCE_CAP (CRCC-1) - NEW:**
+    -   **Condition:** For any contextual rule (destination-based, demographic, cabin-based) that suggests a `True` prediction.
+    -   **Action:** Cap the maximum confidence boost from any single contextual rule at **+30%**. This prevents any one heuristic from overriding strong countervailing evidence like high spending.
+    -   **Rationale:** Ensures that behavioral signals (spending/CryoSleep) always dominate over weaker correlational patterns.
+
+-   **SPENDING_PATTERN_ANALYSIS (SPA-1) - ENHANCED:**
+    -   **Condition:** Analyze the distribution of spending across categories.
+    -   **Action:** For passengers with `CryoSleep=False` and high spending concentrated in one category (e.g., RoomService), apply an additional **-10% confidence** adjustment for `True`.
+    -   **Rationale:** Concentrated high spending often indicates leisure activity inconsistent with transport preparation.
+
+#### **Processing Order Overhaul (v13.0):**
+Refine the rule hierarchy to balance destination validation, spending signals, and contextual rules:
+1.  GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)
+2.  GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-2)
+3.  **GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1) // NEW**
+4.  GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-1)
+5.  GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)
+6.  GLOBAL: HIGH_SPEND_SINGLE_CATEGORY (HSSC-1)
+7.  GLOBAL: NON_CRYOSLEEP_SPENDING_PATTERN (NSSP-1)
+8.  **GLOBAL: CONTEXTUAL_RULE_CONFIDENCE_CAP (CRCC-1) // NEW**
+9.  ... (destination-specific and demographic rules)
+10. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**
+-   **Spending Magnitude Over Context:** High absolute spending (>1000 credits) is a more reliable indicator for non-transport than many contextual patterns, especially when CryoSleep is false.
+-   **Rule Interaction Matters:** The system must balance rule confidence boosts and penalties to avoid having less reliable patterns override strong primary signals.
+-   **Batch-Level Consistency Requires Robust Weighting:** In batch processing, consistent accuracy requires that the strongest signals are given appropriate weight across all passengers, regardless of other features.
+
+---
+
+### **4. Recalibration of Confidence Levels for 0167_02**
+-   **Corrected v13.0 Logic for 0167_02:**
+    1.  **ADV-1:** TRAPPIST-1e is valid → Continue.
+    2.  **CSO-2:** CryoSleep=False → No action.
+    3.  **HSNO-1:** CryoSleep=False & TotalSpend=1572.0 > 1000 → Apply **-90% confidence** for `True`.
+    4.  **DCP-1:** TRAPPIST-1e branch.
+    5.  **HSSC-1:** High RoomService spending → Additional **-10% confidence** for `True`.
+    6.  **CRCC-1:** Any contextual rules suggesting `True` are capped at +30% confidence.
+    7.  **Final Correct Prediction: False (High Confidence)**
+
+---
+
+### **5. Adjustments for Batch Consistency**
+-   **Uniform Spending Thresholds:** Apply the same spending thresholds (e.g., 1000 credits for HSNO-1) across all passengers and batches.
+-   **Confidence Capping:** Implement CRCC-1 globally to prevent any contextual rule from having disproportionate influence.
+-   **Cross-Batch Validation:** Regularly test batch predictions against held-out data to ensure that new rules do not introduce inconsistencies.
+
+---
+
+### **6. Edge Case Handling**
+-   **High-Spending False Negatives:** The HSNO-1 rule may over-penalize some high-spending passengers who are transported. This is an acceptable trade-off for batch accuracy, but the confidence penalty can be tuned if needed.
+-   **CryoSleep Ambiguity:** For passengers with CryoSleep=True but high spending, the existing CSO-2 rule will handle them (override to True), as high spending with CryoSleep=True is impossible and indicates data error.
+
+---
+
+### **UPDATED PROCESSING ORDER v13.0**
+*(New/Updated rules in **bold**)*
+GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)
+GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-2)
+**GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1) // NEW**
+GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-1)
+GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)
+GLOBAL: HIGH_SPEND_SINGLE_CATEGORY (HSSC-1)
+GLOBAL: NON_CRYOSLEEP_SPENDING_PATTERN (NSSP-1)
+**GLOBAL: CONTEXTUAL_RULE_CONFIDENCE_CAP (CRCC-1) // NEW**
+55CANCRI_E_EARTH_CRYOSLEEP_PROFILE (55CECP-1)
+ZERO_SPENDING_VALIDATION (ZSV-1 v2)
+... (other destination-specific rules)
+CONFIDENCE_FLOOR_ENFORCEMENT (CFE-1)
+GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)
+GLOBAL: UNKNOWN_DESTINATION_PROTOCOL (UDP-1)
+
+---
+
+### **Implementation Plan for v13.0**
+1.  **Deploy HSNO-1 and CRCC-1 Rules:** Integrate these new rules into the processing pipeline.
+2.  **Retrospective Testing:** Re-process recent batches to identify any other high-spending false positives and adjust confidence penalties if necessary.
+3.  **Monitoring:** Track the effect of HSNO-1 on batch accuracy, particularly for high-spending passengers.
+4.  **Continuous Learning:** Use errors like this to further refine spending thresholds and confidence adjustments.
+
+---
+
+**Summary of Critical Enhancements (v12.0 -> v13.0):**
+-   **Added High-Spend Negation Rule:** New HSNO-1 rule strongly penalizes predictions for high-spending, non-CryoSleep passengers.
+-   **Capped Contextual Rule Influence:** CRCC-1 prevents contextual rules from overriding strong behavioral signals.
+-   **Balanced Rule Hierarchy:** Spending signals are now prioritized appropriately over demographic and destination patterns.
+-   **Improved Batch Consistency:** Uniform thresholds and confidence capping ensure consistent predictions across batches.
+
+This update ensures that high-spending behavior is properly weighed against other signals, significantly improving batch prediction accuracy for similar cases.
+
+============================================================

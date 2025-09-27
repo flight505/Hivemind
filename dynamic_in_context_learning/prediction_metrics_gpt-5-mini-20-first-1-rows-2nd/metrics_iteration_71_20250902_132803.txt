@@ -1,0 +1,285 @@
+PREDICTIVE METRICS - ITERATION 71
+============================================================
+
+Version: v3.5.6 (post_0098_02)
+High‑level goal
+- Preserve improvements from v3.5.2–v3.5.5 (per‑channel spend bins, conditional concentrated‑spend exceptions, extended zero_spend trust, multi‑channel subslice trust, concentrated_top1 fixes) while:
+  - Eliminating confident FNs and FPs for concentrated top‑K patterns (both directions),
+  - Making calibrator + uncertainty channel×pattern aware (top1/top2/topK, ordered combos),
+  - Enforcing conservative symmetric single‑record (n==1) gating for untrusted concentrated top‑K patterns (prevent auto‑accept or auto‑reject),
+  - Making concentrated penalties direction‑aware (increase OR decrease logit depending on pooled prior),
+  - Accelerating active learning for concentrated/multi‑channel contradictions.
+
+Executive summary — immediate takeaway & top priorities
+- New batch failure (0098_02) — concentrated_top2 (FoodCourt + ShoppingMall dominate; top2_share ≈ 0.977) produced a false negative:
+  - Record: PassengerId 0098_02 — FoodCourt=2811, ShoppingMall=957, VRDeck=87, RoomService=0, Spa=0, Age=26, Cabin=G/11/P, Destination=TRAPPIST-1e
+  - Computed: total_spend ≈ 3855; top1_share ≈ 0.73; top2_share ≈ 0.977 -> pattern_type = concentrated_top2.
+  - Outcome: predicted False, actual True (FN) in a batch of n==1.
+- Why this matters:
+  - v3.5.5 correctly targeted untrusted concentrated_top2 to avoid confident FPs (0097_01), but changes introduced asymmetric conservative behavior (penalties + SE floors + gating that blocked auto‑accepts but still allowed auto‑rejections), and a calibrator lacking explicit top2 pairwise semantics — caused over‑penalization for legitimate concentrated positives.
+  - We must balance FP reduction and recall for true concentrated positives. The solution is: (1) make concentrated penalties direction‑aware based on pooled priors, (2) make calibrator top‑K / channel‑pair aware, and (3) make n==1 gating symmetric (prevent both auto‑accept and auto‑reject for untrusted top‑K unless extreme consensus).
+
+Top immediate priorities (0–72h)
+1. 0–24h: Implement symmetric n==1 gating: do not auto‑accept OR auto‑reject untrusted concentrated_topK records (route to priority_audit), unless extreme consensus (high p_final + ensemble agreement or very low p_final + ensemble agreement).
+2. 0–72h: Implement direction‑aware concentrated logit_adjustment using pooled_prior (topK_subslice pooled with hierarchical pooling). Reduce static negative-only penalties.
+3. 0–72h: Expose topK features (ordered_topK tuple, top2_share, pairwise flags) and novelty_score to feature store; add 0098_02 and related contradictions to active learning queue with high priority.
+4. 2–14d: Retrain GLM_fallback + covariate calibrator with topK covariates, pairwise interaction features and grouped CV by subslice_id & pattern_type. Use sample weighting to preserve concentrated recall.
+5. Weekly: Prioritize labeling and AL for concentrated_top2 contradictions (both FPs and FNs).
+
+Primary error details (0098_02)
+- Record features:
+  - total_spend = 2811 + 957 + 87 = 3855
+  - top1_share = 2811 / 3855 ≈ 0.729
+  - top2_share = (2811 + 957) / 3855 ≈ 0.977
+  - num_nonzero_channels = 3; spend_entropy low.
+  - Pattern_type = concentrated_top2 (FoodCourt + ShoppingMall)
+- Model outcome: p_final below threshold → predicted False (FN). Causes likely: (a) rule/penalty applied for untrusted concentrated_top2 combos that reduced logit; (b) calibrator lacked pairwise covariates and therefore could not learn that FoodCourt+ShoppingMall tends to be positive in many contexts; (c) gating was asymmetric — it prevented confident FPs but allowed confident FNs to auto‑reject.
+
+Short root causes
+- Lack of pairwise channel semantics inside calibrator and GLM_fallback (no explicit top2_combo features).
+- Static negative‑only logit penalties for untrusted concentrated_topK (applied uniformly regardless of pooled_prior), causing over‑penalization when pooled evidence suggests positivity.
+- SE floors and uncertainty inflation without symmetric gating for auto‑rejection — high uncertainty + penalty pushed p_final below threshold and was allowed to auto‑reject in n==1 batches.
+- Slice_trust_table top2 subslices either absent or not pooled optimally (hierarchical pooling parameters too aggressive toward negative channel pairs).
+- Active learning and labeling insufficiently prioritized for concentrated_top2 contradictions — slow to accumulate trusted subslice counts for frequent top2 patterns with varying signs.
+
+Answers to the six questions (targeted & actionable)
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Observed pattern: concentrated_top2 where two spend channels (FoodCourt + ShoppingMall) account for ~98% of spend with low entropy.
+- Why the model underpredicted (FN):
+  - A blanket/unidirectional concentrated_topK penalty was applied to untrusted combos (meant to reduce FPs like 0097_01) but it did not consider pooled_prior direction — it reduced logit even where higher‑level pooled priors (single‑channel or channel_bin) favored positive labels.
+  - Calibrator lacked top2/topK covariates and pairwise channel interaction features; consequently it could not recover positive signal from the combination of channels.
+  - SE inflation + high min SE for concentrated/nontrusted patterns increased uncertainty; combined with a negative logit shift produced p_final below accept threshold.
+  - n==1 policy permitted auto‑rejects even when auto‑accepts were blocked — gating was asymmetric.
+
+Measurable indicators to detect similar risk:
+- top2_share ≥ 0.90 and spend_entropy ≤ 0.15, combined with:
+  - N_subslice (ordered_top2 tuple × context) < min_n_K (sparse),
+  - pooled_prior (hierarchical pooled prior) > 0.6 (i.e., higher-level evidence suggests positive) but applied static negative penalty,
+  - model_disagreement modest and se_combined inflated,
+  - batch n==1.
+- Signal: any untrusted concentrated_topK where pooled_prior > 0.6 and p_final was reduced by applied_logit_shift → candidate false negative.
+
+2) How should the decision rules be modified to prevent similar errors?
+Principles:
+- Treat concentrated_topK as pattern_type specific and directional: penalties must be polarity/direction aware (increase OR decrease logit) based on pooled_prior & higher‑level priors.
+- Gate small batches symmetrically: for untrusted concentrated_topK and n small, block both confident accepts and confident rejects unless extreme consensus.
+- Calibrator must be covariate‑aware and pairwise/channel‑combo aware to learn channel semantics.
+
+Concrete rule changes (implementable immediately)
+- Pattern detection:
+  - concentrated_top1: top_channel_share ≥ 0.80 OR (spend_entropy ≤ 0.25 AND top_channel_share ≥ 0.70).
+  - concentrated_top2: top2_share ≥ 0.90 OR (spend_entropy ≤ 0.15 AND top2_share ≥ 0.75).
+  - Precedence: top1 → top2 → multi_channel → dispersed.
+- Trusted_topK_subslice:
+  - Key: (ordered_topK_channel_tuple, age_bucket, deck, destination).
+  - Trust criteria: N_subslice ≥ min_n_by_K[K] AND TP_rate ≥ slice_trust_TP_threshold.
+  - min_n_by_K initial: {K=1:50, K=2:30, K>=3:20}.
+- Direction‑aware concentrated logit shift:
+  - Replace static negative shift with:
+    - pooled_prior = hierarchical_polling(concentrated_subslice, channel_bin_prior, global_prior).
+    - polarity_factor = 2 * pooled_prior − 1  (range −1..+1).
+    - logit_shift = polarity_factor * δ_logit_conc_K * novelty_scale.
+    - δ_logit_conc_K initial: {K=1:0.9, K=2:0.6} (reduce K=2 to avoid over‑penalization). Sweep ranges: K=2 {0.4–0.9}.
+    - novelty_scale = min(1, novelty_score / novelty_scale_denom) (scale 0..1).
+    - Clip logit_shift magnitude to |logit_shift| ≤ δ_max_K (δ_max_K initial = δ_logit_conc_K).
+    - Rationale: If pooled_prior > 0.5, shift is positive (increase logit), preserving true positives; if pooled_prior < 0.5, shift is negative to reduce FPs.
+- SE & uncertainty:
+  - Keep concentrated_nontrusted_floor, but reduce K=2 floor slightly to avoid excess uncertainty causing auto‑rejection: concentrated_nontrusted_floor_K2 = 0.08 (was 0.09).
+  - Maintain extreme_novelty_floor = 0.10.
+  - var_pattern scale κ_K: {K=1:1.0, K=2:1.3, multi:1.2}.
+- Symmetric n==1 gating:
+  - If n==1 AND pattern_type ∈ {concentrated_top1, concentrated_top2, concentrated_topK} AND NOT Trusted:
+    - Do NOT auto‑accept AND do NOT auto‑reject. Route to priority_audit unless:
+      - p_final > extreme_accept_threshold_K AND ensemble agreement > agreement_threshold_accept, OR
+      - p_final < extreme_reject_threshold_K AND ensemble agreement > agreement_threshold_reject.
+    - extreme_accept_threshold_K: {K=1:0.995, K=2:0.998}
+    - extreme_reject_threshold_K: {K=1:0.005, K=2:0.002}
+    - agreement_threshold_accept/reject: 0.98
+  - For small_batch (n < small_batch_min, small_batch_min=10) apply similar conservative gating but with weaker thresholds.
+- Calibrator:
+  - Replace global Platt with covariate GBM (LightGBM) or small NN that inputs:
+    - p_after_penalty, pattern_type, topK_combo_id (hashed/embedded), top_channel_share, top2_share, spend_entropy, num_nonzero_channels, pairwise channel flags, model_disagreement, N_subslice, pooled_prior, novelty_score.
+  - Use grouped CV by (topK_combo_id, pattern_type) and time windows to avoid leakage.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Top2 combinations are heterogeneous: some channel pairs (FoodCourt+VRDeck) may correlate with False while other pairs (FoodCourt+ShoppingMall) correlate with True — channel semantics are critical.
+- Absolute spend magnitude alone is not decisive; the composition of the top‑K and context (age, deck, destination) shifts label direction.
+- Single‑record predictions are a big source of both confident FP and FN when combined with untrusted concentrated patterns — symmetric conservative gating is needed.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Pattern‑aware variance model:
+  - var_slice ≈ posterior_mean*(1−posterior_mean)/(N_subslice + 1)
+  - var_pattern = κ_K * g(num_nonzero, spend_entropy, novelty_score) with κ_K per K.
+- Combined variance:
+  - var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern
+  - var_novelty_conditional = (no_trusted_subslice ? κ_novelty * novelty_score : small_floor)
+- SE floors (contextual; updated):
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor_K1 = 0.07
+  - concentrated_nontrusted_floor_K2 = 0.08 (reduced from 0.09)
+  - multi_channel_nontrusted_floor = 0.06
+  - extreme_novelty_floor = 0.10
+- z_adj for decisioning:
+  - z_adj = base_z * (1 + γ1*FP_risk + γ2*model_disagreement + γ3*novelty_score)
+  - If trusted_slice_flag True → z_adj *= (1 − λ_trust)
+  - base_z = 1.645; γs = {1.0, 0.6, 1.0}; λ_trust = 0.35
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Deterministic snapshotting: snapshot scorer, calibrator, slice_trust_table and hyperparams at batch start with snapshot_id; use same snapshot for entire batch to avoid intra-batch inconsistencies.
+- Symmetric small‑batch policy: For n < small_batch_min (10), apply stronger SE floors & symmetric gating.
+- Audit routing: treat untrusted concentrated_topK records as “requires human review” by default for n==1. Ensure audit queue prioritized and small.
+- Provenance & logging: persist per record the applied logit_shift, pooled_prior, N_subslice, pattern_type, topK_combo_id, model_disagreement, novelty_score, and decision_reason_code.
+- Canary & rollout: block rollout until concentrated_top2 recall and top1 FP rates meet acceptance criteria.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New per‑record features:
+  - top_channel_id, top_channel_share, top2_share, topK_combo_id (ordered tuple), pairwise_channel_flags, spend_entropy, num_nonzero_channels, novelty_score, pooled_prior_by_K.
+- Model & training changes:
+  - GLM_fallback v14 → include pattern_type, topK combo features (hashed/embeddings), top2_share, spend_entropy, pairwise interactions (FoodCourt×ShoppingMall etc.), and pattern_type×age_bucket / deck interactions.
+  - Calibrator v4 → covariate GBM with grouped CV; use monotonic constraints only where domain supports.
+- Hierarchical smoothing:
+  - Empirical Bayes pooling for topK_subslice priors with τ_K pooled factors (heavier pooling for K=2 in early stages) but ensure pooling uses single‑channel priors as well.
+- Active learning:
+  - Prioritize concentrated_top2 contradictions (both FPs & FNs) for labeling — sample until N_subslice ≥ min_n_by_K or until pooled_prior stabilizes.
+- Monitoring additions:
+  - Per‑pattern ECE/Brier/precision/recall by pattern_type and top‑pair.
+  - Time‑to‑trust: labels needed for subslice to reach Trusted.
+
+Updated deterministic scoring pipeline — v3.5.6 (condensed flow)
+1. Snapshot load at batch start: channel_spend_bin, channel_spend_stats, slice_trust_table (zero_spend, concentrated_subslices top1/top2/topK), models & calibrators, hyperparams, snapshot_id.
+2. Preprocessing per record:
+   - Compute total_spend, num_nonzero_channels, spend_entropy, ordered topK channels, top_channel_share, top2_share, topK_combo_id, Age_bucket, Cabin_deck, Destination.
+   - Determine pattern_type ∈ {zero, concentrated_top1, concentrated_top2, concentrated_topK, multi_channel, dispersed}.
+   - Compute novelty_score (inverse frequency of exact subslice key).
+3. Prior lookups & hierarchical pooling:
+   - Retrieve subslice counts (ordered_topK_tuple, age_bucket, deck, destination).
+   - pooled_prior = hierarchical_pooling(concentrated_subslice_prior, single_channel_bin_prior, global_prior) with w_subslice = N_subslice/(N_subslice + τ_K).
+4. Model inference:
+   - Run ensemble (GLM_fallback, aggregator, SRM); obtain p_ens ± se_ens and model_disagreement.
+5. p_combined_prepenalty:
+   - p_prior = pooled_prior.
+   - p_combined_prepenalty = α_prior * p_prior + α_ens * p_ens.
+6. Direction‑aware concentrated adjustment:
+   - If pattern_type == concentrated_topK:
+     - If Trusted_subslice → minimal shift, low SE floor.
+     - Else → compute polarity_factor = 2*p_pooled − 1; novelty_scale based on novelty_score; logit_shift = polarity_factor * δ_logit_conc_K * novelty_scale (clipped).
+     - Inflate var_pattern per κ_K and set concentrated_nontrusted_floor_K.
+7. Variance & SE:
+   - var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern.
+   - se_combined = sqrt(max(var_combined, base_min_se(context)^2)).
+8. Calibrate:
+   - p_after_penalty = inv_logit(logit(p_combined_prepenalty) + logit_shift).
+   - p_final = covariate_calibrator.predict([p_after_penalty, pattern_type, topK_combo_id, top_channel_share, top2_share, spend_entropy, num_nonzero_channels, model_disagreement, pooled_prior, N_subslice, novelty_score]).
+9. Decisioning & symmetric gating:
+   - If Trusted_subslice_flag True and p_final ≥ accept_threshold_trusted → auto‑accept.
+   - Else if n==1 AND pattern_type concentrated_topK AND NOT Trusted:
+     - Route to priority_audit UNLESS:
+       - p_final > extreme_accept_threshold_K AND ensemble agreement > agreement_threshold_accept OR
+       - p_final < extreme_reject_threshold_K AND ensemble agreement > agreement_threshold_reject.
+   - Else standard thresholding with pattern‑aware z_adj.
+10. Persist per‑record provenance and append contradictions to active learning queues.
+11. Post‑batch: update slice_trust_table counts with labels (exponential decay), retrain triggers if contradictions exceed thresholds.
+
+Default hyperparameters (initial; tuning required)
+- Pattern detection thresholds: unchanged from v3.5.5 (top2 detection preserved).
+- concentrated_min_n_by_K: {K=1:50 (sweep 30–100), K=2:30 (sweep 20–60), K>=3:20}
+- slice_trust_TP_threshold = 0.70
+- τ_K pooling factor = {K=1:100 (sweep 40–200), K=2:160 (reduced from 200, sweep 80–320)}
+- base_min_se:
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor_K1 = 0.07
+  - concentrated_nontrusted_floor_K2 = 0.08 (reduced from 0.09)
+  - multi_channel_nontrusted_floor = 0.06
+  - extreme_novelty_floor = 0.10
+- δ_logit_conc_K = {K=1:0.9 (0.6–1.2), K=2:0.6 (0.4–0.9)}
+- extreme_accept_threshold_K = {K=1:0.995, K=2:0.998}
+- extreme_reject_threshold_K = {K=1:0.005, K=2:0.002}
+- small_batch_min = 10
+- base_z = 1.645; γs = {1.0, 0.6, 1.0}; λ_trust = 0.35
+- calibrator: LightGBM with grouped CV by subslice_id & pattern_type; monotonic constraints where applicable
+- ensemble weights start: aggregator 0.45, GLM 0.30, SRM 0.25 (tunable)
+
+Validation experiments & acceptance criteria
+- Test sets:
+  - Historical failing cases: 0084_01 (concentrated FN), 0086_01 (multi_channel FP), 0092_01 (concentrated_top1 FP), 0097_01 (concentrated_top2 FP), 0098_02 (concentrated_top2 FN).
+  - Synthetic concentrated_topK OOD cases across Age_bucket × deck × dest and channel pairs (FoodCourt+VRDeck, FoodCourt+ShoppingMall, RoomService+VRDeck, etc.).
+  - Recent live batches (shadow).
+- Metrics to monitor:
+  - Per‑pattern precision/recall (concentrated_top1, concentrated_top2, multi_channel).
+  - Per‑pair FP/FN rates for top channel pairs (FoodCourt+VRDeck, FoodCourt+ShoppingMall).
+  - Overall Brier score, ECE, CI coverage.
+  - Small‑batch (n==1) FP/FN rates and audit queue growth.
+- Acceptance criteria vs v3.5.4 baseline:
+  - concentrated_top2 FP rate: ≥30% relative reduction on historical FP cases (esp. FoodCourt+VRDeck).
+  - concentrated_top2 FN rate: ≤20% relative reduction vs current (avoid >2% absolute increase in FN for concentrated_top2).
+  - concentrated_top1 FP rate: ≥25% relative reduction.
+  - concentrated recall loss ≤2% absolute overall.
+  - Overall FN increase ≤3% absolute.
+  - Audit queue may increase up to 1.5× for 2 weeks; must decline after 4 weeks as AL labels accumulate.
+- Parameter sweeps:
+  - δ_logit_conc_K, concentrated_nontrusted_floor_K2, τ_K, min_n_by_K.
+- Ablations:
+  - Turn off direction‑aware logit shift → measure concentrated_top2 FN increase.
+  - Remove top2 covariates in calibrator → measure deterioration.
+
+Unit test matrix (CI)
+- Case A (audit expected): concentrated extreme RoomService no trusted subslice → priority_audit.
+- Case B (trusted accept expected): zero_spend & CryoSleep True → auto‑accept.
+- Case C (trusted accept expected): zero_spend child deck F with Trusted subslice → auto‑accept.
+- Case D (concentrated accept expected): 0084_01 (RoomService concentrated) → if Trusted → auto‑accept; if not → audit.
+- Case E (concentrated_top1 nontrusted): 0092_01 (ShoppingMall concentrated) → reduced p_final & route_to_audit or predict False.
+- Case F (multi_channel FP): 0086_01 → reduced p_final & audit routing if untrusted.
+- Case G (concentrated_top2 FP): 0097_01 (FoodCourt + VRDeck) → expected: reduced p_final and route_to_audit for n==1; avoid confident FP auto‑accept.
+- Case H (concentrated_top2 FN): 0098_02 (FoodCourt + ShoppingMall) → expected: if pooled_prior (via hierarchical pooling) indicates positive, logit_shift should be non‑negative → p_final should not be driven to auto‑reject; for n==1 untrusted, route_to_audit rather than auto‑reject unless extreme consensus found.
+- Case I (OOD synthetic): unseen extreme multi_channel spends → verify logit penalty + higher SE + audit routing.
+- Case J (regression): ensure concentrated_spend recall for trusted subslices does not fall >2% abs.
+
+How v3.5.6 will handle 0098_02 (concrete walkthrough)
+- Preprocess: pattern_type = concentrated_top2; top2_combo_key = (FoodCourt, ShoppingMall, Age_bucket=20s, deck=G, dest=TRAPPIST-1e); total_spend ≈ 3855; top2_share ≈ 0.977.
+- Lookup: top2_subslice N likely small → NOT Trusted. Hierarchical pooling pulls in FoodCourt single‑channel prior and ShoppingMall prior, producing pooled_prior (e.g., ~0.65 if both channels historically correlate with True).
+- Direction‑aware shift: polarity_factor = 2*pooled_prior − 1 (≈ 0.30) → logit_shift positive (increases logit), scaled by novelty_scale. This avoids the negative blanket penalty that previously produced the FN.
+- Calibrator: pattern‑aware calibrator further adjusts p_after_penalty using topK features and pooled_prior → if signals are positive, p_final will be high enough to either be auto‑accepted (if ensemble agreement & thresholds met) or (if n==1 and not extreme) routed to priority_audit rather than auto‑rejected.
+- Result: avoid confident FN; if uncertain, route to priority_audit to get human review and label.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+   - Add ordered_topK combo stats to slice_trust_table (daily rollups), compute pooled_prior for common top2 pairs, expose topK features & novelty_score to feature store.
+2. Scoring engine (shadow + safe):
+   - Implement symmetric n==1 gating for untrusted concentrated_topK (route to audit), direction‑aware logit_shift (δ_logit_conc_K2 = 0.6), reduce concentrated_nontrusted_floor_K2 to 0.08, and add provenance logging fields.
+   - Shadow run updated scorer over last N batches including 0084_01, 0086_01, 0092_01, 0097_01, 0098_02 to evaluate FP/FN tradeoffs.
+3. ML:
+   - Prepare retrain plan (GLM_fallback v14 + covariate calibrator) with topK features and grouped CV (2–14 days).
+   - Assemble active learning sampling for concentrated_top2 contradictions (aim for N_subslice ≥ min_n_by_K quickly).
+4. Ops/SRE:
+   - Add canary metrics: concentrated_top2 FP/FN by top pair (FoodCourt+VRDeck, FoodCourt+ShoppingMall), n==1 auto_accept/reject rates.
+   - Block full rollout until acceptance criteria met.
+5. Product/ops:
+   - Update audit triage to prioritize concentrated_top2 contradictions.
+6. Monitoring:
+   - Dashboards: per‑pattern ECE/Brier, pooled_prior drift per top2 combo, unique new top2 combos per day.
+
+Expected tradeoffs & mitigations
+- Short‑term: audit queue expected to increase; mitigated by active learning prioritized labeling to convert untrusted subslices into Trusted faster.
+- Tradeoffs: reducing K=2 penalty magnitude may permit some FPs; directional penalty reduces systematic FNs while preserving FP control through calibrator and gating.
+- Mitigations: strong AL for concentrated_top2 contradictions and hierarchical pooling will restore trust quickly and keep audit sizes bounded.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudo‑code implementing direction‑aware concentrated logic and symmetric gating.
+- topK_subslice aggregation & retention/decay script.
+- slice_trust_table extension docs and schema.
+- GLM_fallback v14 + covariate calibrator retrain plan and stratified validation report (including 0097_01 & 0098_02).
+- CI unit test suite including new FN & FP cases.
+- Dashboards & canary config for topK FP/FN and concentrated recall.
+
+One‑line summary
+v3.5.6: make concentrated top‑K handling directional and channel‑pair aware, add symmetric single‑record gating (prevent both auto‑accept and auto‑reject for untrusted concentrated patterns), train a covariate calibrator with topK/pairwise features, and prioritize AL for contradictions — this prevents confident FNs like 0098_02 while keeping FP reductions from earlier fixes.
+
+Which deliverable first?
+I can (pick one):
+- produce the deterministic scorer skeleton + minimal CI test suite (includes 0097_01 + 0098_02), or
+- produce the topK_subslice aggregation script + schema for slice_trust_table.
+
+Recommendation: produce the deterministic scorer skeleton + CI tests first (so you can deploy symmetric gating quickly as a shadow/safe change), then the topK aggregation script. Which should I prepare first?
+
+============================================================

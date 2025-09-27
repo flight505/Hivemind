@@ -1,0 +1,319 @@
+PREDICTIVE METRICS - ITERATION 82
+============================================================
+
+Updated Predictive Metrics Report — v3.7.1 (post_0107_01 + post_0108_02 corrections)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A single-record batch (n == 1) produced an overconfident auto-decision (Pred=True) for Passenger 0108_02 while Actual=False. This record is a moderately concentrated, moderately-high-spend outlier (RoomService=562, ShoppingMall=326, total_spend ≈ 888; top1_share ≈ 0.633). It did not meet our previously-added concentrated_high_spend thresholds (top1_share ≥ 0.75 and sum_spend ≥ 1000) so it fell through gating, but still produced an overconfident p_final. Root contributors:
+  1. Single-record batches amplify pooled_prior influence; gating covered only very-high-concentration extremes, not moderate-concentration-high-spend cases.
+  2. Sum_spend produced a directional logit shift with insufficient compression → excessive push on p_final.
+  3. SE/variance calculation did not sufficiently incorporate spend-extremity and low spend-entropy → underestimated uncertainty.
+  4. Ensemble agreement / novelty gating thresholds were not enforced for this mid-concentration slice.
+  5. Operational provenance and batch_snapshot_id still missing in places → slows triage.
+- Why it matters now: Patterns like 0108_02 (mid-concentration + high total spend, single-record untrusted) will continue causing FP spikes unless we treat a broader class of fragile patterns (not only ultra-extreme) as first-class and increase uncertainty modeling and gating for n == 1 or low-n batches.
+- Immediate 0–72h priorities (stopgap, must implement):
+  1. Add mid_concentrated_high_spend pattern: route any n==1 record with top1_share ≥ T_mc_mid (0.60) AND sum_spend ≥ S_mid (500) AND Trusted_subslice==False to priority_audit unless very strict model consensus and low se.
+  2. Increase SE floor for mid_concentrated_nontrusted to 0.12 and concentrated_high_nontrusted to 0.15.
+  3. Compress sum_damp mapping (log-scaling) so moderate or large sums cannot produce large unbounded logit shifts.
+  4. Add spend_zscore, sum_spend_bucket, top1_share, spend_entropy to scorer outputs and per-record provenance; snapshot scorer config per batch.
+  5. Enforce ensemble agreement gating for single-record fragile patterns (different thresholds by pattern).
+  6. Start retraining GLM_fallback + calibrator including mid_concentrated interactions and require quantile uncertainty outputs.
+
+Direct answers to the six requested questions (brief)
+1) Signals that led to this error
+   - n == 1 (single-record batch).
+   - total_spend ≈ 888 (moderately high).
+   - concentrated_top1-ish: top1_share ≈ 0.633 (below prior T_mc=0.75 so prior gating missed it).
+   - pooled_prior and channel/subslice priors had outsized influence in pooled_prior due to single-record.
+   - Directional logit_shift applied with inadequate sum damping, producing a push toward True.
+   - se_combined underestimated because spend_extremity and low spend_entropy were not included → p_final overly confident.
+   - Ensemble agreement / novelty gating not enforced for this mid-concentration slice.
+2) Decision-rule changes to prevent recurrence
+   - Expand gating to include mid_concentrated_high_spend as first-class fragile pattern and enforce symmetric n==1 gating for it.
+   - Compress sum_damp via log-scaling; cap per-pattern δ_pattern for any sum-driven shift.
+   - Require ensemble_agreement thresholds and se_combined thresholds for auto-decisions on any n==1 fragile patterns: mid_concentrated_agreement ≥ 0.995 & se ≤ 0.06 (strict), concentrated_high_agreement ≥ 0.998 & se ≤ 0.06.
+   - Raise SE floor for mid_concentrated_nontrusted to 0.12 (conservative).
+   - Make pooled_prior spend_bucket-aware to avoid global priors overwhelming high-spend buckets.
+3) New pattern insights
+   - Not only ultra-extreme top1_share matters: moderate concentration combined with moderately-high total spend forms a fragile class (mid_concentrated_high_spend) that behaves non-stationarily.
+   - top1_share alone misses cases where two channels share most spend; spend_entropy + sum_spend reveal fragility.
+   - Single-record high/medium spend patterns are often novelty/label-drift candidates and deserve conservative treatment.
+4) Confidence recalibration summary
+   - Add var_spend_extremity term into variance model (proportional to spend_zscore^2 and inverse spend_entropy).
+   - Use combined variance = var_prior + var_ens + var_novelty + β_slice*var_slice + β_channel*var_channel + var_spend_extremity.
+   - Enforce pattern-specific SE floors: concentrated_high_nontrusted = 0.15, mid_concentrated_nontrusted = 0.12.
+   - Calibrator must output mean + sd + p10/p90 (quantiles).
+5) Consistency adjustments
+   - Standardize imputation (spend NaN→0) and add per-channel missing_indicator flags.
+   - Snapshot scorer config per batch and require batch_snapshot_id logged per record (CI failure if missing).
+   - Add sum_spend_bucket, spend_zscore, top1_channel_id, top1_share, spend_entropy to slice keys; use those for slice-trust seeding.
+6) Metric improvements for edge cases
+   - New canaries: mid_concentrated_high_spend contradictions; n==1 routing ratio.
+   - Per-channel high_spend ECE/Brier/FN/FP & spend_bucket-level ECE.
+   - Active-label priority for mid_concentrated contradictions to seed slice_trust_table.
+
+0108_02 — detailed failure chain (what went wrong, why)
+- Record snapshot: Passenger 0108_02 — RoomService 562, FoodCourt 0, ShoppingMall 326, Spa 0, VRDeck 0 → total_spend ≈ 888; top1_share ≈ 0.633; num_nonzero_channels = 2–3 (depending on how zeros are treated).
+- Failure chain:
+  1. Pattern did not trigger existing concentrated_high_spend flag (T_mc 0.75, S_high 1000), so no symmetric n==1 gating applied.
+  2. pooled_prior (global + channel + subslice) gained heavy weight because n == 1, shifting base logit.
+  3. Directional logit_shift applied with sum_damp that lacked compression; moderate sum_spend produced an uncompressed positive shift.
+  4. Variance model omitted explicit spend_extremity and spend_entropy effects; se_combined remained low → auto-decision allowed.
+  5. Ensemble agreement and novelty gating were not enforced for this mid-concentration class → single-model bias amplified final p.
+  6. Provenance/batch_snapshot_id may have been absent or incomplete (operational friction) — slowed triage.
+
+Minimum signals to capture per-record (must persist)
+- n_batch (n)
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile_by_channel, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, missing_count
+- Trusted_subslice, N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components (global, channel, subslice, spend_bucket)
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- novelty_score, applied_logit_shift components, p_after_logit_shift, p_final_mean, p_final_uncertainty(sd/p10/p90), se_combined
+- gating_decision + gating_reasons, batch_snapshot_id, scoring_version, record_id, feature_snapshot_hash
+
+Revised pattern definitions (v3.7.1 additions; make first-class)
+- true_zero_spend_flag: sum_spend == 0 AND missing_count == 0
+- imputed_zero_spend_flag: sum_spend == 0 AND missing_count > 0
+- micro_concentrated_flag: 0 < sum_spend ≤ S_low AND top1_share ≥ T_mc AND num_nonzero_channels ≤ 2
+  - S_low = 50 (sweepable)
+  - T_mc = 0.75 (sweepable)
+- concentrated_topK_flag: top1_share ≥ T_mc AND num_nonzero_channels ≤ K_thresh (K_thresh default 2)
+- concentrated_high_spend_flag (existing): concentrated_topK_flag AND (spend_zscore ≥ Z_high OR sum_spend ≥ S_high)
+  - Z_high = 3.0, S_high = 1000 (sweepable)
+- mid_concentrated_high_spend_flag (new): top1_share ≥ T_mc_mid AND sum_spend ≥ S_mid
+  - T_mc_mid = 0.60 (sweepable 0.50–0.70)
+  - S_mid = 500 (sweepable 250–1000)
+  - Z_mid = 2.0 (sweepable 1.5–2.5)
+- spend_outlier_flag (generic): spend_zscore ≥ 3 OR spend_percentile ≥ 99
+Rationale: treat mid_concentrated_high_spend as a fragile pattern separate from micro_concentrated and concentrated_high; 0108_02 is a canonical mid_concentrated example.
+
+POOLING / pooled_prior (updated & spend-aware)
+- pooled_prior = (τ_pattern * μ_global + τ_channel * μ_channel + N_subslice * μ_subslice + τ_spend_bucket * μ_spend_bucket) / (τ_pattern + τ_channel + N_subslice + τ_spend_bucket)
+- Add μ_spend_bucket and τ_spend_bucket so high-spend buckets have own prior.
+- τ_pattern defaults (v3.7.1): {K1:100, K2:160, K3:220, zero:260, micro:320, concentrated_high:280, mid_concentrated:200}
+- τ_channel default: 120
+- τ_spend_bucket default: 80
+- min_n_by_pattern default increased for mid_concentrated to reduce over-reliance on tiny subslices.
+Rationale: pooled_prior must be spend-aware so high-spend buckets don't get dominated by global marginal.
+
+DIRECTION-AWARE logit_shift (updated & compressed)
+- Use compressed sum_damp to limit sum-driven influence:
+  - raw = log(1 + sum_spend)
+  - denom = log(1 + S_damp)  (S_damp default 200)
+  - sum_damp = clamp(raw / denom, ε, 1.0) where ε = 0.05
+- Polarity & damping:
+  - polarity = 2 * pooled_prior − 1
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95)), w_dis = 0.80
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- δ_pattern updates (v3.7.1):
+  - {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40, mid_concentrated:0.50, concentrated_high:0.45}
+- Additional gating (single-record rules):
+  - If n == 1 AND pattern_type ∈ {true_zero_spend, imputed_zero_spend, micro_concentrated, mid_concentrated, concentrated_high} AND Trusted_subslice == False:
+    - Only allow auto_accept/auto_reject when:
+      - ensemble_agreement ≥ pattern_agreement_threshold AND
+      - se_combined ≤ accept_se_max AND
+      - |logit_shift| ≤ δ_pattern * pattern_shift_frac
+    - Otherwise → priority_audit
+  - pattern_agreement_thresholds (v3.7.1):
+    - zero: 0.995, micro: 0.999, mid_concentrated: 0.995, concentrated_high: 0.998
+  - pattern_shift_frac: 0.75 (prevents full δ application for fragile patterns)
+Rationale: compress sum influence and do stricter gating for any single-record fragile pattern.
+
+VARIANCE / SE MODEL (explicit, include spend extremity & entropy)
+- New components:
+  - var_spend_extremity = κ_spend * (spend_zscore / Z_scale)^2 * (1 + (1 − spend_entropy))
+    - κ_spend default 0.04, Z_scale = 3.0
+  - var_prior = pooled_prior*(1 − pooled_prior)/(τ_effective + 1), τ_effective = τ_pattern + τ_channel + N_subslice
+  - var_ens = variance(ensemble p_i)
+  - var_slice = μ_subslice*(1 − μ_subslice)/(N_subslice + 1)
+  - var_channel = μ_channel*(1 − μ_channel)/(N_channel + 1)
+  - var_pattern = κ_pattern * (1 + (1 − sum_spend_norm)) * (1 + (1 − spend_entropy)), κ_pattern default 0.03
+  - var_novelty_cond = κ_novelty * novelty_score^2 * (1 + (not Trusted_subslice ? 1.0 : 0.0)), κ_novelty default 0.02
+- Combine:
+  - var_combined = var_prior + var_ens + var_novelty_cond + β_slice*var_slice + β_pattern*var_pattern + β_channel*var_channel + var_spend_extremity
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- SE floors (v3.7.1 initial):
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor = {micro:0.15, mid_concentrated:0.12, concentrated_high:0.15}
+  - zero_nontrusted_floor = 0.15
+  - extreme_novelty_floor = 0.14
+Rationale: explicitly add spend-driven variance and entropy penalty so 0108_02 gets higher se_combined.
+
+DECISION GATING (updated pseudocode)
+- Definitions:
+  - ensemble_agreement = max_fraction_of_models_predicting_top_class
+  - model_disagreement = 1 − ensemble_agreement
+- thresholds:
+  - agreement_threshold_general = 0.98
+  - accept_se_max = 0.06
+  - pattern_agreement_thresholds as above
+- Pseudocode:
+  1. If Trusted_subslice and p_final_mean ≥ accept_threshold_trusted and se_combined ≤ accept_se_max → auto_accept.
+  2. Else if n == 1 AND pattern_type ∈ fragile_patterns AND NOT Trusted_subslice:
+       - If (p_final_mean ≥ extreme_accept_threshold[pattern] AND ensemble_agreement ≥ pattern_agreement_threshold AND se_combined ≤ accept_se_max AND |logit_shift| ≤ δ_pattern*pattern_shift_frac) → auto_accept
+       - Else if (p_final_mean ≤ (1 − extreme_accept_threshold[pattern]) AND ensemble_agreement ≥ pattern_agreement_threshold AND se_combined ≤ accept_se_max AND |logit_shift| ≤ δ_pattern*pattern_shift_frac) → auto_reject
+       - Else → priority_audit
+  3. Else (general case): apply z-adjusted threshold on p_final_mean using se_combined; route to audit if uncertainty or model_disagreement high.
+- extreme_accept_thresholds (v3.7.1):
+  - zero: 0.995, micro: 0.999, mid_concentrated: 0.995, concentrated_high: 0.999, K1..K3: 0.995
+Rationale: symmetric gating for both false accepts and false rejects on fragile single-record cases.
+
+CALIBRATOR & GLM_FALLBACK (retrain plan)
+- GLM_fallback interactions to include:
+  - mid_concentrated × top1_channel × sum_spend_bucket × Age_bucket × HomePlanet
+  - concentrated_high × same interactions
+  - micro & zero interactions as before
+- Calibrator:
+  - Model: LightGBM quantile ensemble (p10, p50, p90) OR small Bayesian NN returning mean+sd.
+  - Grouped CV by ordered_topK_id × sum_spend_bucket and time-based splits to avoid leakage.
+  - Input features (minimal): p_after_logit_shift, pattern_type, top1_channel_id, top1_share, spend_zscore, sum_spend_bucket, num_nonzero_channels, spend_entropy, novelty_score, pooled_prior, N_subslice, N_channel, model_disagreement, CryoSleep, Age_bucket, HomePlanet, Cabin_deck, Destination, missing_count
+  - Output: p_final_mean, p_final_uncertainty (sd, p10, p90)
+- Retrain targets:
+  - Upweight mid_concentrated contradictions and zero_spend FNs.
+  - Evaluate slice validators focusing on mid_concentrated, concentrated_high, zero_spend, and micro_concentrated.
+Rationale: calibrator must learn interactions that cause miscalibration for 0108_02-like records.
+
+MONITORING, METRICS & ALERTS (what to add)
+- New slice monitoring canaries:
+  - mid_concentrated_high_spend: ECE, Brier score, FN rate, FP rate (by spend_zscore buckets)
+  - concentrated_high_spend, zero_spend, micro_concentrated: existing metrics
+  - n==1: fraction auto_accepted, auto_rejected, routed_to_audit; FN/FP rates
+  - ensemble_agreement histogram & model_disagreement
+  - spend_zscore histogram, spend_entropy distribution
+- Alerts:
+  - mid_concentrated FN rate > 20% above baseline for 24h → immediate block on auto_reject/auto_accept for mid_concentrated until triaged
+  - concentrated_high_spend FN rate > 20% above baseline → block auto_reject/auto_accept and alert triage
+  - zero_spend/micro_concentrated FN rate > 20% → block auto_reject
+  - n==1 audit routing fraction falling below expected → alert (gating misapplied)
+  - mismatch between batch_snapshot_id and per-record provenance → alert
+Rationale: detect regressions quickly on fragile slices.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- New CI tests (minimum):
+  - M1: 0103_02 (true_zero_spend, n==1, untrusted) → priority_audit
+  - M2: 0103_01 (micro_concentrated, n==1, untrusted) → priority_audit
+  - M3: 0102_01 (concentrated_top1, n==1, untrusted) → priority_audit
+  - M4: 0107_01 (concentrated_high_spend, n==1, untrusted) → priority_audit
+  - M5 (new): 0108_02 (mid_concentrated_high_spend, n==1, untrusted) → priority_audit
+  - Preserve existing regression tests (0099_01, 0099_02, 0101_01, etc.)
+- Validation experiments:
+  - Retrain calibrator & GLM_fallback with grouped CV; test on historical mid_concentrated contradictions.
+  - Shadow deploy updated scorer (mid_concentrated gating + compressed sum_damp + raised floors) for two weeks; measure audit queue and per-slice FN/FP.
+- Acceptance targets (relative to v3.5.8 baseline):
+  - mid_concentrated contradictions: ≥30% relative reduction in contradictions on historical data.
+  - concentrated_high_spend FP/FN contradictions: ≥30–40% relative reduction.
+  - zero_spend FN rate: ≥30–40% reduction.
+  - overall FN increase ≤3 percentage points (aim ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+Rationale: measurable reductions on fragile slices while limiting audit overload.
+
+OPERATIONAL ACTIONS (0–72 hours) — prioritized
+1. Engineering (immediate, 0–24h):
+   - Implement mid_concentrated_high_spend detector (compute spend_zscore, spend_percentile, spend_entropy, top1_share).
+   - Add spend_zscore, sum_spend_bucket, top1_channel_id, top1_share, spend_entropy, missing_count to feature outputs and daily rollups.
+   - Fix NaN handling: impute spend NaN→0; add per-channel missing_indicator flags.
+   - Enforce batch_snapshot_id & scoring_version required per-record (CI fail if missing).
+2. Scoring engine (stopgap shadow, 24–48h):
+   - Enforce symmetric n==1 gating for fragile patterns including mid_concentrated (route to priority_audit).
+   - Replace linear sum_damp with log-compressed sum_damp; cap δ_pattern for fragile patterns.
+   - Raise mid_concentrated_nontrusted_floor to 0.12 and concentrated_high_nontrusted_floor to 0.15.
+   - Persist per-record provenance into audit logs.
+   - Shadow this scorer and validate CI tests (including 0108_02).
+3. ML (24–72h):
+   - Retrain GLM_fallback + covariate calibrator including mid_concentrated interactions; calibrator must return mean+sd and quantiles.
+   - Prepare active learning sampling for mid_concentrated contradictions and zero_spend contradictions.
+4. Ops & Monitoring (24–72h):
+   - Deploy new dashboards & canaries for mid_concentrated and per-channel high_spend slices; add alerts.
+   - Block full live rollout until shadow meets acceptance criteria for at least 72h.
+5. Product / Audit (24–72h):
+   - Create fast-label workflows for mid_concentrated contradictions to accelerate slice trust growth.
+   - Triaging workflow to escalate suspected label/record mismatches, including batch_snapshot issues.
+
+PER-RECORD PROVENANCE TO LOG (persist for audit)
+- batch_snapshot_id, scoring_version, passenger_id, record_id
+- pattern_type (true_zero/imputed_zero/micro/mid_concentrated/concentrated_high/etc.)
+- sum_spend, sum_spend_bucket, spend_zscore, spend_percentile, spend_entropy
+- top1_channel_id, top1_share, num_nonzero_channels, missing_count
+- N_subslice, μ_subslice, N_channel, μ_channel
+- pooled_prior components (global, channel, subslice, spend_bucket) + final pooled_prior
+- ensemble_predictions, ensemble_mean, ensemble_variance, ensemble_agreement, model_disagreement
+- applied_logit_shift: {polarity, δ_pattern, sum_damp(raw/logscaled), dis_damp, novelty_scale, logit_shift_value}
+- p_after_logit_shift, p_final_mean, p_final_uncertainty (sd/p10/p90), se_combined
+- gating_decision and gating_reasons (audit/auto_accept/auto_reject + checks)
+- label and label_source (if available)
+- feature_snapshot_hash, run_timestamp
+
+HYPERPARAMETERS (v3.7.1 initial; sweepable)
+- S_low = 50 (10–100)
+- T_mc = 0.75 (0.60–0.90)
+- T_mc_mid = 0.60 (0.50–0.70)
+- S_mid = 500 (250–1000)
+- S_high = 1000 (500–5000)
+- Z_mid = 2.0 (1.5–2.5)
+- Z_high = 3.0 (2.5–4.0)
+- S_damp = 200 (100–500) used in log scaling
+- τ_pattern: {K1:100, K2:160, K3:220, zero:260, micro:320, mid_concentrated:200, concentrated_high:280}
+- τ_channel = 120 (40–300)
+- τ_spend_bucket = 80 (40–200)
+- δ_logit_pattern = {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40, mid_concentrated:0.50, concentrated_high:0.45}
+- mid_concentrated_nontrusted_floor = 0.12 (0.08–0.20)
+- concentrated_high_nontrusted_floor = 0.15 (0.10–0.25)
+- agreement_thresholds as above
+- w_dis = 0.80
+- κ_spend = 0.04, Z_scale = 3.0
+- γ_sum_low = 0.8 in z_adj
+Note: tune via shadow deploy + grouped CV.
+
+CI TESTS (explicit expected outcomes, include 0108_02)
+- 0103_02 (true_zero_spend, untrusted, n==1) → priority_audit
+- 0103_01 (micro_concentrated, untrusted, n==1) → priority_audit
+- 0102_01 (concentrated_top1, untrusted, n==1) → priority_audit
+- 0107_01 (concentrated_high_spend, untrusted, n==1) → priority_audit
+- 0108_02 (mid_concentrated_high_spend, untrusted, n==1) → priority_audit (new)
+- Trusted subslice variations → allow calibrated auto-decisions
+- Preserve earlier regression tests
+
+MONITORING & ALERTING (exact triggers, additions)
+- mid_concentrated FN rate > 20% above baseline for 24h → block auto_reject/auto_accept for mid_concentrated and alert triage
+- concentrated_high_spend FN rate > 20% above baseline → block auto_reject
+- zero_spend/micro_concentrated FN rate > 20% above baseline → block auto_reject
+- n==1 audit routing fraction < expected threshold → alert
+- mismatch between batch_snapshot_id and per-record provenance → alert
+
+ACCEPTANCE CRITERIA (post-deploy shadow -> live)
+- mid_concentrated contradictions: ≥30% relative reduction
+- concentrated_high_spend contradictions: ≥30–40% reduction
+- zero_spend FN rate: ≥30–40% reduction
+- concentrated_top1 FP rate: ≥25% reduction
+- overall FN increase ≤3% absolute (aim ≤1%)
+- Audit queue ≤1.5× baseline for first 2 weeks, trending back to baseline
+
+DELIVERABLES (priority order)
+1. Deterministic scorer skeleton (v3.7.1) implementing:
+   - mid_concentrated & concentrated_topK detection + spend_zscore computation
+   - symmetric n==1 gating for fragile patterns + extreme-consensus short-circuit
+   - compressed sum_damp (log scaling) + reduced δ for fragile patterns
+   - raised SE floors for mid_concentrated/untrusted and per-record provenance logging
+   - snapshotable config for batch processing
+2. Minimal CI test suite extending v3.7.0 with 0108_02 expectation.
+3. Updated slice_trust_table seeding script with per-channel + spend_bucket aggregation.
+4. GLM_fallback v17.x + covariate calibrator retrain plan & validation report (grouped CV).
+5. Dashboards & canary configuration for mid_concentrated and concentrated_high_spend slices.
+6. Active learning labeling plan for mid_concentrated contradictions.
+
+One-line summary
+v3.7.1: Broaden fragile-pattern coverage to include mid_concentrated_high_spend, enforce symmetric n==1 gating and stricter consensus+uncertainty checks, compress spend-driven logit shifts, add spend-extremity variance and spend-bucket-aware pooled priors, fix imputation/provenance, retrain calibrator to return uncertainty, and shadow-deploy to prevent repeats like 0108_02 while preserving throughput.
+
+Recommended immediate artifact to prepare first
+- Produce the deterministic scorer skeleton + minimal CI tests now (includes 0108_02 expectation). Rationale: shadowable, quick to implement, immediate protection (symmetric n==1 gating + mid_concentrated detection + provenance logging + raised floors). In parallel, start the slice_trust_table aggregation & calibrator retrain.
+
+If you want, I will:
+- prepare the deterministic scorer skeleton + CI test updates (includes 0108_02 expectation), or
+- prepare the slice_trust_table seeding + aggregation script for channel + spend buckets.
+
+Which should I prepare first?
+
+============================================================

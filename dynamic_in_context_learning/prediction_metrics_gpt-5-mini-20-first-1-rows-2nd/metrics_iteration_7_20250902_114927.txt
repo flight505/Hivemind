@@ -1,0 +1,251 @@
+PREDICTIVE METRICS - ITERATION 7
+============================================================
+
+Executive summary — what happened and immediate priorities
+- What happened: The new batch produced another false positive (0020_06, Terta Mcfaddennon; predicted True, actual False). This is the same failure class we already diagnosed with Mael (0020_05): many small, weakly positive signals combined to push a marginal p_final above threshold. The dataset also contains a previous false negative (Breney 0020_04), so we are still seeing both FP and FN failure modes.
+- Immediate priorities (deploy in this order, low-risk → higher change):
+  1. Keep Laplace smoothing + reliability shrinkage (k = 5) and reliability-scaling of weights (k2 = 5).
+  2. Cap per-feature log-odds deltas (max_delta = ±0.8).
+  3. Add uncertainty-aware gating (CI on logit_final) and enforce stricter p_lower thresholds for auto-accept; otherwise Abstain (preferred) or fall back to policy.
+  4. Add small-n hard-neutralization: if n_i ≤ 3 treat delta_i as strongly downweighted (delta *= 0.5).
+  5. Add correlated-feature redundancy correction (avoid additive counting of co-occurring weak signals).
+  6. Log per-prediction diagnostics (p_final, p_lower, se_logit_final, support_* and top contributors) for every row.
+- Rationale: Terta confirms the same root causes: correlated, small-n, weak positives were treated as independent evidence and there was insufficient uncertainty gating.
+
+A. Snapshot reminder (for reproducibility)
+- Current labeled snapshot in analysis: N = 23, T = 14 → p0 = (14 + 1)/(23 + 2) = 15/25 = 0.6000.
+- If you add Mael (0020_05) labeled False, snapshot becomes: N = 24, T = 14 → p0 = (14 + 1)/(24 + 2) = 15/26 ≈ 0.5769.
+- Operational rule: always compute predictions against and store the exact snapshot (N, per-value n_i, t_i, timestamp). All logic below assumes that stored snapshot.
+
+B. Root cause analysis — what specifically went wrong for 0020_06 (Terta) and how this relates to Mael
+- Key datapoints for Terta: HomePlanet=Earth, CryoSleep=False, Cabin=E/0/S (Deck E, Side S), Destination=TRAPPIST-1e, Age=7 (child), VIP=False, most spend fields 0/missing.
+- Failure pattern (same family as Mael):
+  1. Multiple features each had slightly positive p_i_shrunk relative to p0 (HomePlanet=Earth, Deck E, Side S, Destination, missing/0 spending interpreted as neutral/positive). None were individually reliable (small n_i or small effect sizes).
+  2. Aggregator treated features as independent additive evidence → summed small deltas into a marginally positive logit_final.
+  3. Uncertainty propagation was either absent or too-permissive: the final CI (if any) still allowed committing to a positive label.
+  4. Age-conditioned behaviour: CryoSleep / age interactions are important (infants/children differ), but CryoSleep multiplier had only been applied previously to infants — children (Age 2–12) still need special handling.
+- Net result: correlated weak positives + insufficient uncertainty gating → false positive.
+
+C. What this error reveals about passenger transport patterns (insights)
+- Correlated buckets: Deck, Side, and HomePlanet often co-occur and produce correlated effects that can be double-counted by independent add-up aggregation.
+- Missing/zero spending can behave as a predictive signal (missingness itself matters). Treat missingness explicitly.
+- Age subgroups matter: infants and children show different CryoSleep and Deck interactions than adults.
+- Small-n buckets frequently produce fragile deltas that can flip marginal predictions when aggregated. The system must be conservative for low-support buckets.
+
+D. Complete updated deterministic scoring pipeline (production-ready, reproducible)
+Follow the single-pass approach but add redundancy correction, better uncertainty propagation (Beta posteriors), small-n neutralization, and stricter decision gating. All steps are deterministic given the snapshot.
+
+0) Notation & stored snapshot
+- Snapshot stores: N, per-category: n_i (count), t_i (positive count). Also store global base_weights for features, correlation matrix Corr_ij (computed from snapshot), and per-feature spending_missing flags counts.
+
+1) Baseline prior
+- p0 = (T + 1) / (N + 2)   (T = total transported in snapshot; Beta(1,1) prior)
+
+2) Per-value Laplace smoothing
+- If n_i > 0: p_i_smoothed = (t_i + 1) / (n_i + 2)
+- If n_i = 0: p_i_smoothed = p0 and mark as new_category_low_support
+
+3) Reliability shrinkage (k = 5)
+- p_i_shrunk = (n_i / (n_i + k)) * p_i_smoothed + (k / (n_i + k)) * p0
+
+4) Log-odds deltas (cap and small-n neutralization)
+- logit0 = ln(p0 / (1 − p0))
+- raw_delta_i = ln(p_i_shrunk / (1 − p_i_shrunk)) − logit0
+- If n_i ≤ n_small (n_small = 3): raw_delta_i := raw_delta_i * small_n_factor (small_n_factor = 0.5)
+- delta_i := clip(raw_delta_i, −max_delta, +max_delta)  (max_delta = 0.8)
+
+5) Base feature weights (starting point)
+- base_w: e.g., CryoSleep 0.30, Deck 0.22, Spending 0.12, Age 0.08, HomePlanet 0.10, Destination 0.08, Side 0.06, VIP 0.04
+- (Re-fit after +50 labels; treat these as starting values.)
+
+6) Age-conditioned multipliers (at least for CryoSleep; add more as needed)
+- CryoSleep multiplier:
+  - Age ≤ 1: 0.5
+  - 1 < Age ≤ 12: 0.65  (raise slightly vs previous 0.6 because children still carry some signal)
+  - Age > 12: 1.0
+- Optionally apply Age multipliers to other features if diagnostics show subgroup differences.
+
+7) Reliability scaling of weights (k2 = 5)
+- r_i = n_i / (n_i + k2)
+- raw_w_i = base_w_i * age_multiplier_i * r_i
+
+8) Redundancy correction (prevent double-counting correlated features)
+- Motivation: correlated features (Deck, Side, HomePlanet, Destination) often co-occur; treat group evidence jointly.
+- Two practical options (pick one for immediate rollout; implement both long-term):
+  A) Simple group normalization (recommended immediate):
+     - Precompute feature clusters by snapshot: cluster features where abs(Corr_ij) ≥ corr_group_threshold (e.g., 0.25). For each cluster G with m features, rescale raw_w_i ← raw_w_i / sqrt(m). Then proceed to normalize.
+  B) Partial de-correlation (medium-term):
+     - Compute feature delta vectors on snapshot and perform a weighted Gram-Schmidt or fit a small L2 logistic regression on shrunken p_i to get orthogonalized weights; use result to compute effective w_i.
+- After redundancy correction: normalized weights w_i = raw_w_i / Σ_j raw_w_j.
+
+9) Combine into logit
+- logit_final = logit0 + Σ_i w_i * delta_i
+- p_final = sigmoid(logit_final)
+
+10) Uncertainty propagation (Beta posterior variance → se on logit)
+- For each feature i:
+  - Posterior Beta parameters: a_i = t_i + 1, b_i = n_i − t_i + 1  (Beta(1,1) prior)
+  - var_p_i = (a_i * b_i) / ( (a_i + b_i)^2 * (a_i + b_i + 1) )
+  - se_delta_i ≈ sqrt(var_p_i) / (p_i_shrunk * (1 − p_i_shrunk))   (approx linearization)
+  - If n_i = 0 (new category): set se_delta_i = large (conservative), e.g., se_delta_i = 2.0
+- se_logit_final = sqrt( Σ_i (w_i^2 * se_delta_i^2) )
+- Use z (default 1.28 for 90% one-sided) to compute:
+  - lower_logit = logit_final − z * se_logit_final
+  - p_lower = sigmoid(lower_logit)
+  - upper_logit = logit_final + z * se_logit_final
+  - p_upper = sigmoid(upper_logit)
+
+11) Evidence & support diagnostics (signed and counts)
+- support_i_signed = (p_i_shrunk − p0) * r_i    (shrink-weighted signed prob uplift)
+- support_pos = Σ_i base_w_i * max(0, support_i_signed)
+- support_neg = Σ_i base_w_i * max(0, −support_i_signed)
+- support_abs_total = support_pos + support_neg
+- reliable_pos_count = count_i( r_i ≥ 0.6 AND (p_i_shrunk − p0) ≥ 0.05 )
+- reliable_neg_count = count_i( r_i ≥ 0.6 AND (p0 − p_i_shrunk) ≥ 0.05 )
+
+12) Decision / Abstain / Fallback (revised, stricter)
+- If support_abs_total < T_low (T_low = 0.035) AND max(reliable_pos_count, reliable_neg_count) < 2:
+    - If system allows Abstain → Abstain (manual review).
+    - Else → Auto-fallback per cost policy (see fallback policy below).
+- Else (sufficient evidence):
+    - Positive branch (predict True) if all conditions met:
+       - support_pos > support_neg AND
+       - (support_pos ≥ support_pos_min OR reliable_pos_count ≥ 2) AND
+       - p_lower ≥ p_lower_pos_threshold
+       - Age adjustments:
+         - Age ≤ 1: require reliable_pos_count ≥ 2 OR p_lower ≥ 0.65
+         - 1 < Age ≤ 12: require reliable_pos_count ≥ 2 OR p_lower ≥ 0.60
+         - Age > 12: p_lower ≥ 0.55 acceptable
+       - Recommended numeric constants:
+         - support_pos_min = 0.06
+         - p_lower_pos_threshold (general) = 0.55
+    - Negative branch (predict False) if:
+       - support_neg > support_pos AND
+       - (support_neg ≥ support_neg_min OR reliable_neg_count ≥ 2) AND
+       - p_upper ≤ p_upper_neg_threshold
+       - Recommended:
+         - support_neg_min = 0.05
+         - p_upper_neg_threshold = 0.45
+    - Otherwise → Abstain or fallback.
+
+13) Persist for diagnostics (every prediction)
+- Persist: p_final, p_lower, p_upper, se_logit_final, support_pos, support_neg, support_abs_total, reliable_pos_count, reliable_neg_count, top-3 contributors (feature, delta_i, w_i, n_i, t_i), snapshot_id (N, timestamp) and the Corr_ij cluster assignments used. This is critical for reproducible triage.
+
+14) Auto-fallback policy (if abstain unavailable)
+- If fallback needed and false negatives are costlier → default to baseline rule (predict by p0).
+- If false positives are costlier → default to False (Not Transported).
+- Log every fallback and sample for manual audit.
+
+E. Why the new pipeline fixes Terta and Mael (conceptual)
+- Small-n neutralization and shrinkage reduce the influence of tiny buckets.
+- Redundancy correction prevents co-occurring, weakly positive features from adding up linearly to create false positives.
+- Uncertainty propagation (Beta posterior → se_logit_final) calculates a conservative p_lower; the stricter p_lower threshold (0.55 or higher for children) prevents marginal p_final with high variance from becoming automatic positives.
+- Age-conditioned thresholds further protect child/infant cases where signals behave differently.
+
+F. Concrete parameter recommendations (deployable defaults)
+- Laplace alpha = 1
+- Shrinkage k = 5
+- Reliability weight k2 = 5
+- max_delta = ±0.8
+- small_n_threshold = 3, small_n_factor = 0.5
+- corr_group_threshold = 0.25 (for immediate grouping)
+- T_low = 0.035
+- support_pos_min = 0.06
+- support_neg_min = 0.05
+- p_lower_pos_threshold (general) = 0.55
+- p_upper_neg_threshold = 0.45
+- Age multipliers for CryoSleep: Age ≤1 → 0.5, 1<Age≤12 → 0.65, else 1.0
+- z for one-sided CI = 1.28 (90%); consider 1.64 (95%) in stricter contexts or when abstain capacity is high.
+
+G. Confidence mapping (revised)
+- High confidence (auto-accept):
+  - p_lower ≥ 0.60 AND support_abs_total ≥ 0.08 AND reliable_count_in_direction ≥ 2
+- Medium confidence:
+  - p_lower ≥ 0.55 AND support_abs_total ≥ 0.05
+- Low confidence:
+  - p_lower < 0.55 OR support_abs_total < 0.05 → Abstain preferred; if auto-label necessary, use configured fallback.
+
+H. Batch consistency & reproducibility (strengthened rules)
+- Always attach snapshot_id to every batch and each per-row log.
+- Deterministic scoring: same snapshot, same weights, same random seed (none used).
+- Batch-level checks:
+  - Before committing a batch, compute batch_abstain_rate and batch_mean_se_logit.
+  - If batch_abstain_rate > allowed (default 5%) OR mean_se_logit unusually high (more than historical mean + 2σ), pause auto-commits and run audit subsample.
+- Record and version base_weights; re-fit only after enough new labels (recommended +50 labels).
+
+I. Monitoring & alerts (what to compute & thresholds)
+- Per-day:
+  - Brier score, accuracy, calibration (deciles), distribution of p_final and p_lower, abstain fraction (target < 5%).
+- Per-bucket:
+  - FPR/FNR charts for key buckets (Deck E/F, CryoSleep True, Spending=0, Age groups) with control limits.
+  - Per-bucket drift: change in p_i_shrunk and n_i over time.
+- Triggers:
+  - Re-fit base_weights if +50 labels or if any bucket's FPR or FNR exceeds historical control limits.
+  - Alert if abstain fraction exceeds threshold (e.g., 5–7%) or batch mean se_logit increases suddenly.
+
+J. Edge-case handling (explicit rules)
+- New categories (n_i = 0): p_i_shrunk = p0, se_delta_i large, force Abstain unless strong other evidence.
+- Very small buckets (n ≤ 3): apply small-n_factor to delta and mark low-reliability; do not allow single small-n bucket to flip decision.
+- Missing spend fields: create is_spend_missing flag and treat missingness as a feature; do not treat NaN as zero.
+- Infants (Age ≤ 1): require two independent reliable positive signals OR p_lower ≥ 0.65 to auto-predict True.
+- Children (1 < Age ≤ 12): require two reliable positive signals OR p_lower ≥ 0.60.
+
+K. Expected short-term tradeoffs
+- Reduced false positives (and likely fewer single-bucket-driven false negatives).
+- Slight increase in Abstain fraction and manual review load initially (target < 5%).
+- Slight short-term hit to raw automated coverage / recall, but improved precision and reproducibility. Over time (after +50–100 labels) re-fit weights to reduce abstains.
+
+L. Rollout checklist (prioritized)
+Immediate (24–48h)
+  1. Deploy Laplace smoothing, shrinkage k=5, reliability-scaling k2=5, delta cap ±0.8, small-n neutralization (n≤3 factor 0.5).
+  2. Implement uncertainty propagation using Beta posterior variance and compute p_lower/p_upper and se_logit_final.
+  3. Implement decision gating with p_lower thresholds and age-conditioned adjustments.
+  4. Add per-prediction logging (p_final, p_lower, se_logit_final, support metrics, top-3 contributors, snapshot_id).
+Near-term (1–2 weeks)
+  1. Implement simple correlated-feature grouping (corr threshold 0.25) to prevent additive double-counting.
+  2. Add missingness flags and pairwise interaction features (Deck×HomePlanet, CryoSleep×AgeGroup) for buckets with sufficient n.
+  3. Run LOO evaluation and quantify how changes affect Brier, accuracy, abstain fraction and which prior FPs/FNs are corrected.
+Medium-term (after +50 labels)
+  1. Re-fit base_weights via L2-regularized logistic regression using shrunken p_i features and reliability r_i as meta-features.
+  2. Replace clustering redundancy correction with parametric partial-decorrelation (GLM with regularization) or hierarchical Bayesian pooling for categorical buckets.
+Long-term (100+ labels)
+  1. Consider a regularized parametric model (logistic / tree) with the same preprocessing and uncertainty estimation (bootstrap or Bayesian).
+  2. Consider hierarchical Bayesian models for per-bucket pooling (more robust small-n handling).
+
+M. How to handle Terta (0020_06) + Mael (0020_05) specifically with revised pipeline
+- Under the revised pipeline:
+  - CryoSleep age-muting reduces CryoSleep contribution (Mael Age=1).
+  - Small-n neutralization and redundancy correction reduce Deck E / Side S / HomePlanet additive effect.
+  - se_logit_final for both rows will be larger; p_lower will likely fall below the stricter thresholds and the system will Abstain (recommended).
+  - If Abstain not available: fallback to baseline per cost policy and log case for audit.
+
+N. New metrics & dashboards to add immediately
+- Per-prediction fields: p_final, p_lower, p_upper, se_logit_final, support_pos, support_neg, support_abs_total, reliable_pos/neg_count, top contributors, snapshot_id.
+- Dashboards:
+  - Daily: Abstain fraction, auto-fallback fraction, sampled manual-audit precision.
+  - Bucket heatmaps: per-bucket FPR/FNR with n and trend slope.
+  - Evidence distribution: histogram of support_abs_total and se_logit_final.
+  - Batch health panel: mean se_logit_final, number of new categories encountered, fraction of predictions with any n_i = 0 or n_i ≤ 3.
+
+O. Recommended validation experiments (what I can run for you)
+- Leave-One-Out (LOO) evaluation on current labeled set (N = 23 or N = 24 if you add Mael) to measure:
+  - Brier score, accuracy, confusion matrix, abstain fraction, how many prior FPs/FNs are corrected.
+- A/B test of thresholds: evaluate p_lower thresholds at 0.50, 0.55, 0.60 to pick operating point for desired trade-off between FP/FN and abstain fraction.
+- Bootstrapped se_logit_final check vs analytic Beta-based se to validate coverage rates.
+- Correlation cluster sensitivity: evaluate corr_group_threshold ∈ {0.20, 0.25, 0.30} and grouping rules.
+
+P. Final actionable recommendations (short list)
+1. Immediately implement smoothing + shrinkage + reliability scaling + delta cap + small-n neutralization + Beta-based se propagation + p_lower gating. Log everything.
+2. Add missingness flags, create per-batch Corr_ij and perform simple feature grouping (block additive errors).
+3. Raise p_lower threshold for auto-positive to 0.55 (and higher for children/infants) and increase support_pos_min to 0.06.
+4. Target abstain fraction ≤ 5% initially; monitor and adjust thresholds once you have +50 new labels.
+5. Run LOO and threshold sweep now and again after +50 labels; re-fit base_weights then.
+
+Would you like:
+- A) A compact, drop-in Python function that implements this revised pipeline (smoothing, shrinkage, reliability-weighted aggregation, redundancy correction, Beta-se variance propagation, decision logic and logging), or
+- B) A LOO evaluation on your current labeled dataset that reports Brier, accuracy, corrected errors and abstain stats, or
+- C) Both (I can produce the function and run the LOO using your supplied labels)?
+
+I recommend running the LOO evaluation first (option B) with the revised decision logic (without re-fitting base weights) to quantify the immediate impact on Mael/Terta and other prior errors. I can prepare the code and execution plan immediately if you confirm.
+
+============================================================

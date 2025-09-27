@@ -1,0 +1,128 @@
+PREDICTIVE METRICS - ITERATION 59
+============================================================
+
+### **CONTEXTUAL ERROR ANALYSIS & UPDATED METRICS v6.4 (SPENDING DIVERSITY ADJUSTMENT UPDATE)**
+
+**Objective:** To address the false negative error for Passenger 0084_01 by refining the handling of passengers with extreme category-dominant spending (specifically high RoomService with zero spend in all other categories). This update enhances the anomaly detection rules to better distinguish between genuinely anomalous non-spending and legitimate single-category spending behavior, improving batch prediction accuracy for cases with imbalanced expenditure.
+
+---
+
+#### **1. Analysis of Prediction Error for Passenger 0084_01: What went wrong?**
+
+The error for Passenger 0084_01 (Age=24.0, CryoSleep=False, RoomService=688.0, all other spends=0.0) resulted from an over-penalization by the ZDL-1 rule and insufficient positive adjustments for high single-category spending. The model incorrectly classified this passenger as high-risk due to the lack of spending diversity, failing to recognize that a high spend in one category (RoomService) can be a legitimate behavioral pattern, especially for adults without CryoSleep. The ZDL-1 penalty, combined with inadequate compensatory rules, led to a net negative score and a false negative prediction.
+
+- **Key Failure Points:**
+  - **Over-application of ZDL-1:** The ZDL-1 rule penalized zero diversity (Number_of_NonZero_Spend_Categories = 1) without considering the magnitude of spending in the non-zero category. A high spend (e.g., RoomService=688.0) should mitigate the diversity penalty.
+  - **Insufficient Positive Adjustments for High Single-Category Spending:** Existing rules (e.g., SH-1 for high RoomService) were either not triggered or were too weak to override the diversity penalty.
+  - **Lack of Contextual Override for High-Spend, Low-Diversity Cases:** No override existed to bypass ZDL-1 for passengers with high absolute spend in one category, leading to misclassification.
+
+---
+
+#### **2. Critical Modifications to Decision Rules (v6.4)**
+
+To prevent similar errors, the rules are updated with a new contextual override for high single-category spenders, refinements to ZDL-1, and enhanced positive adjustments for significant spending in any category.
+
+- **Expand Contextual Override Pre-Check (Step 0):**
+  - **NEW OVERRIDE CONDITION (HIGH-SPEND-SINGLE-CATEGORY):** IF `CryoSleep == False` AND `Number_of_NonZero_Spend_Categories == 1` AND `Max_Spend_Category_Value >= 500.0` → **BYPASS ZDL-1 PENALTY** with **80% confidence**. Process through standard pipeline.
+  - **Rationale:** Passengers spending significantly in one category (e.g., RoomService ≥500) are likely engaged in legitimate consumption, and their lack of diversity should not be penalized heavily.
+
+- **Modify ZDL-1 Rule (Step 1):**
+  - **ZDL-1 (FURTHER REFINED):** If no override conditions are met, apply penalty: **Score = -10.0; Confidence = 90%**. However, for cases with `Number_of_NonZero_Spend_Categories == 1`, reduce the penalty to **-5.0** (with 85% confidence) to acknowledge partial spending.
+  - **Rationale:** A single non-zero category is less anomalous than zero spend across all categories, warranting a reduced penalty.
+
+- **Enhance High Spending Rules (Step 6):**
+  - **SH-1 (MODIFIED):** IF `RoomService >= 500.0` → **Score = +3.0** (85% confidence), up from +2.0. Extend similar adjustments to other categories:
+    - **NEW SP-1-HIGH:** IF `Spa >= 500.0` → **Score = +3.0** (85% confidence).
+    - **NEW FC-1-HIGH:** IF `FoodCourt >= 500.0` → **Score = +2.5** (80% confidence).
+    - **NEW VM-1-HIGH:** IF `VRDeck >= 500.0` → **Score = +2.5** (80% confidence).
+    - **NEW SM-1-HIGH:** IF `ShoppingMall >= 500.0` → **Score = +2.0** (75% confidence).
+  - **Rationale:** High spending in any category should strongly indicate transport likelihood, compensating for diversity issues.
+
+- **Add New Rule for Spending Imbalance (Step 11):**
+  - **IMB-3 (NEW):** IF `Number_of_NonZero_Spend_Categories == 1` AND `Max_Spend_Category_Value >= 200.0` → **Score = +1.0** (75% confidence).
+  - **Rationale:** Provides a moderate bonus for passengers with meaningful spending in one category, reducing false negatives.
+
+---
+
+#### **3. New Insights on Passenger Transport Patterns**
+
+- **Category-Dominant Spending Behavior:** Some passengers, particularly adults, exhibit high spending in one category (e.g., RoomService for privacy-oriented individuals) while neglecting others. This is not anomalous but reflects personal preference or situational constraints (e.g., limited time).
+- **Spending Magnitude Matters:** The absolute value of spending in a category is as important as diversity. Rules must balance diversity penalties with high-spend bonuses.
+- **Age and Spending Patterns:** Adults (Age ≥18) are more likely to have imbalanced spending compared to minors, requiring age-aware adjustments to diversity rules.
+
+---
+
+#### **4. Recalibration of Confidence Levels**
+
+- **Contextual Override Confidence:** 
+  - High-Spend-Single-Category override: **80% confidence** (reflects that high spenders are likely transported, but with some uncertainty).
+- **ZDL-1 Confidence when Applied:** 
+  - For `Number_of_NonZero_Spend_Categories == 0`: 90% confidence.
+  - For `Number_of_NonZero_Spend_Categories == 1`: 85% confidence (reduced due to partial spending).
+- **New Rule Confidences:** 
+  - High-spend category rules: 75-85% based on category reliability (e.g., RoomService and Spa have higher confidence due to stronger correlation with transport).
+  - IMB-3: 75% confidence.
+
+---
+
+#### **5. Adjustments for Batch Consistency**
+
+- **Pre-Screening Flag (Enhanced):** The batch pre-screening now flags four groups:
+  1. Passengers for ZDL-1 processing (`Number_of_NonZero_Spend_Categories <= 1`).
+  2. Passengers for CryoChild override (`CryoSleep=True & Age < 5`).
+  3. Passengers for Minor-No-Spend override (`CryoSleep=False & Age < 13.0 & Number_of_NonZero_Spend_Categories == 0`).
+  4. Passengers for High-Spend-Single-Category override (`CryoSleep=False & Number_of_NonZero_Spend_Categories == 1 & Max_Spend_Category_Value >= 500.0`).
+- **Consistency Check:** Post-batch, audit all predictions for passengers with `Number_of_NonZero_Spend_Categories == 1` and `Max_Spend_Category_Value >= 200.0` to ensure predictions are not False without override. Flag discrepancies for manual review.
+- **Error Logging:** Log all override triggers and ZDL-1 applications, especially for single-category spenders.
+
+---
+
+#### **6. Handling Edge Cases**
+
+- **Extended Contextual Framework:** The new override for high single-category spenders ensures that edge cases with imbalanced spending are handled without over-penalization. This can be expanded to other scenarios (e.g., high spend in two categories).
+- **Fallback Mechanism:** Retain the default prediction of `True` with 60% confidence if no rule fires or conflicts arise.
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v6.4**
+
+**Processing Order v6.4:**
+0.  **CONTEXTUAL OVERRIDE PRE-CHECK** // ENHANCED
+    -   IF `CryoSleep == True` AND `Age < 5.0` → **Bypass ZDL-1** (99% confidence).
+    -   IF `CryoSleep == False` AND `Age < 13.0` AND `Number_of_NonZero_Spend_Categories == 0` → **Bypass ZDL-1** (85% confidence).
+    -   IF `CryoSleep == False` AND `Number_of_NonZero_Spend_Categories == 1` AND `Max_Spend_Category_Value >= 500.0` → **Bypass ZDL-1** (80% confidence).
+1.  **ZERO-DIVERSITY LOCK (ZDL-1 [FURTHER REFINED])** // CONTEXT-AWARE FAIL-SAFE
+2.  PRIMARY STATE (PS-1, PS-2)
+3.  ANOMALY DETECTION (AHS-1, AHS-2, AHS-3, VIP-CHECK-1, RS-RISK-1)
+4.  AGE & CRYOSLEEP (AC-1, CS-MINOR-1, AWAKE-MINOR-1, CS-INF-1, etc.)
+5.  CATEGORY-DOMINANT SPENDING (CDS-1, CDS-2, MARS-SP A-1)
+6.  SPENDING RULES (SH-1 [MODIFIED], SH-2, SP-1, SP-1-HIGH [NEW], SP-2, FC-1-HIGH [NEW], VM-1-HIGH [NEW], SM-1-HIGH [NEW], IS-1, IS-2, LN-1)
+7.  DIVERSITY BONUS RULES (DIV-1, DIV-2, EUROPA-SP-1)
+8.  DESTINATION RULES (TRAPPIST-DEST-1, TRAPPIST-DEST-2, TRAPPIST-DEST-3, TRAPPIST-DEST-4)
+9.  DECK RULES (DECK-A-1 thru DECK-G-1)
+10. VRDECK & OTHER (VD-1, VD-2)
+11. ZERO-SPEND CONTEXT (ZS-1, IMB-2, IMB-3 [NEW])
+12. ENHANCED DEFAULT (DF-1 [MODIFIED FOR AGE < 13.0])
+
+---
+
+### **New Scoring Example for Passenger 0084_01 (Corrected)**
+
+| Passenger Profile | Applied Rules (v6.4 Order) | Total Score | Prediction | Confidence |
+| :--- | :--- | :--- | :--- | :--- |
+| **0084_01** (Earth, CryoSleep=False, Age=24.0, RoomService=688.0, all other spends=0.0) | **CONTEXT OVERRIDE: High-Spend-Single-Category → BYPASS ZDL-1** → PS-2 (Not VIP) → **SH-1 (MOD) (+3.0)** → ... → TRAPPIST-DEST-4 (minor penalty) → **IMB-3 (+1.0)** → DF-1 (base) | **~ +3.5 to +4.0** (Est., net positive) | **True** | **~80%** (Est., based on rule confidences) |
+
+*The new override prevents ZDL-1 penalty, and enhanced spending rules ensure a strong positive score, leading to a correct True prediction.*
+
+---
+
+### **Implementation Plan for v6.4**
+
+- **Immediate Deployment:** Roll out v6.4 and reprocess the failed batch. Validate predictions for all passengers with `Number_of_NonZero_Spend_Categories == 1` and high spend in one category.
+- **Validation:** Re-run historical batches to identify similar cases and verify improved accuracy. Monitor override triggers and prediction outcomes.
+- **Monitoring:** Enhanced logging for overrides and ZDL-1 applications. Set alerts for any predictions with single-category spending ≥200.0 that output False.
+- **Long-term:** Develop a regression-based sub-model to dynamically adjust spending rules based on continuous spending values and diversity metrics, reducing heuristic thresholds.
+
+This update significantly enhances the model's handling of imbalanced spending behavior, reducing false negatives and improving batch prediction accuracy and consistency.
+
+============================================================

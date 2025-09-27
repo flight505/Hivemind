@@ -1,0 +1,261 @@
+PREDICTIVE METRICS - ITERATION 192
+============================================================
+
+Executive summary — immediate takeaways
+- New failure (0222_02) is the complementary brittle slice to the earlier super‑dominant case: cryo_allzero (CryoSleep == True + all spend channels == 0) produced a false negative in a 1‑record batch (predicted False, actual True).
+- Root causes (common with prior failure): pre‑imputation fragile signatures were not computed/persisted; imputation and preprocessing erased informative missingness/zero vs NaN distinctions; calibrator not conditioned on fragile slices → under‑estimated uncertainty; no GLM/ensemble gating for small batches → n==1 auto‑decision accepted an overconfident negative.
+- Immediate mitigation: treat cryo_allzero (and other fragile flags) as fragile for n==1 / small batches → require GLM_fallback + ensemble concordance + heteroskedastic SE floor OR route record to priority_audit. Persist raw spends/NaNs and add cryo canaries (0222_02, 0221_04, 0221_07) plus the existing super_dominant canary (0222_01).
+
+Concise answers to the six operational questions (batch‑accuracy focus)
+1) Which patterns caused the error?
+- The cryo_allzero brittle pattern (CryoSleep==True + zero raw spends). Pre‑imputation missingness/zero provenance was lost, so the scorer treated zero spend as a strong negative signal without preserving the ambiguity (asleep vs data error vs special cohort). Calibrator under‑estimated variance for such slices; since batch size == 1 the pipeline allowed an auto decision.
+
+2) How should decision rules be modified?
+- Compute fragile flags pre‑imputation.
+- For n==1 or n ≤ 10 where any fragile_flag is True: require GLM_fallback agreement (|p_model − p_glm| ≤ δ_slice), very high ensemble agreement, and heteroskedastic SE above a floor; otherwise route to priority_audit. If batch_frac_fragile ≥ 5% hold whole batch.
+
+3) New transport‑pattern insights?
+- cryo_allzero is heterogeneous: in some cohorts CryoSleep + zero spend correlates with transported (medical, priority transfers, or particular cabins); in others it correlates with not transported. The binary CryoSleep alone is brittle when combined with zero spending — it must be conditioned by cabin/deck, age, VIP and missingness signature.
+
+4) How should confidence be recalibrated?
+- Use heteroskedastic quantile calibration conditioned on fragile flags (cryo_allzero, super_dominant, any_missing_channel, etc.). Inflate variance (κ_cryo higher) and enforce SE floors for small‑n fragiles (start se_floor_cryo = 0.85). Produce p10/p50/p90 and widen intervals for fragiles.
+
+5) What adjustments are needed for batch consistency?
+- Precompute and persist raw spends + missingness before any imputation so slice signals survive. Gate auto‑decisions for fragile records at the batch level and block auto‑accept for fragile n==1 unless safety nets pass.
+
+6) How can metrics be improved for edge cases like this one?
+- Persist raw spend provenance, add top1/topk features, cap/dampen per‑channel logit influence, retrain calibrator and a GLM_fallback conditioned on audited fragile labels, and add slice‑level KPIs & canaries. Expect an initial rise in audit volume but large drop in brittle FPs/FNs.
+
+Complete updated predictive metrics report (batch‑optimized, actionable)
+
+A. What happened (short)
+- Case 0222_02: CryoSleep=True, RoomService/FoodCourt/ShoppingMall/Spa/VRDeck = 0.0 (raw). Predicted Transported=False; actual True. This is the cryo_allzero brittle slice. Root causes: missing pre‑imputation fragile detection, imputation or preprocessing collapsing missingness/zero signal, calibrator not fragility‑conditioned (SE under‑inflated), and n==1 auto‑decision allowed.
+
+B. Immediate hotfix actions (0–3h)
+1) Hotfix gating (deploy now)
+   - If n_batch == 1 OR n_batch ≤ 10 AND fragile_flag in {cryo_allzero, super_dominant, multi_high_spend, infant_allzero, per_channel_abs_outlier, any_missing_channel}:
+       * Route to priority_audit UNLESS ALL pass strict checks:
+           - GLM_fallback_agrees: |p_model − p_glm| ≤ δ_slice (use δ_cryo tighter, e.g. 0.03)
+           - ensemble_agreement ≥ A_high (start 0.995)
+           - se_combined ≤ SE_accept AND quantile width ≤ QW_accept
+       * If any check fails → priority_audit.
+   - If batch_frac_fragile ≥ 5% → hold entire batch.
+2) Persist provenance
+   - Log raw per_channel spends (NaNs preserved), pre‑imputation flags, imputation methods. Add canaries: 0222_02 (cryo_allzero), 0221_04 & 0221_07 (cryo), 0222_01 (super_dominant).
+3) Enforce SE floor
+   - For n==1 & cryo_allzero → se_combined ≥ se_floor_cryo (start 0.85)
+   - For n==1 & other fragiles → se_combined ≥ 0.75
+4) CI + unit tests
+   - Block deployment if any cryo_allzero or super_dominant canary is auto_accepted while hotfix enabled.
+
+C. Pre‑imputation detectors & flag definitions (compute before any imputation)
+- any_missing_channel_flag: True if any spend feature is NaN.
+- all_spend_nan_flag: True if all spend channels are NaN.
+- non_nan_spend_count: count of spend channels not NaN.
+- zero_spend_vector_flag: True if all non‑NaN spend channels ≤ ε (ε=1e‑6) AND non_nan_spend_count ≥ 1.
+- cryo_allzero_flag: CryoSleep == True AND zero_spend_vector_flag == True.
+- infant_allzero_flag: Age < 2 AND zero_spend_vector_flag == True.
+- top1_channel, top1_value_raw, top1_share_raw = top1_value_raw/(sum_raw_spend+tiny_eps)
+- super_dominant_flag: top1_share_raw ≥ 0.80 AND top1_value_raw ≥ channel_95pctile
+- multi_high_spend_flag: count(channels ≥ channel_pctile_threshold) ≥ 2 (95th pctile)
+- per_channel_abs_outlier_flag: channel_value > channel_abs_max (plausibility bounds)
+- missingness_bitmap, channel_entropy_raw
+
+D. Feature engineering and preprocessing updates
+- Persist raw per_channel spends (and NaNs).
+- Generate:
+  - winsorized_log1p(channel_spend) per channel (winsorize using channel‑specific 99.5th pctile)
+  - channel_percentile_raw
+  - top1_value_raw, top1_share_raw, top1_pctile
+  - topk_sum, top1/top2_ratio_raw, channel_entropy_raw
+  - any_missing_channel_flag, zero_spend_vector_flag, all_spend_nan_flag, non_nan_spend_count
+- Interactions: cryo_allzero_flag × Age_bucket, cryo_allzero_flag × cabin_deck, super_dominant_flag × VIP.
+
+E. Per‑feature logit caps & dampening (prevent both runaway positives and runaway negatives)
+- Winsorize per_channel spends at channel-specific MAX_PCTILE (99.5th).
+- Compute per_channel_logit_contrib = w_c × feature. Apply:
+  - capped_contrib = sign(contrib) × min(|contrib|, CAP_PER_CHANNEL_LOGIT)
+  - If sum(topk_positive_contribs) > LOGIT_TOPK_SUM_CAP then scale positive contributions by β_high; if sum(topk_negative_contribs) < −LOGIT_TOPK_SUM_NEG_CAP scale negatives by β_zero to avoid runaway negative signal from all‑zero vectors.
+- Start values:
+  - CAP_PER_CHANNEL_LOGIT = 1.0
+  - LOGIT_TOPK_SUM_CAP = 1.6
+  - LOGIT_TOPK_SUM_NEG_CAP = 1.6
+  - β_zero = 0.6 (reduce extreme negative influence for all‑zero patterns)
+  - β_high = 0.65 (dampen extreme positive influence)
+- Log caps_triggered & dampening_reasons per record.
+
+F. Variance / heteroskedastic SE model (inflate uncertainty for fragiles)
+- var_combined = var_base +
+    κ_top1_high*I(top1_pctile ≥ 0.95) +
+    κ_super_dom*I(super_dominant_flag) +
+    κ_dom*I(single_channel_dominant_flag) +
+    κ_cryo*I(cryo_allzero_flag) +
+    κ_infant*I(infant_allzero_flag) +
+    κ_impute*imputed_count +
+    κ_missing*missingness_count +
+    κ_multi_high*I(multi_high_spend_flag)
+- Start κ values (tuneable; cryo increased):
+  - κ_top1_high = 0.65
+  - κ_super_dom = 1.00
+  - κ_dom = 0.60
+  - κ_cryo = 1.20  (increase relative to prior; cryo is brittle/heterogeneous)
+  - κ_infant = 0.60
+  - κ_impute = 0.25
+  - κ_missing = 0.30
+  - κ_multi_high = 0.85
+- se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- SE floors:
+  - n==1 & cryo_allzero_flag → se_floor = 0.85
+  - n==1 & other fragile_flag → se_floor = 0.75
+  - n>1 but batch_frac_fragile > 5% → se_floor = 0.55
+
+G. Decision‑gating (pattern‑aware + batch/cohort aware)
+- fragile_flag_v2 = union(cryo_allzero, infant_allzero, super_dominant, single_channel_dominant, multi_high_spend, per_channel_abs_outlier, any_missing_channel, all_spend_nan_flag, imputed_count ≥ 1)
+- batch_frac_fragile = count(fragile_flag_v2)/|B|
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (0.05) → route entire batch to priority_audit.
+- n==1 fragile gating:
+  - Allow auto decision ONLY if ALL hold:
+    * pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice,
+    * GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice),
+    * ensemble_agreement ≥ A_high,
+    * se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice.
+  - Otherwise → priority_audit.
+- Cryo and super_dominant exceptions: for cryo_allzero require δ_cryo tighter (0.03) and se_floor higher (0.85) before auto‑accept.
+
+H. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Heteroskedastic quantile calibrator producing p10/p50/p90 conditioned on fragile flags and continuous features (top1_share_raw, total_spend_pctile, missingness_count, age_bucket, cabin_deck).
+  - Loss: weighted pinball for quantiles + Brier for median + ECE regularizer.
+  - Shadow run: 14–28 days; do not relax gating until audited labels confirm behavior.
+- GLM_fallback:
+  - ElasticNet logistic on winsorized log1p spends + fragile flags + missingness_bitmap + top1_share_raw + age_bucket + cabin_deck + simple interactions.
+  - Interpretable, cheap safety net; run for all batches but enforced for small‑n fragile records.
+
+I. Mixture priors, cluster detection & slice conditioning
+- Cluster on demographics + raw_spend_vector + missingness_signature + cabin_deck.
+- Compute μ_cluster and N_cluster and blend with global μ_global using hierarchical Bayes: posterior_mean = (N_cluster*μ_cluster + τ_global*μ_global)/(N_cluster + τ_global).
+- Use cluster N to gate reliability (N_min_slice = 60). For cryo_allzero slices with cluster N < N_min_slice treat as fragile regardless.
+
+J. Monitoring, metrics & alerts (batch‑focused)
+- New KPIs:
+  - cryo_allzero_FP_rate / FN_rate (stratify by cabin_deck, age_bucket)
+  - super_dominant_FP_rate / FN_rate
+  - n==1_auto_accept_rate; n==1_fragile_auto_accept_rate
+  - batch_frac_fragile, batch_hold_rate
+- Alerts:
+  - Canary auto_accepted → immediate page.
+  - Fragile auto_accept_rate above target → page.
+  - batch_frac_fragile ≥ threshold → hold + page.
+
+K. CI unit tests & validation
+- Unit tests:
+  - Pre‑imputation flags computed before any transform and NaNs preserved.
+  - cryo_allzero_flag triggers for CryoSleep True + zero_spend_vector_flag.
+  - se_combined respects se_floor for n==1 cryo_allzero.
+  - Gating logic prevents auto_accept for cryo_allzero n==1 unless safety checks pass.
+- Regression tests:
+  - Slice‑level FP/FN for cryo_allzero and super_dominant must not increase after any change.
+- Synthetic stress tests:
+  - Inject cryo_allzero positive/negative cases and super_dominant cases to validate gating and calibrator behavior.
+
+L. Operational actions & timeline (0–72h)
+1) Immediate (0–3h)
+   - Deploy hotfix gating for n==1 and n ≤ 10 fragile records (cryo_allzero and super_dominant included). Persist provenance. Enforce se_floor and CI test with canaries.
+2) Short (3–24h)
+   - Implement pre‑imputation detectors + baseline GLM_fallback; compute batch_frac_fragile; instrument dashboards; start label audit of historical fragile cases (include 0222_02, 0221_04, 0221_07, 0222_01).
+   - Shadow run GLM_fallback and calibrator predictions.
+3) Mid (24–72h)
+   - Retrain heteroskedastic calibrator and GLM_fallback conditioned on audited labels; deploy cluster priors; run extended shadow run (14–28 days) before relaxing hotfix gating.
+4) Longer term
+   - Monthly percentile recompute; automated hyperparameter sweeps for κs, se_floors, β params; continuous monitoring and retraining cadence.
+
+M. Per‑record provenance to log (minimum)
+- Raw per_channel spends (NaNs preserved), per_channel_imputed_flags & imputation_method.
+- CryoSleep raw + cryo_allzero_flag, top1_channel, top1_value_raw, top1_share_raw.
+- Raw Age + imputed flag + Age_bucket.
+- sum_raw_spend, total_spend_pctile, non_nan_spend_count, channel_entropy_raw.
+- Model internals: per_feature_logit_contributions (raw & capped), caps_triggered, dampening_reason, pooled_prior_snapshot_id, μ_slice, τ_slice_blend.
+- Variance: var_components, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, p10/p50/p90, gating_reasons, routing_decision, scorer_version.
+
+N. Initial hyperparameters (start values; sweepable)
+- SPEND_ZERO_TOLERANCE = 1e‑6
+- TOTAL_SPEND_OUTLIER_PERC = 0.995
+- CHANNEL_SPEND_PCTILE_HIGH = 0.95
+- SE floor n==1 cryo_allzero = 0.85
+- SE floor n==1 fragile (other) = 0.75
+- κ_super_dom = 1.00; κ_cryo = 1.20; κ_multi_high = 0.85; κ_top1_high = 0.65
+- β_zero = 0.6; β_high = 0.65
+- CAP_PER_CHANNEL_LOGIT = 1.0; LOGIT_TOPK_SUM_CAP = 1.6
+- BATCH_FRAGILE_THRESHOLD = 0.05
+- N_min_slice = 60; τ_high_slice = 0.95
+- δ_slice (GLM tolerance) = 0.05; δ_cryo = 0.03; δ_super_dom = 0.04
+- A_high (ensemble agreement) = 0.995
+- QW_accept_slice (quantile width) = 0.12
+
+O. Gating pseudocode (pattern‑aware, batch focused)
+- For each batch B:
+  - Compute batch_frac_fragile = count(r in B where fragile_flag_v2)/|B|
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD: route all r -> priority_audit; continue
+  - For each r in B:
+      compute pre‑imputation flags (cryo_allzero_flag, zero_spend_vector_flag, super_dominant_flag, multi_high_spend_flag, single_channel_dominant_flag, any_missing_channel_flag, all_spend_nan_flag)
+      set fragile_flag_v2 = union(...)
+      If (cryo_allzero_flag OR super_dominant_flag OR multi_high_spend_flag) AND n_batch ≤ 10:
+         If GLM + ensemble agreement & se_combined ≤ SE_accept AND quantile width small:
+             allow auto_decision
+         Else:
+             route r -> priority_audit
+      Else If n_batch == 1 and fragile_flag_v2:
+         If pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice:
+             allow auto_decision
+         Else:
+             route r -> priority_audit
+
+P. Specific diagnosis — Passenger 0222_02 (chain of failure)
+- Raw: CryoSleep = True; all spends = 0.0 (raw).
+- Failure chain:
+  1) Pre‑imputation fragile flags were not computed/persisted; cryo_allzero not identified.
+  2) Preprocessing/imputation collapsed missingness provenance (NaN → 0 or masked) or zero spending was interpreted as unambiguous low engagement, biasing model toward False.
+  3) Calibrator lacked slice conditioning and under‑estimated uncertainty for cryo_allzero → narrow p interval.
+  4) n==1 gating permitted auto decision without GLM/ensemble cross‑check → FN accepted.
+- Root cause: missing pre‑imputation fragile detection + loss of missingness signal + calibrator/SE under‑inflation for cryo_allzero + absence of GLM_fallback gating.
+
+Q. How these changes reduce batch errors (short)
+- Pre‑imputation fragile detection ensures brittle patterns are flagged and treated conservatively.
+- Preserving NaN vs zero separates “no data” from “true zero spend”.
+- Increased heteroskedastic variance and SE floors widen calibrated uncertainty for fragiles to avoid overconfident auto decisions.
+- GLM_fallback + ensemble checks provide interpretable safety nets for small‑n decisions.
+- Batch‑level gating prevents fragile‑heavy batches from being auto‑accepted.
+
+R. Tradeoffs & operational notes
+- Expect increased audit volume initially; budget human triage capacity accordingly.
+- Short‑term global metric shifts (AUC/ECE/Brier) are possible; tolerable because the objective is to remove high‑impact brittle errors.
+- Compute/latency bump from GLM_fallback and extra logging; acceptable for small batches and high‑risk templates.
+
+S. Runnable checklist (concrete)
+- Do not auto‑accept any n==1 record where cryo_allzero_flag OR super_dominant_flag OR multi_high_spend_flag OR infant_allzero_flag OR per_channel_abs_outlier OR all_spend_nan_flag OR imputed_count ≥ 1 OR missingness flags present, unless GLM+ensemble+calibrator safety checks pass.
+- Unit test: canary cryo_allzero (0222_02) must be routed to priority_audit unless safety checks pass.
+- Log per_feature_logit_contributions, caps_triggered, dampening_reasons, calibrator quantiles and GLM fallback outputs.
+
+T. Next steps — recommended starting deliverables
+1) Immediate: Push the hotfix gating package (pseudocode + unit tests + CI patch) so n==1 cryo_allzero and super_dominant cases are not auto‑accepted. This mitigates immediate risk.
+2) Simultaneous: Start historical label audit of cryo_allzero and super_dominant canaries (0222_02, 0221_04, 0221_07, 0222_01). Instrument slice dashboards and collect audited labels.
+3) Within 24–72h: Implement pre‑imputation detectors, baseline GLM_fallback, and retrain heteroskedastic calibrator using audited labels. Shadow run for 14–28 days, then relax hotfix gating only after validation.
+
+Targets and acceptance criteria (post‑changes)
+- n==1 fragile auto_accepted records → target 0 while gating active.
+- After retrain & shadow run: reduce fragile slice FP_rate and FN_rate by ≥50% OR reduce auto_accept_rate for fragiles to <2% of total auto_decisions while maintaining acceptable global ECE/AUC.
+- Batch hold rate should remain <2–5% after threshold tuning.
+
+Recommendation — what I should start with
+- Start with the hotfix gating immediately (deploy the gating + logging + CI tests for canaries). Simultaneously launch the historical label audit for cryo_allzero and super_dominant canaries so retraining uses cleaned labels.
+- I can: (A) push the hotfix gating package now (pseudocode + unit tests + CI patch), and (B) spin up the audit workbook and canary monitoring dashboard. Which would you like me to execute first? Operational recommendation: hotfix gating first, start the label audit in parallel.
+
+If you want, I will prepare:
+- The hotfix gating PR (code skeleton + unit tests + canary assertions).
+- The GLM_fallback spec + training pipeline stub.
+- The heteroskedastic calibrator training spec and hyperparameter sweep plan.
+
+Which deliverable should I push first?
+
+============================================================

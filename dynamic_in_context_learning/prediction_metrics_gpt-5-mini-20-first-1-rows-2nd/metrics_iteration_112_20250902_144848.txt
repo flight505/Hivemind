@@ -1,0 +1,315 @@
+PREDICTIVE METRICS - ITERATION 112
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): Two brittle failures surfaced in the same batch:
+  1. 0140_01 (Evaley Mejiaddox) — small-n (n==1) false-negative: all spends = 0, CryoSleep = True, Age 24; model predicted Not-transported (False) with high confidence, actual = Transported (True).
+  2. 0140_02 (Verney Whitakers) — single-record false-positive: large absolute spend (RoomService=440, VRDeck=462, sum_spend=902), predicted Transported (True) with high confidence, actual = Not-transported (False).
+- Why this is urgent: Two complementary brittle failure modes are active:
+  - small-n all_zero records being driven by pooled/global priors and under-estimated uncertainty (FN risk), and
+  - extreme/atypical spend patterns being over-weighted by model logit contributions (FP risk).
+  Both are being auto-decided in single-record batches. These are repeatable, detectable patterns — fixable with gating, variance inflation, pooled-prior context conditioning, and targeted retrain/upweighting.
+- Immediate implication / stopgap: DO NOT auto-accept/auto-decline any n==1 record that matches a fragility signal (all_zero OR top1_share ≥ 0.70 OR sum_spend ≥ 800 OR feature_dom_fraction ≥ 0.60 OR missingness_count ≥ 2 OR top2_balanced_high). Route these to priority_audit unless strict consensus & low uncertainty checks pass. Add 0140_01 and 0140_02 to canaries.
+
+Top priorities (0–72h)
+1. Enforce n==1 conservative gating for fragile_flag records (definition below). Block auto-decisions unless:
+   - slice_context_score ≥ Z_high AND
+   - N_slice ≥ N_min_slice AND
+   - GLM_fallback agrees with model decision AND
+   - ensemble agreement ≥ A_high AND
+   - se_combined ≤ SE_accept.
+   Otherwise route to priority_audit.
+2. Persist per-record provenance for all fragility signals and all variance components (see provenance list below).
+3. Inflate uncertainty for fragile slices via explicit variance terms + dynamic SE floors; gate on p10/p90 spread and se_combined rather than mean alone.
+4. Retrain calibrator & GLM_fallback with explicit interactions for both all_zero and extreme_spend / dual-channel patterns; upweight contradictory examples (all_zero-but-transported, high-spend-but-not-transported, dual-high-but-not-transported) ×3–5, shadow-run ≥14 days.
+5. Add canaries (include 0140_01, 0140_02 and prior problem ids) and block auto-decisions for them until validated.
+
+Direct answers to your six requested points
+1) What specific patterns caused these errors?
+- 0140_01 (FN):
+  - all_zero_flag = True; CryoSleep = True; Age 24; n==1 batch. Model applied a global negative sign to all_zero and calibration pooled prior dominated the decision despite insufficient slice evidence and high novelty; calibrator under-estimated slice uncertainty.
+- 0140_02 (FP):
+  - sum_spend = 902 (> ABS_SPEND_HIGH), two large channels (VRDeck & RoomService) giving top1_share ≈ 0.51 (not concentrated by top1 but high absolute spend); model treated absolute spend as monotonic positive signal (high logit contribution) without sufficient context conditioning. Calibrator again under-estimated uncertainty for extreme spend and feature_dom_fraction may have allowed spend to overwhelm other signals (Cabin, Destination, etc.).
+- Shared systemic issues:
+  - Single-record (n==1) decisions allowed to be dominated by single features or pooled priors.
+  - Calibrator & pooled-prior blending not context-aware enough (no fine-grained μ_sumspend_demo, μ_all_zero_demo).
+  - Variance model lacks explicit components for all_zero, extreme spend, top2-balanced-high patterns and missingness — resulting in overconfident mispredictions.
+
+2) How should decision rules be modified to prevent recurrence?
+- Fragile_flag definition (initial):
+  - all_zero_flag == True OR top1_share ≥ 0.70 OR sum_spend ≥ 800 OR feature_dom_fraction ≥ 0.60 OR missingness_count ≥ 2 OR top2_balanced_high (top1_share and top2_share both ≥ 0.30).
+- Conservative gating pseudocode:
+  - if n == 1 and fragile_flag:
+      allow_auto_decision = (
+         slice_context_score >= Z_high AND
+         N_slice >= N_min_slice AND
+         GLM_fallback_agreement == True AND
+         ensemble_agreement >= A_high AND
+         se_combined <= SE_accept
+      )
+      if not allow_auto_decision: route -> priority_audit
+  - If n in {2,3}: relax thresholds modestly but require GLM/ensemble agreement and increased SE floor.
+- Specific for sum_spend-high: treat sum_spend_bucket as part of slice context; require μ_sumspend_demo to be robust (N_sumspend_slice >= N_min_sumspend) before allowing auto-decision.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- all_zero is context-dependent: being all_zero is not uniformly negative — interactions with CryoSleep, Age, HomePlanet, Destination and Cabin change direction.
+- Absolute high spend is not uniformly a positive transport signal: some high-spend profiles (balanced spend across specific channels like VRDeck+RoomService or older cabin/destination combos) correlate with Not-transported in slices.
+- Dual-high / balanced-top2 patterns require separate treatment (not just top1 concentration).
+- Missingness and novelty (rare cabin codes, new destinations) must increase uncertainty and reduce auto-decisions.
+- Therefore, channel-level and spend-magnitude signals must be modeled as context-conditioned slices, not global monotonic features.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Calibrator outputs: p10/p50/p90 plus sd. Gate on quantile width (p90−p10) and se_combined.
+- Explicit variance model (examples; tune κ):
+  - var_conc_by_channel = κ_conc_chan * (1 − top1_channel_context_score) * (top1_share^2) * log1p(sum_spend)
+  - var_all_zero = κ_zero * (1 − all_zero_context_score) * sqrt(1 + num_imputed_features) * novelty_scale
+  - var_missingness = κ_miss * missingness_count * novelty_scale
+  - var_feature_dom = κ_dom * max(0, feature_dom_fraction − FEATURE_DOMINANCE_BASE)
+  - var_spend_scale = κ_scale * log1p(sum_spend)
+  - var_dual_high = κ_dual * (1 − dual_channel_context_score) * (top1_share * top2_share) * log1p(sum_spend)
+  - var_combined = var_base + var_dispersion + var_spend_scale + var_all_zero + var_missingness + var_feature_dom + var_conc_by_channel + var_dual_high
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Example κ defaults (validation sweep): κ_conc_chan = 0.06; κ_zero = 0.08; κ_miss = 0.05; κ_dom = 0.07; κ_scale = 0.02; κ_dual = 0.05.
+- Dynamic SE floors:
+  - weak-context (novel slice, small N, all_zero/dual-high/high-spend): se_floor = 0.25–0.35
+  - strong-context: se_floor = 0.06–0.10
+- Gate auto-decisions on p90−p10 narrowness and se_combined rather than mean alone.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Standardize transforms across scorer, pooled-prior computation, calibrator and GLM_fallback (winsorize/log1p, bucket boundaries, age buckets, missingness encoding).
+- Extend pooled priors to be context-aware for:
+  - all_zero (μ_all_zero_demo)
+  - sum_spend buckets (μ_sumspend_demo)
+  - concentration_by_channel and dual-high-channel pairs (μ_conc_channel_demo, μ_dual_channel_demo)
+- Use blending τ_slice = N_slice/(N_slice + N0_slice) with higher N0 for fragile slices (e.g., all_zero N0 default 50; sum_spend-high N0 default 50; concentration_by_channel N0 25–200).
+- Cap per-feature logit contributions and impose sign regularization to prevent a single feature (sum_spend) from dominating single-record decisions.
+- Persist daily per-slice N counts for slices used in gating / pooled priors.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- Monitoring & canaries:
+  - Add monitors for all_zero_by_ctx, sum_spend_high_by_ctx, dual_high_by_ctx, concentration_by_channel_by_ctx and missingness_by_ctx. Track ECE, Brier, FP, FN, contradictions, n==1_auto_accept_rate.
+  - Add canaries: 0140_01, 0140_02, plus prior problem IDs. Block auto-decisions for canaries until validations pass.
+- Active learning:
+  - Seed labeling queue with upweighted examples of all_zero×CryoSleep×Age and sum_spend_high × top2 patterns; label contradictory examples and upweight ×3–5 during retrain.
+- Retrain & CI:
+  - Retrain calibrator & GLM_fallback with new interactions. Shadow-run ≥14 days. Require contradictions to drop ≥30–40% and ECE not worsened >0.5–1.0% absolute.
+- Unit tests:
+  - Verify n==1 gating triggers for all_zero, sum_spend_high, dual_high, concentration_by_channel.
+  - Verify se_combined increases in fragile slices.
+  - Verify calibrator outputs widen quantile spreads in weak-context slices.
+  - Verify pooled-prior blending respects N0_slice.
+
+COMPLETE updated predictive metrics report — actionable components
+
+A. New / updated feature definitions (v→v+1)
+- sum_spend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck (raw & log1p)
+- sum_spend_bucket = quantile or fixed bins (e.g., [0, 50, 200, 400, 800, 2000+])
+- all_zero_flag = (sum_spend == 0 AND num_nonzero_channels == 0)
+- missingness_count = count of NULLs in high-value context features (Destination, Cabin, HomePlanet)
+- top1_channel, top1_spend, top1_share
+  - if all_zero_flag → top1_share = NULL, concentration_type = 'all_zero'
+  - else → top1_channel = argmax(channel_spend); top1_share = top1_spend / max(1, sum_spend)
+- top2_channel, top2_spend, top2_share (NULL for all_zero)
+- top2_balanced_high (dual-high) flag = (top1_share >= 0.30 AND top2_share >= 0.30)
+- concentration_by_channel_flag = (top1_share ≥ TOP1_CONC_THRESHOLD) ; TOP1_CONC_THRESHOLD = 0.70
+- top1_share_bucket = [0–0.25, 0.25–0.5, 0.5–0.7, 0.7–0.9, 0.9–1.0]
+- spend_entropy_norm = normalized Shannon entropy across channel spends
+- feature_dom_fraction = fraction of absolute logit contribution from the single top feature; single_feature_influence_flag if ≥ FEATURE_DOMINANCE_THRESH (0.60)
+- top1_channel_context_score = smoothed P(transported | top1_channel, top1_share_bucket, Age_bucket, CryoSleep, HomePlanet, Destination)
+- top2_dual_context_score = smoothed P(transported | top1_channel, top2_channel, top1_share_bucket, top2_share_bucket, Age_bucket,...)
+- all_zero_context_score = smoothed P(transported | all_zero=True, Age_bucket, CryoSleep, HomePlanet, Destination, Cabin)
+- sumspend_context_score = smoothed P(transported | sum_spend_bucket, Age_bucket, CryoSleep, HomePlanet, Destination, Cabin)
+- var provenance fields: var_all_zero, var_conc_by_channel, var_missingness, var_feature_dom, var_spend_scale, var_dual_high
+
+B. Pooled priors extension (channel-aware + all_zero + spend-aware)
+- Compute stratified μ for:
+  - μ_all_zero_demo = P(transported | all_zero=True, Age_bucket, CryoSleep, HomePlanet, Destination, Cabin)
+  - μ_conc_channel_demo = P(transported | top1_channel, top1_share_bucket, Age_bucket, CryoSleep, HomePlanet, Destination)
+  - μ_dual_channel_demo = P(transported | top1_channel, top2_channel, top1_share_bucket, top2_share_bucket, Age_bucket...)
+  - μ_sumspend_demo = P(transported | sum_spend_bucket, Age_bucket, CryoSleep, HomePlanet, Destination, Cabin)
+- Blending:
+  - τ_slice = N_slice / (N_slice + N0_slice)
+  - N0_all_zero default = 50 (sweep 25–200)
+  - N0_sumspend default = 50 (sweep 25–200)
+  - N0_concentration per-channel default 25–200
+  - μ_blended_slice = τ_slice * μ_slice + (1 − τ_slice) * μ_global_slice
+  - p_prior = w_data * p_model + (1 − w_data) * μ_blended_slice with w_data = n / (n + N0_slice)
+- For fragile n==1 slices, w_data will be small and pooled prior will dominate unless N0 too low — therefore increase N0 for fragile slices.
+
+C. Direction-aware logit shifts (pattern & channel treatment)
+- Add additive logit offsets per strongly-supported slice:
+  - channel_shift_frac = clamp(base_channel_shift + w_chan_ctx*(top1_channel_context_score − 0.5)*2, −0.5, 0.5)
+  - all_zero_shift_frac = clamp(base_all_zero_shift + w_zero_ctx*(all_zero_context_score − 0.5)*2, −0.5, 0.5)
+  - spend_shift_frac = clamp(base_spend_shift + w_spend_ctx*(sumspend_context_score − 0.5)*2, −0.5, 0.5)
+- Damp shifts by τ_slice to avoid overcorrecting single-record logits.
+
+D. Variance / SE model (explicit)
+- New variance terms (sweepable κ):
+  - var_conc_by_channel = κ_conc_chan * (1 − top1_channel_context_score) * (top1_share^2) * log1p(sum_spend)
+  - var_all_zero = κ_zero * (1 − all_zero_context_score) * sqrt(1 + num_imputed_features) * novelty_scale
+  - var_missingness = κ_miss * missingness_count * novelty_scale
+  - var_feature_dom = κ_dom * max(0, feature_dom_fraction − FEATURE_DOMINANCE_BASE)
+  - var_spend_scale = κ_scale * log1p(sum_spend)
+  - var_dual_high = κ_dual * (1 − top2_dual_context_score) * (top1_share * top2_share) * log1p(sum_spend)
+- Combine:
+  - var_combined = var_base + var_dispersion + var_spend_scale + var_all_zero + var_missingness + var_feature_dom + var_conc_by_channel + var_dual_high
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Example κ defaults: κ_conc_chan = 0.06, κ_zero = 0.08, κ_miss = 0.05, κ_dom = 0.07, κ_scale = 0.02, κ_dual = 0.05
+- Dynamic SE floors: weak-context se_floor = 0.25–0.35; strong-context se_floor = 0.06–0.10
+
+E. Decision-gating (pattern & channel-aware; concrete)
+- Initial constants (sweepable):
+  - TOP1_CONC_THRESHOLD = 0.70
+  - TOP2_BALANCE_THRESHOLD = 0.30
+  - FEATURE_DOMINANCE_THRESH = 0.60
+  - ABS_SPEND_HIGH = 800 (sweep 600–2500)
+  - Z_high = 0.80
+  - N_min_conc_by_channel = 25 (sweep 10–100)
+  - N_min_zero_samples = 25–50 (sweep 10–200)
+  - N_min_sumspend = 25–50
+  - A_high = 0.995
+  - SE_accept = 0.06 (increase to 0.08–0.12 for n≤3)
+  - MISSINGNESS_STOPGAP = 2
+- Concrete gating:
+  - n==1 and fragile_flag → require:
+     slice_context_score ≥ Z_high AND
+     N_slice ≥ N_min_slice AND
+     GLM_fallback_agrees AND
+     ensemble_agreement ≥ A_high AND
+     se_combined ≤ SE_accept
+     else → priority_audit
+  - For n in [2,3] → relax thresholds but keep consensus requirement and higher SE floors.
+
+F. Calibrator & GLM_fallback retrain plan
+- Calibrator:
+  - Inputs: model_logit, ensemble_agreement, all_zero_flag, concentration_by_channel_flag, top1_channel, top1_share, top2_channel, top2_share, sum_spend_bucket, spend_entropy_norm, num_nonzero_channels, feature_dom_fraction, missingness_profile, top1_channel_context_score, top2_dual_context_score, all_zero_context_score, sumspend_context_score, CryoSleep, Age_bucket, HomePlanet, Destination, Cabin.
+  - Outputs: p10/p50/p90 + sd.
+  - Loss: composite pinball loss (quantiles) + ECE penalty + Brier; upweight contradictions ×3–5.
+  - Data window: last 18–36 months; reserve last 14–28 days for shadow-run.
+- GLM_fallback:
+  - Features: interactions top1_channel × top1_share_bucket × sum_spend_bucket × Age_bucket × HomePlanet × CryoSleep; all_zero × CryoSleep × HomePlanet × Age_bucket × Cabin; top1_channel × top2_channel × top1_share_bucket × top2_share_bucket; missingness_count × channels.
+  - Regularization: elastic-net with per-feature logit cap (no single feature >3–4 logits).
+  - Upweight contradictory/rare examples ×3–5.
+- Shadow-run ≥14 days; acceptance criteria:
+  - contradictions in concentration_by_channel, all_zero_by_ctx, sum_spend_high_by_ctx slices reduced ≥30–40%
+  - overall ECE not worsened by >0.5–1.0% absolute
+
+G. Monitoring, metrics & alerts
+- Dashboards:
+  - per-slice: ECE, Brier, FP, FN, contradiction_count, n==1_auto_accept_rate for all_zero_by_ctx, sum_spend_high_by_ctx, dual_high_by_ctx, concentration_by_channel_by_ctx.
+  - per-channel top1_sign_consistency: fraction transported when top1_channel=X & top1_share>threshold.
+  - Global: n==1_auto_accept_contradiction_rate.
+- Alerts:
+  - slice FP or FN >20% above baseline over 24h → hold auto-accept + page ML/Ops.
+  - n==1_auto_accept_rate spike → hold gating changes + alert.
+- Canaries:
+  - 0140_01 (all_zero but transported), 0140_02 (high-spend but not transported), 0139_01, 0138_02, 0138_01, 0136_01, 0134_01, 0126_01, 0127_01, 0133_01/02 — route to priority_audit unless context strong & GLM agrees & se_combined low.
+
+H. CI tests & validation
+- Unit tests:
+  - n==1 gating triggers for all_zero_flag, sum_spend_high, dual_high_flag, concentration_by_channel_flag.
+  - top1_share NULL for all_zero_flag across pipeline.
+  - se_combined increases when var_all_zero/var_conc_by_channel/var_missingness/var_spend_scale apply.
+  - calibrator quantile spread widens for weak-context slices.
+  - pooled prior blending respects N0_slice.
+- Shadow-run acceptance:
+  - contradictions reduced ≥30–40% in target slices.
+  - no canary auto-accepted.
+  - overall ECE within tolerated degradation (<0.5–1.0% absolute).
+
+I. Operational actions (0–72 hours)
+1. Immediate engineering (0–12h):
+   - Persist top1_channel, top2_channel, top1_channel_context_score, all_zero_flag, all_zero_context_score, sumspend_context_score, concentration_by_channel_flag, top2_balanced_high, feature_dom_fraction, missingness_count and other flags in scoring provenance.
+   - Implement n==1 gating: block auto-decision for any record with fragile_flag True (including 0140_01 & 0140_02) unless consensus per gating pseudocode passes.
+   - Register canaries (add 0140_01, 0140_02 and others) and block auto-accept.
+2. Scoring engine updates (12–48h):
+   - Expose var_conc_by_channel, var_all_zero, var_missingness, var_spend_scale, var_dual_high and se_combined in provenance; enforce identical transforms and temporary per-feature logit caps.
+3. ML pipeline (24–72h):
+   - Retrain calibrator & GLM_fallback with new features & interactions; upweight contradictions; start 14+ day shadow validation.
+   - Publish updated pooled priors & per-slice N daily.
+4. Monitoring & ops (24–72h):
+   - Deploy dashboards & alerts for concentration_by_channel_by_ctx, all_zero_by_ctx, sum_spend_high_by_ctx, dual_high_by_ctx and missingness_by_ctx and canaries.
+   - Seed active-label queue for targeted labeling: all_zero × CryoSleep × Age combos and sum_spend_high × top2_high combos.
+5. Product/audit (24–72h):
+   - Build fast-label UI & route priority_audit records for human review; label and feed to active-learning retrain.
+
+J. Per-record provenance to log (required)
+- Raw spends: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck
+- sum_spend (raw & log1p), sum_spend_bucket
+- all_zero_flag, concentration_type
+- top1_channel (NULL for all_zero), top1_spend, top1_share (NULL for all_zero), top1_share_bucket
+- top2_channel, top2_spend, top2_share, top2_balanced_high
+- top1_channel_context_score, top1_channel_pos_frac, top1_channel_N
+- top2_dual_context_score, top2_dual_pos_frac, N_dual_samples
+- all_zero_context_score, all_zero_pos_frac, N_zero_samples
+- spend_entropy_norm, num_nonzero_channels
+- missingness_profile, missingness_count
+- feature_dom_fraction, feature_dom_channel
+- var_all_zero, var_missingness, var_concentration, var_abs_spend, var_dual_high, var_feature_dom, var_dispersion
+- se_combined
+- μ_all_zero_demo, μ_conc_channel_demo, μ_dual_channel_demo, μ_sumspend_demo, τ_slice_blend, pooled_prior_snapshot_id
+- GLM_fallback_probs, GLM_fallback_agreement_flag
+- ensemble_probs, ensemble_agreement
+- p10/p50/p90, p_final_sd
+- gating_reasons
+- scorer_version, pooled_prior_snapshot_id, calibrator_version
+
+K. Hyperparameters (initial; sweepable)
+- TOP1_CONC_THRESHOLD = 0.70
+- TOP2_BALANCE_THRESHOLD = 0.30
+- FEATURE_DOMINANCE_THRESH = 0.60
+- ABS_SPEND_HIGH = 800 (sweep 600–2500)
+- Z_high = 0.80
+- N_min_conc_by_channel = 25 (sweep 10–100)
+- N_min_zero_samples = 25–50 (sweep 10–200)
+- N_min_sumspend = 25–50
+- A_high = 0.995
+- SE_accept = 0.06 (increase to 0.08–0.12 for n≤3)
+- κ_conc_chan = 0.06, κ_zero = 0.08, κ_miss = 0.05, κ_dom = 0.07, κ_scale = 0.02, κ_dual = 0.05
+- N0 blending: all_zero N0 = 50 (sweep 25–200), sum_spend N0 = 50 (sweep 25–200), concentration_by_channel N0 = 25–200, default N0 = 3–10 for non-fragile slices
+- per-feature logit cap = 3.0–4.0 logits
+
+L. CI canaries & expected behavior (problem IDs)
+- 0140_01 (all_zero but transported): expect gating_reason 'all_zero_stopgap' and priority_audit unless all_zero_context_score ≥ Z_high & GLM agrees & se_combined ≤ SE_accept.
+- 0140_02 (high-spend but not transported): expect gating_reason 'sum_spend_high_stopgap' and priority_audit unless sumspend_context_score ≥ Z_high & GLM agrees & se_combined ≤ SE_accept.
+- Prior problem IDs: expect stopgap behavior per their flags.
+
+M. Quick triage checklist
+- For 0140_01:
+  1. Verify computed fields: all_zero_flag True; sum_spend 0; num_nonzero_channels 0; missingness_count; CryoSleep True.
+  2. Compute all_zero_context_score and N_zero_samples; if N small → priority_audit.
+  3. Inspect μ_all_zero_demo and τ_slice_blend and N0_all_zero; ensure N0≥25–50.
+  4. Check se_combined includes var_all_zero; if not, fix calibrator.
+  5. Inspect GLM_fallback; if GLM predicts True and ensemble disagrees → audit.
+  6. If audit → upweight label in retrain.
+- For 0140_02:
+  1. Verify computed fields: sum_spend=902, top1_share≈0.512, top2_share≈0.488, top2_balanced_high True.
+  2. Compute sumspend_context_score and top2_dual_context_score; check N_sumspend & N_dual_samples.
+  3. Inspect var_spend_scale & var_dual_high and se_combined; if var components missing or small → calibrator underestimation.
+  4. Inspect GLM_fallback & ensemble: if fallback predicted False while primary model predicted True → audit.
+  5. If audit → label and upweight in retrain; consider pairwise channel interaction in model.
+
+N. Why these changes will reduce batch errors
+- Context-aware pooled priors and increased N0 for fragile slices prevent single-record model logits from overriding reliable but sparse slice evidence.
+- Explicit variance terms force higher uncertainty for fragile patterns (all_zero, sum_spend_high, dual-high), avoiding over-confident auto-decisions.
+- Retraining with targeted upweighting of contradictory examples corrects sign mistakes and strengthens fallback.
+- Provenance + canaries + active labeling accelerate detection and correction.
+
+Immediate one-line corrective action
+- Implement n==1 gating: route any record with all_zero_flag == True OR top1_share ≥ 0.70 OR sum_spend ≥ 800 OR feature_dom_fraction ≥ 0.60 OR top2_balanced_high OR missingness_count ≥ 2 to priority_audit unless context_score ≥ 0.80 AND GLM_fallback/ensemble consensus AND se_combined ≤ 0.06 — add 0140_01 and 0140_02 to canaries.
+
+Acceptance criteria for promotion
+- Shadow-run ≥14 days.
+- Contradictions in concentration_by_channel, all_zero_by_ctx, sum_spend_high_by_ctx, dual_high_by_ctx slices reduced ≥30–40%.
+- Global ECE not worsened by >0.5–1.0% absolute.
+- No canary auto-accepted; canary gating consistent with spec.
+- Per-channel sign-consistency drift monitored and within bounds.
+
+Next-step offer
+I can deliver either:
+1) A minimal gating patch to implement n==1 stopgap, canary blocking and provenance logging (pseudocode + CI unit tests) within 2–12 hours; or
+2) A full retrain & deployment plan (dataset selection, upweighting schedule, CV folds, hyperparameter sweeps, acceptance criteria, dashboards) for calibrator & GLM_fallback within 24–48 hours.
+
+Which would you like first?
+
+============================================================

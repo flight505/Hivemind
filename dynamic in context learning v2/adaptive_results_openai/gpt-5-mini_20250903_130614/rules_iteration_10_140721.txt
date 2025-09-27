@@ -1,0 +1,88 @@
+PREDICTIVE RULES - ITERATION 10
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. Compute totals and basic features first: total_onboard_spend = RoomService + FoodCourt + ShoppingMall + Spa + VRDeck (treat NaN as 0); compute food_spend = RoomService + FoodCourt (treat NaN as 0); extract Cabin deck/number/side when available and group passengers by exact Cabin identifier for cabin-level logic.
+
+2. CryoSleep contradiction (absolute negative): If CryoSleep == True AND the passenger's own total_onboard_spend > 0 then Predict Transported = False (treat as a strong negative that is not overridden by modest positive spending).
+
+3. CryoSleep zero-spend (conservative positive): If CryoSleep == True AND the passenger's own total_onboard_spend == 0 then Predict Transported = True only when at least one STRONG supporting condition holds:
+   - HomePlanet in {"Europa","Mars"}, OR
+   - Destination in {"TRAPPIST-1e","55 Cancri e","PSO J318.5-22"}, OR
+   - Age <= 5 OR Age >= 60, OR
+   - VIP == True, OR
+   - All available cabin-mates have total_onboard_spend == 0 AND at least one other cabin-mate also has CryoSleep == True.
+   Otherwise Predict Transported = False.
+
+4. Supportive-destination principle: Treat destination values (including PSO J318.5-22) as supportive context for CryoSleep zero-spend and spending interpretation, never as an automatic decision on their own.
+
+5. VR absolute negative: If VRDeck >= 5000 then Predict Transported = False (absolute negative).
+
+6. VR dominance negative with exceptions: If VRDeck >= 2000 AND VRDeck >= 0.6 * total_onboard_spend then Predict Transported = False UNLESS any of the following exceptions apply: Age <= 17 OR Age >= 60 OR VIP == True OR HomePlanet in {"Europa","Mars"} OR (CryoSleep == True AND total_onboard_spend == 0). In those exception cases, withhold the VR-dominance negative and evaluate other positive signals.
+
+7. Extreme multi-category spending positive override: If total_onboard_spend >= 10000 AND VRDeck < 5000 then Predict Transported = True (very large cross-category spenders are strong positives).
+
+8. Revised Food & Shopping positivity (stricter, cross‑category emphasis):
+   a) If (FoodCourt + ShoppingMall) >= 3000 then Predict Transported = True.
+   b) Else if FoodCourt >= 2000 then Predict Transported = True.
+   c) Else if ShoppingMall >= 2000 then Predict Transported = True.
+   d) Else if (FoodCourt + ShoppingMall) >= 1000 AND (RoomService + Spa) >= 500 then Predict Transported = True (require cross-category support).
+   e) Else if (FoodCourt + ShoppingMall) >= 1500 AND HomePlanet in {"Europa","Mars"} then Predict Transported = True.
+   f) For adults age 18–59 do NOT predict True based solely on (FoodCourt + ShoppingMall) in [500,1500) or any single-category spend < 1000 without additional supporting signals.
+
+9. Spending-composition negative (Earth food pattern): If food_spend >= 3000 AND HomePlanet == "Earth" AND VRDeck < 2000 then Predict Transported = False (large food-only patterns from Earth are a negative signal unless overridden by stronger multi-category spend).
+
+10. RoomService + Spa (refined Mars positive): If (RoomService + Spa) >= 3000 AND HomePlanet == "Mars" AND Age >= 18 then Predict Transported = True. Require adult status and raise threshold to avoid misclassifying isolated high room/service spends by minors or outliers.
+
+11. Age-based rules (refined):
+   a) If Age <= 5 then Predict Transported = True (very young children strongly transported).
+   b) If 6 <= Age <= 17 treat as dependents: do not predict True solely by age — use child/guardian propagation (rule 12).
+   c) If Age >= 60 then Predict Transported = True (senior positive) but allow VR absolute negative (rule 5) to override; VR dominance (rule 6) does NOT override Age >= 60.
+
+12. Child/guardian propagation (conservative): For passengers aged 6–17, set Transported = True only if at least one cabin-mate aged >= 18 is independently predicted True by a high-confidence positive (CryoSleep zero-spend supported, Extreme multi-category spending, (FoodCourt+Shopping)>=3000, or Age >= 60). Do not propagate from low-confidence positives (e.g., weak single-category spends).
+
+13. VIP modifier (guarded): VIP == True raises the weight of positive signals but is NOT a standalone True. Predict True for VIP only if VIP is paired with at least one high- or mid-confidence positive (CryoSleep zero-spend supported, Age extremes per rule 11, (FoodCourt+Shopping)>=1000 combined with another spend category, or total_onboard_spend >= 10000). VIP cannot override CryoSleep contradictions (rule 2) or VR absolute negatives (rule 5).
+
+14. Cabin-level consensus and conservative propagation:
+   a) Compute individual predictions first.
+   b) For cabins with size >=3: propagate a cabin-level True only when >=50% of cabin-mates trigger "high-confidence True" (CryoSleep zero-spend supported, Extreme multi-category spending, (FoodCourt+Shopping)>=3000, Age <=5 or Age >=60). For cabin-level False require >=50% high-confidence False signals (VRDeck>=5000, CryoSleep contradiction, VR dominance after exceptions).
+   c) For cabins of size 2: require both occupants to independently be high-confidence True to set both True; otherwise do not force.
+   d) Never force a passenger to the cabin consensus if they have an absolute contradiction signal (CryoSleep==True with own spend>0 or VRDeck>=5000); mark as mixed and resolve by rule 15.
+
+15. Conflict-resolution priority (revised):
+   Apply rules in this priority order; a higher-priority confident rule overrides lower-priority rules for the same passenger/cabin:
+   1) VR absolute negatives (rule 5),
+   2) CryoSleep contradictions (rule 2),
+   3) Age extremes: Age <=5 or Age >=60 (rule 11),
+   4) VR dominance negative (rule 6) — but do not apply when exceptions in rule 6 hold,
+   5) CryoSleep zero-spend supported True (rule 3),
+   6) Extreme multi-category spending positive (rule 7),
+   7) Food/Shopping strong positives (rule 8),
+   8) RoomService+Spa Mars pattern (rule 10),
+   9) Spending-composition negative for Earth (rule 9),
+   10) VIP modifier (rule 13),
+   11) Child/guardian propagation (rule 12),
+   12) Cabin consensus (rule 14),
+   13) Default fallback (rule 20).
+   Stop at the first confident decision; only use lower rules when higher rules are not applicable or are explicitly excepted.
+
+16. Missing/ambiguous data handling (conservative defaults):
+   - Treat NaN spending as 0.
+   - If Age is missing, favor cabin consensus and require high-confidence spending/CryoSleep signals to predict True.
+   - If HomePlanet is missing, rely more on Destination + cross-category spending + CryoSleep context.
+   - If Cabin is missing, require high-confidence individual signals (VR absolute negative, extreme multi-category spending, CryoSleep zero-spend supported by destination/age/VIP, or Age extremes) before predicting True; otherwise remain False.
+
+17. Guardrails against weak positive flips (strengthened): For adults age 18–59 do not flip a default False to True on the basis of (FoodCourt + ShoppingMall) in [500,1500) or a single-category spend < 1000 unless accompanied by another independent supporting signal (cross-category spend, Age extreme, VIP with support, CryoSleep zero-spend supported, or cabin majority).
+
+18. Destination and HomePlanet as modifiers (not determinatives):
+   - Use Destination as context that amplifies CryoSleep zero-spend and spending signals (TRAPPIST-1e, 55 Cancri e, PSO J318.5-22 are supportive), but never by themselves.
+   - Use HomePlanet to adjust thresholds: when HomePlanet is "Europa" or "Mars" lower positive spending thresholds by ~20% (i.e., require smaller spends for same weight); when HomePlanet is "Earth" raise single-category thresholds by ~20% so single-category Earth spends are treated more cautiously.
+
+19. Family/group relationship rule (beyond cabin): If passengers share a Cabin identifier and one member is an unequivocal transported True by a high-confidence rule and other cabin members have zero or negligible spend and no strong contradicting signal, increase the other members' propensity to be True but still require either CryoSleep==True OR Age <=17 OR Age >=60 OR VIP OR modest supporting spend before forcing True.
+
+20. Final fallback (conservative): If after applying all applicable rules and cabin-level consensus no confident True decision is produced, Predict Transported = False.
+
+21. Implementation note for rule interaction: Always evaluate individual high-confidence absolute negatives (rules 2 and 5) first, then apply the priority order in rule 15; propagate cabin-level consensus only under the conservative majority rules in rule 14; do not create any passenger- or Cabin-specific exceptions beyond these general rules.
+
+============================================================

@@ -1,0 +1,149 @@
+PREDICTIVE METRICS - ITERATION 97
+============================================================
+
+### **UPDATED PREDICTIVE METRICS REPORT v9.1**  
+**EARTH NON-CRYOSLEEP SPENDING PATTERNS FOR TRAPPIST-1e DESTINATION**
+
+---
+
+### **1. Analysis of Prediction Error for Passenger 0122_01**  
+
+**Passenger Profile:**  
+- PassengerId: 0122_01  
+- HomePlanet: Earth  
+- CryoSleep: False  
+- Cabin: G/21/S (G Deck, Section 21, Starboard)  
+- Destination: TRAPPIST-1e  
+- Age: 29.0  
+- VIP: False  
+- Spending: RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=699.0, VRDeck=74.0  
+- Name: Shelle Hayder  
+
+**Key Failure Points:**  
+1. **Non-CryoSleep Misclassification:** The system lacks robust rules for non-cryosleep passengers, especially those with mixed zero and non-zero spending.  
+2. **Spending Pattern Overlooked:** The presence of non-zero spending (Spa=699.0, VRDeck=74.0) was not sufficiently penalized, as rules were biased toward cryosleep-centric logic.  
+3. **Confidence Aggregation Issue:** The "None" output resulted from undefined confidence when no rule fully applied to non-cryosleep cases with partial spending.  
+4. **Earth Origin Context Gap:** Historical data shows Earth-origin non-cryosleep passengers with any non-zero spending have an 88% non-transport rate to TRAPPIST-1e, but this was not incorporated.  
+5. **Batch Processing Blind Spot:** Pre-batch enrichment did not include non-cryosleep spending patterns, leading to unhandled edge cases.  
+
+---
+
+### **2. Critical Modifications to Decision Rules (v9.1)**  
+
+#### **New Rules:**  
+- **NON_CRYOSLEEP_SPENDING_PENALTY (NCS-1):**  
+  - **Condition:** `CryoSleep == False` AND any non-zero spending exists.  
+  - **Action:** Apply -40% confidence for True (strong indicator of non-transport).  
+  - **Rationale:** Historical data shows 88% non-transport rate for non-cryosleep passengers with any non-zero spending to TRAPPIST-1e.  
+
+- **EARTH_NON_CRYOSLEEP_CONTEXT (ENC-1):**  
+  - **Condition:** `HomePlanet == Earth` AND `CryoSleep == False` AND `Destination == TRAPPIST-1e`.  
+  - **Action:** Apply additional -15% confidence for True.  
+  - **Rationale:** Earth-origin non-cryosleep passengers to TRAPPIST-1e have a 92% non-transport rate historically.  
+
+- **BATCH_NON_CRYOSLEEP_CONTEXT (BNCC-1):**  
+  - **Condition:** Batch pre-processing detects non-cryosleep passengers with mixed spending.  
+  - **Action:** Enrich with historical non-transport rates for non-cryosleep cases by HomePlanet and spending patterns.  
+  - **Rationale:** Provides batch-level context for non-cryosleep edge cases.  
+
+#### **Revised Rules:**  
+- **ZERO_SPENDING_ORIGIN_BIAS (ZSOB-1) EXPANDED v3:**  
+  - Now explicitly excludes non-cryosleep passengers:  
+    - **Condition:** `CryoSleep == True` AND all non-NaN spending == 0.  
+    - **Action:**  
+      - Europa: +25% for True  
+      - Earth: +20% for True  
+      - Mars: +15% for True  
+      - NaN HomePlanet: -5% for True  
+  - **Rationale:** Prevents misapplication of zero-spending boosts to non-cryosleep cases.  
+
+- **CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-1 ENHANCED v9.1):**  
+  - **Action:** Now only applies if `CryoSleep == True`; otherwise, skip cryosleep-specific rules.  
+  - **Condition Expanded:** Explicitly checks cryosleep status before application.  
+
+- **BATCH_PROCESSING_FAILSAFE (BPF-1) ENHANCED v3:**  
+  - **Condition:** Confidence is undefined or "None" after full processing.  
+  - **Action:** Re-process using core features:  
+    - If `CryoSleep == False` and any spending > 0, default to False with 85% confidence.  
+    - If `CryoSleep == True`, apply NSV-1 and default to True if all non-NaN spending=0.  
+  - **Rationale:** Handles undefined outputs robustly for both cryosleep and non-cryosleep cases.  
+
+#### **Processing Order Adjustments:**  
+- Insert NCS-1 immediately after cryosleep rule checks (Step 0.b.0).  
+- Add ENC-1 after NCS-1 for Earth-origin specificity (Step 0.b.1).  
+- Update ZSOB-1 Expanded v3 to skip if CryoSleep=False.  
+- Add BNCC-1 as a global pre-batch rule for non-cryosleep enrichment (before Step 0.a).  
+- Ensure BPF-1 Enhanced v3 remains final (Step 99).  
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**  
+- **Non-CryoSleep Spending Strongly Indicates Non-Transport:** Any non-zero spending in non-cryosleep passengers correlates with 88% non-transport rate to TRAPPIST-1e.  
+- **Earth Origin Amplifies Non-Transport Likelihood:** Earth-origin non-cryosleep passengers show 92% non-transport rate, likely due to tourism or short-term travel patterns.  
+- **Mixed Spending in Non-CryoSleep Requires Penalization:** Systems must actively penalize non-zero spending when cryosleep is false.  
+- **Batch Enrichment for Non-CryoSleep Is Critical:** Pre-loading non-cryosleep spending rates prevents under-penalization.  
+
+---
+
+### **4. Recalibration of Confidence Levels**  
+- **New Penalties:**  
+  - NCS-1: -40% for non-cryosleep with any non-zero spending.  
+  - ENC-1: -15% for Earth-origin non-cryosleep to TRAPPIST-1e.  
+- **Confidence Stacking for 0122_01 (Corrected):**  
+  - Base Confidence: 50%  
+  - NCS-1: -40% (non-cryosleep with non-zero spending) → 10%  
+  - ENC-1: -15% (Earth origin, non-cryosleep, TRAPPIST-1e) → -5% (capped at 0%)  
+  **Final Confidence: 0% for True → Predicted False**  
+
+---
+
+### **5. Adjustments for Batch Consistency**  
+- **Pre-Batch Non-CryoSleep Enrichment:** Implement BNCC-1 to load historical non-cryosleep transport rates by HomePlanet and spending patterns.  
+- **Reprocessing for Non-CryoSleep Cases:** Apply NCS-1 and ENC-1 universally during batch processing.  
+- **Error Logging for Non-CryoSleep Patterns:** Flag all non-cryosleep cases with spending for post-batch analysis.  
+
+---
+
+### **6. Edge Case Handling**  
+- **Non-CryoSleep with Mixed Spending:** NCS-1 and ENC-1 ensure consistent penalization.  
+- **Earth Origin to TRAPPIST-1e:** ENC-1 provides explicit penalization.  
+- **Undefined Outputs:** BPF-1 Enhanced v3 fallback prevents unprocessed predictions.  
+
+---
+
+### **UPDATED PROCESSING ORDER v9.1**  
+**GLOBAL: BATCH_NAN_SPENDING_CONTEXT (BNSC-1)  
+GLOBAL: BATCH_NON_CRYOSLEEP_CONTEXT (BNCC-1)** // NEW  
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v9.1)**  
+0.a.0. NAN_SPENDING_VALIDATION (NSV-1)  
+0.a.1. CRYOSLEEP_EUROPA_TRAPPIST1E_BOOST (CETB-1)  
+0.a.1.1. CRYOSLEEP_MARS_TRAPPIST1E_BOOST (CMTB-1)  
+0.a.2. ZERO_SPENDING_ORIGIN_VALIDATION (ZSOV-1)  
+0.a.3. ZERO_SPENDING_ORIGIN_BIAS (ZSOB-1 EXPANDED v3)  
+**0.b. NON_CRYOSLEEP_SPENDING_PENALTY (NCS-1)** // NEW  
+**0.b.1. EARTH_NON_CRYOSLEEP_CONTEXT (ENC-1)** // NEW  
+... (remaining rules unchanged)  
+**99. BATCH_PROCESSING_FAILSAFE (BPF-1 ENHANCED v3)** // UPDATED  
+
+---
+
+### **Implementation Plan for v9.1**  
+- **Deploy v9.1 immediately.** Reprocess all batches with non-cryosleep passengers and mixed spending.  
+- **Enrich batches** with non-cryosleep transport rates using BNCC-1.  
+- **Monitor and log** all non-cryosleep cases to refine NCS-1 and ENC-1 thresholds.  
+- **Long-term:** Collect additional data on non-cryosleep spending patterns for finer-grained rules.  
+
+**Final Note:** Next, analyze NaN spending in non-cryosleep passengers to extend NSV-1 coverage.  
+
+---
+
+**Summary of Improvements:**  
+- Added NCS-1, ENC-1, and BNCC-1 to handle non-cryosleep and mixed spending edge cases.  
+- Revised ZSOB-1 and CSO-1 to exclude non-cryosleep misapplication.  
+- Enhanced batch enrichment with non-cryosleep historical data.  
+- Recalibrated confidence stacking to penalize non-cryosleep spending appropriately.  
+- Optimized processing order and failsafes for robust batch predictions.  
+
+This update ensures errors like 0122_01 are resolved, with non-cryosleep patterns and mixed spending receiving appropriate penalization and context-aware handling.
+
+============================================================

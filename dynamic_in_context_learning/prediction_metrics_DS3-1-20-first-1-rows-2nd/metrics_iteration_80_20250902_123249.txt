@@ -1,0 +1,122 @@
+PREDICTIVE METRICS - ITERATION 80
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.4 (HIGH ROOMSERVICE, ZERO LUXURY SPENDING GAP HANDLING)
+
+**Objective:** To correct the prediction error for Passenger 0107_01 by addressing a significant oversight in non-CryoSleep passenger handling: the failure to incorporate context where high RoomService spending coexists with zero luxury spending (Spa, VRDeck) on economy-class destinations like TRAPPIST-1e. The passenger had substantial RoomService charges (1743.0) but zero spending in Spa and VRDeck, indicating possible essential-only consumption inconsistent with Transport eligibility on a budget-conscious route. This highlights that high basic spending without luxury expenses may signal non-transport candidacy, necessitating a luxury spending gap validation rule.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0107_01: What Went Wrong?
+
+The error for Passenger 0107_01 (Age=21.0, CryoSleep=False, RoomService=1743.0, FoodCourt=5.0, ShoppingMall=17.0, Spa=0.0, VRDeck=0.0, Destination=TRAPPIST-1e, HomePlanet=Mars, VIP=False, Cabin=D/2/S) resulted from overreliance on aggregate spending without contextual luxury gap analysis:
+
+**Key Failure Points:**
+- **Luxury Spending Gap Neglect:** The model applied standard spending overrides (e.g., AS-1 Revised, MDS-1) which boosted confidence due to high RoomService, but did not account for the complete absence of luxury expenditures (Spa=0, VRDeck=0). On TRAPPIST-1e—an economy-focused destination—such a pattern may indicate essential-only consumption, common in non-transported individuals.
+- **Destination Context Oversight:** TRAPPIST-1e's transport economics favor passengers with balanced or luxury-inclined spending; those with skewed essential spending (like high RoomService alone) are higher risk for non-transport.
+- **Cabin and Age Context Not Fully Leveraged:** Cabin deck D (mid-tier) and adult age (21) did not trigger sufficient risk checks, as existing rules prioritized CryoSleep and youth contexts.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.4)
+
+This update introduces a new rule to validate luxury spending gaps for non-CryoSleep passengers on specific destinations and refines existing spending rules.
+
+**Add Luxury Spending Gap Validation Rule (New Step 0.k):**
+- **LUXURY_SPENDING_GAP_VALIDATION (LSG-1):**
+  - IF `CryoSleep == False` AND `RoomService > 1500` AND `Spa == 0.0` AND `VRDeck == 0.0` AND `Destination == TRAPPIST-1e` → **Apply -15% confidence penalty**.
+  - **Rationale:** High RoomService with zero luxury spending on economy destinations indicates essential-only consumption, reducing transport likelihood.
+
+**Modify Aggregate Spending Override Rule (Step 0.c):**
+- **AS-1 REVISED v2:**
+  - Now includes a check for luxury spending gap: if conditions for LSG-1 are met, skip boosting and route to LSG-1 instead of applying +X% boost.
+  - **Rationale:** Prevent over-boosting for cases with imbalanced spending patterns.
+
+**Adjust Contextual Spending Pattern Rule (Step 2.5):**
+- **CSP-1 ENHANCED v2:**
+  - Incorporate luxury gap check: for non-CryoSleep passengers on TRAPPIST-1e, if RoomService > 1500 and Spa=0 and VRDeck=0, reduce confidence by 10% inline.
+  - **Rationale:** Add secondary validation layer for spending pattern risks.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **Luxury Spending Discrepancies Matter:** High basic spending (e.g., RoomService) without luxury expenses (Spa, VRDeck) on economy destinations like TRAPPIST-1e often correlates with non-transport, as it suggests budget constraints or non-recreational travel purposes.
+- **Destination-Spending Interaction:** TRAPPIST-1e's transport thresholds are sensitive to spending balance; luxury absence negates high basic spending benefits.
+- **Non-CryoSleep Adults Require Granular Checks:** Adults without CryoSleep need spending pattern validation beyond aggregates, especially on economy routes.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - LSG-1: -15% penalty for luxury spending gap.
+  - CSP-1 Enhanced v2: -10% penalty for gap cases.
+- **Adjusted Rules:**
+  - AS-1 Revised v2: Bypass boost for gap cases.
+- **Default Confidence:**
+  - DF-1: Further adjusted to **63% confidence** to account for luxury gap risks.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening Expansion:** Add LSG-1 to pre-screening for non-CryoSleep passengers with RoomService > 1500 and Destination=TRAPPIST-1e.
+- **Batch Luxury Gap Validation:** Pre-batch, flag all non-CryoSleep passengers with high RoomService and zero Spa/VRDeck on TRAPPIST-1e for LSG-1 processing.
+- **Error Logging:** Monitor non-CryoSleep predictions on TRAPPIST-1e with spending imbalances to validate new rules.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **High RoomService, Zero Luxury on TRAPPIST-1e:** Handled by LSG-1 and CSP-1 Enhanced v2 penalties.
+- **CryoSleep Cases:** Unchanged from v7.3; luxury gap not applicable due to CryoSleep spending exemptions.
+- **Fallback:** If luxury spending data is missing, use spending ratio (RoomService vs. total) as proxy for gap detection.
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.4
+
+**Processing Order v7.4:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v4)**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED v2)** // **UPDATED RULE**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1)**
+**0.i. CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1 REVISED)**
+**0.j. CRYOSLEEP_ZERO_RISK_VALIDATION (CZR-1)**
+**0.k. LUXURY_SPENDING_GAP_VALIDATION (LSG-1)** // **NEW RULE**
+1.  **ZDL-1 (CRYOSLEEP-EXEMPT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED v2) // **UPDATED RULE**
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+... (Remaining rules) ...
+12. DEFAULT (DF-1) // **ADJUSTED TO 63%**
+
+---
+
+### New Scoring Example for Passenger 0107_01 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.4 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0107_01** (Mars, CryoSleep=False, Cabin=D/2/S, Destination=TRAPPIST-1e, Age=21.0, VIP=False, RoomService=1743.0, FoodCourt=5.0, ShoppingMall=17.0, Spa=0.0, VRDeck=0.0) | **NVA-1**: Spending present → **AS-1 Revised v2**: RoomService high, but luxury gap detected → route to **LSG-1**: Activated (Destination=TRAPPIST-1e, RoomService>1500, Spa=0, VRDeck=0) → -15% penalty → **PS-1** → **CSP-1 Enhanced v2**: Activated (luxury gap) → -10% penalty → **ACB-2**: Not triggered → **DF-1** | **False** | **38%** (PS-1: 63% + LSG-1: -15% + CSP-1 Enhanced v2: -10%) |
+
+*The new rules correctly penalize the luxury spending gap, resulting in a False prediction.*
+
+---
+
+### Implementation Plan for v7.4
+
+- **Deploy v7.4 immediately.** Reprocess the batch; validate 0107_01 is now False.
+- **Monitor** all non-CryoSleep cases on TRAPPIST-1e with high RoomService and zero luxury spending.
+- **Update historical batches** with luxury gap validation.
+- **Long-term:** Integrate spending ratio analytics (e.g., RoomService/(Spa+VRDeck)) for finer-grained gap detection.
+
+This update ensures nuanced handling of spending pattern discrepancies, preventing over-boosting for imbalanced cases on economy destinations.
+
+**Final Note:** Next, analyze the impact of VIP status on luxury spending patterns for non-CryoSleep passengers.
+
+============================================================

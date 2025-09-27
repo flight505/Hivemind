@@ -1,0 +1,239 @@
+PREDICTIVE METRICS - ITERATION 0
+============================================================
+
+Predictive Metrics Report — Spaceship Titanic (training sample n = 20)
+Purpose
+- Provide an operational, reproducible rule set + probability engine for making batch (one passenger at a time) predictions of whether a passenger is “Transported”.
+- Deliver (a) the strongest patterns found in the training sample, (b) a prioritized set of decision rules with numeric probability estimates and confidence assessments, (c) a recommended scoring formula for production batch use, and (d) operational/Bayesian cautions and guidelines to preserve batch accuracy & consistency.
+
+Important meta-note about this report
+- The training sample is small (20 passengers). All numeric probabilities below are computed from this sample and reported both as raw frequencies and as Laplace-smoothed estimates (add-one smoothing). Use these as informed priors rather than final ground truth; re-calibrate with additional data where possible. I flag confidence levels for every rule to reflect sample support.
+
+Dataset summary (training sample)
+- Total rows: 20
+- Transported = True: 13 (65% raw). Smoothed baseline P(Transported) = (13+1)/(20+2) = 14/22 ≈ 0.6364.
+- Not transported = 7 (35% raw).
+
+1) Key patterns and correlations (empirical evidence from the 20-row sample)
+- CryoSleep:
+  - CryoSleep = True: 4/4 transported (raw 100%). Smoothed P(Transported | Cryo=True) = (4+1)/(4+2) = 5/6 ≈ 0.833. Confidence: Moderate (n=4).
+  - CryoSleep = False: 9/16 transported (raw 56.25%). Smoothed ≈ 0.556. Confidence: High for the “False” count (n=16).
+  - Takeaway: CryoSleep = True is a strong positive signal in this sample.
+- Cabin / Deck letter:
+  - Deck F: 8/10 transported (raw 80%). Smoothed ≈ 0.75. Confidence: High (n=10).
+  - Deck B: 3/4 transported (raw 75%). Smoothed ≈ 0.667. Confidence: Moderate (n=4).
+  - Deck G: 2/3 transported (raw 66.7%). Smoothed ≈ 0.6. Confidence: Low-moderate (n=3).
+  - Deck A: 0/2 (raw 0%). Smoothed ≈ 0.25. Confidence: Low (n=2).
+  - Takeaway: Deck F (and to a lesser extent B) correlate with higher transport likelihood.
+- Cabin side (P vs S):
+  - Side P: 8/11 transported (raw 72.7%). Smoothed ≈ 0.692. Confidence: High (n=11).
+  - Side S: 5/8 transported (raw 62.5%). Smoothed ≈ 0.6. Confidence: Moderate (n=8).
+- HomePlanet:
+  - Earth: 8/11 transported (raw 72.7%). Smoothed ≈ 0.692. Confidence: High.
+  - Europa: 3/6 transported (raw 50%). Smoothed = 0.5. Confidence: Moderate.
+  - Mars: 2/3 transported (raw 66.7%). Smoothed ≈ 0.6. Confidence: Low-moderate.
+- Destination:
+  - TRAPPIST-1e: 10/15 transported (raw 66.7%). Smoothed ≈ 0.647. Confidence: High (n=15).
+  - 55 Cancri e: 2/4 transported (raw 50%). Smoothed = 0.5. Confidence: Moderate.
+  - PSO J318.5-22: 1/1 transported (raw 100%), smoothed ≈ 0.667. Confidence: Very Low (n=1).
+- Age groups:
+  - Infant (age==0): 1/1 transported (raw 100%), smoothed ≈ 0.667. Confidence: Very low.
+  - Children (age 1–17): 2/2 transported (raw 100%), smoothed = 0.75. Confidence: Low (n=2).
+  - Young adults (18–40): 7/12 transported (raw 58.3%), smoothed ≈ 0.571. Confidence: Moderate.
+  - Older adults (41–60): 3/5 transported (raw 60%), smoothed ≈ 0.571. Confidence: Low-moderate.
+  - Takeaway: younger ages skew higher in this sample, but sample sizes are small for children/infants.
+- VIP:
+  - VIP = True: 0/1 transported (raw 0%), smoothed = 0.333. Confidence: Very low (n=1). In this sample VIP was NOT predictive of transport (but sample size prevents strong claims).
+- Total spending (sum of RoomService + FoodCourt + ShoppingMall + Spa + VRDeck), treating missing spends as zero for counting:
+  - Total = 0: 5/6 transported (raw 83.3%), smoothed ≈ 0.75. Confidence: Moderate.
+  - 500–1000: 2/5 transported (raw 40%), smoothed ≈ 0.429. Confidence: Low-moderate.
+  - 1000–5000: 5/6 transported (raw 83.3%), smoothed ≈ 0.75. Confidence: Moderate.
+  - >5000: 1/3 transported (raw 33.3%), smoothed ≈ 0.4. Confidence: Low.
+  - Takeaway: pattern is non-monotonic—zero spenders and medium-high spenders in 1000–5000 range are associated with higher transport rate in this sample; extremely large spenders (>5000) were less likely to be transported here. Use caution: a few influential high-spenders can skew patterns.
+
+2) Prioritized decision rules (applied one passenger at a time)
+All rules return a probability and a confidence level. Use Laplace-smoothed probabilities (shown) as the default priors for each feature value.
+
+Top-level rules (apply in order; later rules combine)
+1. Family / group override (highest priority)
+   - If you have outcome(s) for other members of the same passenger group (same prefix before “_”), enforce consistency:
+     - If majority of known group members were transported -> set passenger p ≈ 0.85 (High confidence if group size≥2 and >50% agree).
+     - If majority known not transported -> set p ≈ 0.15 (High confidence if group size≥2 and >50% agree).
+   - Rationale: in this dataset sibling/family rows are highly consistent (0003 pairs both not-transported, 0006 pairs both transported, 0008 family all transported).
+   - Confidence: High when multiple group members exist; otherwise skip.
+
+2. CryoSleep
+   - If CryoSleep == True -> P(Transported) ≈ 0.833 (smoothed). Confidence: Moderate (n=4).
+   - If CryoSleep == False -> P(Transported) ≈ 0.556. Confidence: High (n=16).
+   - Action: CryoSleep True is a strong positive factor (apply as multiplicative/ additive boost in scoring).
+
+3. Deck & side (combine deck-letter and side)
+   - Deck F: P ≈ 0.75 (smoothed). Confidence: High (n=10).
+   - Deck B: P ≈ 0.667. Confidence: Moderate.
+   - Deck G: P ≈ 0.6. Confidence: Low-moderate.
+   - Deck A: P ≈ 0.25 (negative signal). Confidence: Low.
+   - Side P: P ≈ 0.692 (slight positive). Confidence: High.
+   - Combine: consider deck first, side second (deck has stronger effect).
+
+4. Spending rule (patterned, non-monotonic)
+   - Total spend buckets (smoothed):
+     - Total = 0 → P ≈ 0.75 (moderate support).
+     - 500–1000 → P ≈ 0.429 (lower).
+     - 1000–5000 → P ≈ 0.75 (higher).
+     - >5000 → P ≈ 0.40 (lower).
+   - Implementation: treat spending as a categorical predictor; if missing spending fields, mark as “unknown” and reduce final confidence.
+
+5. Age
+   - Children (1–17): P ≈ 0.75 (low sample). Confidence: Low.
+   - Infants: P ≈ 0.667 (very low sample).
+   - Young adult (18–40): P ≈ 0.571. Confidence: Moderate.
+   - Older adult (41–60): P ≈ 0.571. Confidence: Low-moderate.
+   - Use as a modest additive adjustment.
+
+6. HomePlanet / Destination
+   - Earth: P ≈ 0.692 (positive). Confidence: High.
+   - Europa: P ≈ 0.5 (neutral). Confidence: Moderate.
+   - Mars: P ≈ 0.6 (low-moderate).
+   - Destination TRAPPIST-1e: P ≈ 0.647 (positive). Confidence: High.
+   - 55 Cancri e: P ≈ 0.5. Confidence: Moderate.
+
+7. VIP
+   - VIP True: P ≈ 0.333 (very low sample). Confidence: Very low.
+   - VIP False: P ≈ 0.667. Confidence: Moderate.
+
+Combining rules:
+- Rules should be combined using a weighted-probability aggregation rather than hard overrides (except family override). I provide a recommended, simple, transparent scoring formula below.
+
+3) Recommended scoring formula (operational — single-passenger batch)
+Purpose: compute a calibrated P_final that accounts for multiple features and their sample evidence.
+
+Step A — baseline:
+- p0 = smoothed baseline P(Transported) = 14/22 ≈ 0.6364.
+
+Step B — per-feature smoothed P(feature_value) (use the table above).
+
+Step C — weights (single-passenger default; if family info present apply family override)
+- Recommended weights when no family info (normalize to sum=1):
+  - CryoSleep: 0.28
+  - Deck letter: 0.20
+  - Spending bucket: 0.15
+  - Age group: 0.12
+  - HomePlanet: 0.10
+  - Destination: 0.07
+  - Side (P/S): 0.05
+  - VIP: 0.03
+
+Step D — compute final probability (simple linear combination of deviations)
+- p_final = clamp( p0 + Σ_i w_i * (p_i - p0), [0.01, 0.99] )
+  - where p_i is smoothed P(Transported | value) for the passenger’s feature value; w_i is the weight for that feature.
+  - Clamp to prevent extreme probabilities driven by small counts.
+- If a feature is missing, set the corresponding weight to 0 and re-normalize the remaining weights (or leave weight sum < 1 and accept smaller shift from p0 but reduce confidence).
+
+Why this formula?
+- It is transparent, easily auditable, and avoids overfitting by anchoring to the smoothed baseline and distributing influence proportionally to per-feature evidence and weight.
+- Weights reflect observed reliability in this sample (CryoSleep and deck are strong; VIP is weak).
+
+Example calculation (worked examples)
+- Example 1 (Candra Jacostaffey — 0006_02):
+  - CryoSleep = True (p_i = 0.8333)
+  - Deck G (p_i = 0.6)
+  - Spending ~0 (p_i = 0.75)
+  - Age 28 (young adult p_i = 0.5714)
+  - HomePlanet Earth (p_i = 0.6923)
+  - Destination TRAPPIST (p_i = 0.6471)
+  - Side S (p_i = 0.6)
+  - VIP False (p_i = 0.6667)
+  - Using weights above, p_final ≈ 0.70 (rounded). Confidence: Moderate-high (CryoSleep + other positive signals).
+- Example 2 (Altark Susent — VIP True, very high spa + food spending):
+  - CryoSleep False, Deck A, VIP True, spending >5000 (p_i ≈ 0.4), age older — combined p_final ≈ 0.47. That matches the observed not-transported outcome in this sample.
+
+4) Probability estimates for common archetypal scenarios (rounded)
+(Using per-feature smoothed probabilities + the weighting formula above)
+- CryoSleep = True and Deck F, low or zero spending, Earth, age 20–40:
+  - p_final ≈ 0.78 — Confidence: Moderate (cryosleep signal + deck F strong).
+- CryoSleep = False, Deck F, spending 700 (500–1000 bucket), young adult:
+  - p_final ≈ 0.60 — Confidence: Moderate.
+- Deck A, VIP True, very high spending (>5000), age > 50:
+  - p_final ≈ 0.40 — Confidence: Low-to-moderate (low sample support for VIP).
+- Zero spending, Deck F, CryoSleep False:
+  - p_final ≈ 0.72 — Confidence: Moderate.
+- Multiple family members already transported → single passenger (same group) → p_final → enforce ~0.85 (High confidence if group size≥2).
+
+5) Statistical insights & summary metrics (observed patterns with counts)
+- Baseline transported probability = 13/20 = 65% (smoothed 63.64%).
+- Strongest single predictors in this sample:
+  - CryoSleep True: raw 100% (n=4) — smoothed 83.3% (moderate support).
+  - Deck F (n=10): raw 80% — smoothed 75% (high support).
+  - HomePlanet = Earth (n=11): raw 72.7% — smoothed 69.2% (high support).
+- Spending is non-linear: zero & mid-high (1000–5000) associated with higher transport in this sample; extremely high (>5000) tended to be not transported.
+- Family grouping strongly correlates with identical outcomes in this sample — treat as a must-use operational rule where group data exist.
+
+6) Confidence levels (how to interpret)
+- High confidence: features with n ≥ 10 in the sample (deck F, Earth, side P) or family-level majority with multiple members.
+- Moderate confidence: features with 4 ≤ n < 10 (CryoSleep, some spending buckets).
+- Low confidence: n ≤ 3 (VIP True, PSO destination, infants) — treat these as weak signals and keep priors conservative.
+- For a passenger prediction, generate both p_final and a confidence score (e.g., High, Medium, Low) computed by summing supporting evidence counts across features; if most strong features are in low-n buckets, lower the confidence.
+
+7) Special considerations for batch prediction accuracy & consistency
+- Family-group consistency:
+  - If predicting multiple passengers in one batch who belong to the same group, enforce a post-processing step to reconcile contradictory individual predictions (majority rule or tied to the known group-level predictions).
+- Missing data:
+  - Missing cabinet/cabin or missing key spends: do not impute aggressively — prefer to reduce weights and produce a lower-confidence probability; if imputation is required, use median per-homeplanet for spends and flag prediction confidence down one level.
+- Calibration:
+  - The small training sample likely produces miscalibrated probabilities. As more data arrive, re-train weights and recalibrate probabilities with isotonic regression or Platt scaling.
+- Thresholds for binary labels:
+  - Default: predict Transported if p_final ≥ 0.5.
+  - If you care about precision (reduce false positives): raise threshold to 0.6–0.7.
+  - If you care about recall (catch more transported): lower to 0.4–0.45.
+  - Always report p_final instead of hard labels where downstream costs are asymmetric.
+- Batch-size independence:
+  - Single-passenger scoring is independent; only apply family-level overrides at batch time. That avoids order dependence.
+- Logging & explainability:
+  - For every prediction return: p_final, top 3 contributing features and their individual p_i values, confidence level, and whether family-override applied.
+- Error modes to watch:
+  - Over-reliance on very small-n features (VIP True, PSO destination).
+  - Extremely high spenders that are outliers — they can flip statistics.
+
+8) Implementation checklist (for production)
+- Preprocessing:
+  - Parse Cabin into Deck / Number / Side.
+  - Compute TotalSpend (sum of five amenity columns). Flag NaNs.
+  - Extract group key (prefix before underscore).
+  - Bin Age and TotalSpend into categories described above.
+- Prediction pipeline:
+  1. If group members with known labels exist → apply family override.
+  2. Fetch smoothed P(Transported|value) for each available feature value.
+  3. Apply scoring formula; output p_final and confidence.
+  4. If multiple passengers in batch share group ID, enforce consistency.
+- Monitoring:
+  - Track calibration (Brier score), precision/recall, and confusion matrix as more labeled data arrives.
+  - Recompute weights every time you add ≥ 100 labeled rows.
+
+9) Recommended next steps (to increase batch prediction accuracy)
+- Collect more labeled data to stabilize signals (target at least several hundred rows).
+- Fit a regularized logistic regression (L1/L2) or Naive Bayes on the expanded dataset, then compare with the rule-based score. Use cross-validation and calibration.
+- Where family info is present, consider a hierarchical model that models family-level random effects.
+- If cost of misclassification is asymmetric, explicitly optimize thresholds for that cost.
+
+Appendix — quick reference tables (smoothed P(Transported) and sample size)
+- Baseline P = 0.6364 (smoothed).
+- CryoSleep: True p=0.833 (n=4), False p=0.556 (n=16)
+- Deck: F p=0.75 (n=10), B p=0.667 (n=4), G p=0.6 (n=3), A p=0.25 (n=2)
+- Side: P p=0.692 (n=11), S p=0.6 (n=8)
+- HomePlanet: Earth p=0.692 (n=11), Europa p=0.5 (n=6), Mars p=0.6 (n=3)
+- Destination: TRAPPIST-1e p=0.647 (n=15), 55 Cancri e p=0.5 (n=4), PSO p=0.667 (n=1)
+- Age groups: child p=0.75 (n=2), young adult p=0.571 (n=12), older adult p=0.571 (n=5), infant p=0.667 (n=1)
+- Spending buckets (total; NaN→treated as 0 when counting): total=0 p=0.75 (n=6), 500–1000 p=0.429 (n=5), 1000–5000 p=0.75 (n=6), >5000 p=0.4 (n=3)
+- VIP True p=0.333 (n=1), VIP False p=0.667 (n=19)
+
+Operational recommendation (one-line)
+- Use the weighted linear deviation formula anchored at p0 (above), apply the family override when group data available, return p_final + confidence, re-calibrate with new labeled data frequently.
+
+If you want, I will:
+- Produce a compact Python implementation (predictor function) of the scoring formula above (includes parsing, smoothing tables, weights, and family-override logic).
+- Run a leave-one-out evaluation on the 20-row sample to estimate in-sample accuracy / calibration for the given rule set.
+- Convert these rules into a logistic model (fit + cross-validate) once you provide a larger labeled set.
+
+Which of the above next steps would you like me to do now (code, evaluation, or adjust weights/rules)?
+
+============================================================

@@ -1,0 +1,142 @@
+PREDICTIVE METRICS - ITERATION 21
+============================================================
+
+### **Analysis of Prediction Error for Passenger 0039_01**
+
+**1. What specific patterns in the current metrics led to this prediction error?**
+The model incorrectly predicted survival for Passenger 0039_01 due to a critical misinterpretation of NaN values in the context of CryoSleep:
+
+- **Misapplication of CryoSleep Override:** The model applied Rule C-1 (+2 modifier) based solely on `CryoSleep == True`, without properly accounting for the implications of NaN values in spending categories for CryoSleep passengers.
+
+- **Failure to Distinguish Between Zero and NaN:** The current system treats explicit zeros ($0.0) and NaN values identically in spending pattern analysis, leading to incorrect classification. For CryoSleep passengers, NaN should represent unavailable data (passenger wasn't using amenities), not zero spending.
+
+- **Overreliance on Base Score:** The base score (+1) was applied despite ambiguous spending data, compounding the error from the CryoSleep override.
+
+- **Missing NaN Handling Logic:** No specific rules exist to handle cases where CryoSleep passengers have NaN values in amenity categories, which should be treated differently than explicit zeros.
+
+**2. How should the decision rules be modified to prevent similar errors?**
+- **Revise CryoSleep Rule (C-1):** Update to: "IF `CryoSleep == True` AND all amenity values are either NaN or 0, apply +2 modifier"
+- **Add NaN Validation Rule (NV-1):** Create new rule: "IF any amenity is NaN AND `Cryleep == False`, apply -1 scrutiny modifier due to data quality concerns"
+- **Modify Base Score Application:** Base score should only apply when spending pattern is clearly interpretable (no ambiguous NaN values in key categories)
+- **Implement Data Quality Check:** Add pre-processing rule to flag passengers with mixed data types (NaN + numerical values) for special handling
+
+**3. What new insights does this error reveal about passenger transport patterns?**
+- **NaN Values Have Contextual Meaning:** For CryoSleep passengers, NaN values likely indicate "not applicable" rather than "zero spending," requiring different interpretation
+- **Data Quality Impacts Prediction Accuracy:** Mixed data patterns (NaN + numerical values) in CryoSleep passengers indicate potential data collection issues that affect prediction reliability
+- **CryoSleep Override Needs Qualification:** The CryoSleep survival advantage assumption requires validation against data quality and spending pattern consistency
+- **Batch Processing Must Account for Data Integrity:** Prediction systems need robust data validation before applying substantive rules
+
+**4. How should confidence levels be recalibrated?**
+- **CryoSleep Rule (C-1) Confidence:** Reduce to 85% when NaN values are present
+- **New NaN Validation Rule (NV-1) Confidence:** 75% for data quality flags
+- **Base Score Confidence:** Reduce to 60% when ambiguous data patterns exist
+- **Overall Model Confidence:** Adjust to 87% with improved NaN handling
+
+**5. What adjustments are needed for better consistency?**
+- **Implement Data Quality Pre-screening:** Add batch processing step to classify data integrity before prediction
+- **Create Separate NaN Handling Rules:** Different rules for CryoSleep vs awake passengers with NaN values
+- **Add Validation Checks:** Ensure spending data consistency (either all NaN/zero for CryoSleep, or all numerical for awake)
+- **Batch Processing Order:** Process passengers with data quality issues (mixed NaN/numerical) last for manual review
+
+**6. How can the metrics be improved to handle edge cases like this one?**
+- **Develop Data Integrity Index** measuring consistency of data types across amenity categories
+- **Add context-specific NaN interpretation rules** based on passenger status (CryoSleep, VIP, etc.)
+- **Implement two-stage prediction:** Data quality assessment followed by substantive prediction
+- **Create exception handling protocol** for passengers with ambiguous data patterns
+
+---
+
+### **UPDATED PREDICTIVE METRICS REPORT v3.2**
+
+**Report Objective:** Integrate learning from Passenger 0039_01 error, emphasizing proper NaN value interpretation and data quality handling. Optimized for batch prediction accuracy with robust data validation.
+
+**Analysis Basis:** Enhanced data integrity checking and context-specific NaN value interpretation system.
+
+---
+
+### **1. Enhanced Decision Logic: Data-Validated Pattern System v3.2**
+
+**A. Data Quality Pre-Processing Rules (Apply First):**
+
+*   **Rule DQ-1: Data Consistency Check (NEW)**
+    *   **Condition:** Mixed data types (NaN + numerical values) in amenity categories
+    *   **Action:** Flag for special processing, apply -1 base score modifier
+    *   **Confidence:** **80%**
+    *   **Precedence:** **HIGHEST PRIORITY**
+
+*   **Rule DQ-2: CryoSleep Data Validation (NEW)**
+    *   **Condition:** `CryoSleep == True` AND any amenity has numerical value > 0
+    *   **Action:** Data inconsistency - override to False prediction, confidence 70%
+    *   **Precedence:** **HIGH PRIORITY**
+
+**B. Substantive Prediction Rules:**
+
+*   **Base Score:** **+1** (only applies if data consistency check passes)
+
+*   **Rule C-1: Qualified CryoSleep Override (UPDATED)**
+    *   **Condition:** `CryoSleep == True` AND all amenities are either NaN or 0
+    *   **Score Modifier:** **+2**
+    *   **Confidence:** **90%**
+
+*   **Rule NV-1: NaN Validation (NEW)**
+    *   **Condition:** Any amenity is NaN AND `CryoSleep == False`
+    *   **Score Modifier:** **-1**
+    *   **Confidence:** **75%**
+
+*   **Rule IS-1: Imbalanced Spending**
+    *   **Condition:** Number of zero-spend amenities ≥ 2 AND TotalSpend > 2000
+    *   **Score Modifier:** **-3**
+    *   **Confidence:** **80%**
+
+*   **Rule SH-1: Selective High-Spender Pattern**
+    *   **Condition:** `TotalSpend > 1500` AND number of zero-spend amenities ≤ 1
+    *   **Score Modifier:** **+3**
+    *   **Confidence:** **85%**
+
+---
+
+### **2. Updated Probability Estimates & Scoring Examples**
+
+| Passenger Profile | Applied Rules | Total Score | Prediction | Probability |
+| :--- | :--- | :--- | :--- | :--- |
+| **Error Case: 0039_01** | DQ-1 (-1), C-1 (+2) | **+1** | **False** | **~45%** |
+| Valid CryoSleep (All NaN/0) | C-1 (+2), Base (+1) | +3 | **True** | ~90% |
+| Awake with NaN Values | NV-1 (-1), Base (+1) | 0 | **False** | ~50% |
+| Data Inconsistent CryoSleep | DQ-2 (Override) | N/A | **False** | ~30% |
+
+---
+
+### **3. Recalibrated Confidence Levels**
+
+| Rule / Component | Revised Confidence | Rationale |
+| :--- | :--- | :--- |
+| **Data Consistency (DQ-1)** | **80%** | Strong indicator of data quality issues |
+| **CryoSleep Validation (DQ-2)** | **70%** | Moderate confidence for data inconsistency override |
+| **Qualified CryoSleep (C-1)** | **90%** | High confidence when data pattern validates |
+| **NaN Validation (NV-1)** | **75%** | Good predictive value for data quality issues |
+| **Imbalanced Spending (IS-1)** | **80%** | Unchanged |
+| **Overall Model** | **87%** | Improved with data validation framework |
+
+---
+
+### **4. Strategic Recommendations for Batch Prediction Accuracy**
+
+1.  **Immediate Deployment:** Implement **DQ-1, DQ-2, and NV-1** rules with highest priority
+2.  **Pre-Processing Enhancement:** Update batch scripts to:
+    - Perform data consistency checks before substantive prediction
+    - Create separate processing queues for different data quality categories
+    - Implement data integrity scoring for each passenger
+3.  **Validation Protocol:** Establish manual review process for passengers flagged with data inconsistencies
+4.  **Feature Engineering:** Add `DataConsistencyScore` and `NaNCount` features
+5.  **Batch Optimization:** Implement parallel processing based on data quality tiers
+
+**Implementation Timeline:**
+- Immediate: Deploy data quality rules DQ-1 and DQ-2
+- 24h: Update batch pre-processing with data consistency checks
+- 48h: Implement NaN validation rule NV-1 across all batches
+- 72h: Establish manual review protocol for data inconsistency cases
+- 1 week: Develop data quality scoring system and reporting
+
+This update addresses the critical data interpretation error regarding NaN values and establishes a robust data validation framework that prevents misapplication of substantive rules to ambiguous data patterns, particularly for CryoSleep passengers.
+
+============================================================

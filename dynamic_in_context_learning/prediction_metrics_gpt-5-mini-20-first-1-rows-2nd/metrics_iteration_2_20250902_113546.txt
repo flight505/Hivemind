@@ -1,0 +1,210 @@
+PREDICTIVE METRICS - ITERATION 2
+============================================================
+
+Executive summary — what happened and immediate corrective priorities
+- Two recent false positives (Philda 0017_02 and Almary 0020_01) exposed the same small-data failure modes: correlated / low-n categorical signals combined additively to overwhelm weak or contradictory evidence. The aggregator over-weighted a few positive buckets (Deck/HomePlanet/Spend/CryoSleep/age buckets) without enough reliability-weighting or interaction-awareness.
+- Immediate, high-impact fixes to deploy now:
+  1. Laplace smoothing + reliability shrinkage of per-value probabilities (pseudo-count k = 5 recommended).
+  2. Reliability-scaling of feature weights (downweight features/buckets with small n).
+  3. A formal evidence (support) score and two conservative production rules:
+     - If evidence (support_total) is Low OR the example lacks >=2 reliable supporting signals → abstain / flag or default to Not Transported.
+     - Cap any single feature’s log-odds contribution to prevent single-feature domination.
+  4. Log predictions + top-3 contributors for every row so we can quickly diagnose new failures.
+
+Below is a COMPLETE updated predictive-metrics report that (a) incorporates the new labelled case 0020_01 (Almary), (b) explains what went wrong for Almary specifically, (c) gives an operational scoring formula (with the conservative safety rules), (d) shows a worked example for Almary, and (e) prescribes concrete rule and monitoring changes to avoid similar errors.
+
+A. Updated dataset summary (after adding Almary 0020_01)
+- Total labeled rows: 22
+- Transported = True: 13
+- Not transported = 9
+- Smoothed baseline (Laplace add-one): p0 = (13 + 1) / (22 + 2) = 14/24 = 0.5833333
+
+B. Which buckets changed when Almary was added (Laplace add-one per-value p)
+(Only buckets that changed are listed — unchanged buckets remain as in the previous tabulation.)
+
+- CryoSleep:
+  - True: n=5, p_smoothed = (t+1)/(n+2) = (4+1)/(5+2) = 5/7 ≈ 0.714286
+  - False: n=17, p_smoothed = (9+1)/(17+2) = 10/19 ≈ 0.526316
+- HomePlanet:
+  - Earth: n=13, p_smoothed = (8+1)/(13+2) = 9/15 = 0.600000
+- Destination:
+  - TRAPPIST-1e: n=16, p_smoothed = (10+1)/(16+2) = 11/18 ≈ 0.611111
+- Deck:
+  - E: n changed from 1 → 2, p_smoothed = (0+1)/(2+2) = 0.25 (was 1/3 before)
+- Side:
+  - S: n=9, p_smoothed = (5+1)/(9+2) = 6/11 ≈ 0.545455
+- Age:
+  - infant: n=2, p_smoothed = (1+1)/(2+2) = 0.5
+- Spending:
+  - total=0: n=7, p_smoothed = (5+1)/(7+2) = 6/9 = 0.666667
+- VIP:
+  - False: n=21 → p_smoothed = (13+1)/(21+2) = 14/23 ≈ 0.608696
+
+Interpretation: adding Almary reduced some previously strong signals (Earth, TRAPPIST, CryoSleep) slightly and made some low-n categories (Deck E, infant) even less reliable.
+
+C. Reliability shrinkage (recommended) — k = 5
+- Apply p_shrunk = (n/(n + k)) * p_smoothed + (k/(n + k)) * p0
+- Important changed p_shrunk (k=5) — used in scoring:
+  - CryoSleep=True: p_shrunk = 109/168 ≈ 0.64881
+  - Deck=E: p_shrunk = 41/84 ≈ 0.48810
+  - Side=S: p_shrunk ≈ 0.55898
+  - HomePlanet=Earth: p_shrunk ≈ 0.59537
+  - Destination=TRAPPIST-1e: p_shrunk ≈ 0.60450
+  - Age=infant: p_shrunk ≈ 0.55952
+  - Spending=0: p_shrunk = 91/144 ≈ 0.63194
+  - VIP=False: p_shrunk ≈ 0.60382
+
+These shrinkage adjustments pull small-n / noisy buckets toward the baseline p0, reducing over-confidence.
+
+D. What specifically caused the Almary error (detailed root-cause)
+Passenger 0020_01 Almary Brantuarez — features:
+- HomePlanet = Earth
+- CryoSleep = True
+- Cabin = E/0/S → Deck = E, Side = S
+- Destination = TRAPPIST-1e
+- Age = 1 → infant
+- VIP = False
+- TotalSpend = 0
+
+Why the model predicted True
+- Many per-value probabilities (after smoothing) are above the baseline p0 (CryoSleep, TRAPPIST, spending=0, VIP=False, Earth), so the additive log-odds aggregator produced p_final ≈ 0.60 and predicted True.
+- Root cause: these positive signals are individually weak-to-moderate and several are highly correlated or low-n. The model lacked a conservative “insufficient-evidence” check that would require multiple reliable signals to make a positive call. In short, many weak positives added up (small-n overfitting) and no rule forced abstention/default False under low evidence.
+
+E. Updated operational scoring formula (compact, production-ready)
+Use this pipeline (deterministic, single-pass per batch):
+
+1) Baseline (smoothed):
+   - p0 = (T + 1) / (N + 2)
+
+2) Per-value smoothed:
+   - p_i_smoothed = (t_i + 1) / (n_i + 2); if n_i = 0 then p_i_smoothed = p0.
+
+3) Reliability shrinkage:
+   - p_i_shrunk = (n_i / (n_i + k)) * p_i_smoothed + (k / (n_i + k)) * p0
+   - recommended k = 5 (tunable).
+
+4) Convert to log-odds deltas:
+   - logit0 = ln(p0 / (1 − p0))
+   - delta_i = ln(p_i_shrunk / (1 − p_i_shrunk)) − logit0
+   - Cap delta_i to ±max_delta (recommend max_delta = 0.8) to avoid single-feature domination.
+
+5) Base weights (starting point; re-fit when >50 new labels):
+   - CryoSleep: 0.30
+   - Deck letter: 0.22
+   - Spending bucket: 0.12
+   - Age group: 0.08
+   - HomePlanet: 0.10
+   - Destination: 0.08
+   - Side: 0.06
+   - VIP: 0.04
+
+6) Reliability-scaling of weights:
+   - r_i = n_i / (n_i + k2) with k2 = 5
+   - raw_w_i = base_w_i * r_i
+   - normalized weights: w_i = raw_w_i / Σ_j raw_w_j
+
+7) Combine in log-odds:
+   - logit_final = logit0 + Σ_i w_i * capped(delta_i)
+   - p_final = sigmoid(logit_final)
+
+8) Evidence/support metric (critical):
+   - support_i = |p_i_shrunk − p0| * r_i
+   - support_total = Σ_i base_w_i * support_i
+
+9) Reliable-signal count:
+   - Feature i counts as “reliable support” if r_i ≥ 0.6 AND |p_i_shrunk − p0| ≥ 0.05
+   - reliable_count = count_i(reliable support in direction of p_final)
+
+10) Decision / abstain policy (conservative, tuned for small-data regime):
+   - If support_total < 0.04 OR reliable_count < 2:
+       - Action: abstain (preferred) OR conservative default: Not Transported (False).
+     Rationale: low evidence or lack of at least two independent reliable signals → avoid confident positive calls.
+   - Else: predict p_final >= 0.5 → Transported (True) else False.
+
+11) Logging and explainability:
+   - For every prediction persist: p_final, support_total, reliable_count, top-3 contributors (feature, p_i_shrunk, contribution), whether abstained/defaulted, and normalized weights.
+
+F. Worked example: Almary 0020_01 under the new pipeline
+- p0 = 14/24 = 0.5833333
+- Key p_i_shrunk (k=5) [rounded]:
+  - CryoSleep=True: 0.64881
+  - Deck=E: 0.48810
+  - Side=S: 0.55898
+  - HomePlanet=Earth: 0.59537
+  - Destination=TRAPPIST-1e: 0.60450
+  - Age=infant: 0.55952
+  - Spending=0: 0.63194
+  - VIP=False: 0.60382
+- Combine with reliability-scaled normalized weights (as described above) → logit_final ≈ 0.410 → p_final ≈ 0.60 (the aggregator still tilts positive).
+- Compute evidence:
+  - support_total ≈ 0.0235 (Low — below 0.04)
+  - reliable_count = 0 (no feature simultaneously has r_i ≥ 0.6 AND |p_i_shrunk − p0| ≥ 0.05)
+- Decision under the new conservative rule:
+  - Because support_total < 0.04 AND reliable_count < 2 → abstain or default to Not Transported.
+  - Result: predict Not Transported (or flag for manual review) → matches actual label and prevents this false positive.
+
+G. Concrete rule changes to prevent similar errors going forward
+1) Shrink per-value probs toward baseline with k = 5 (immediately reduces small-n overconfidence).
+2) Reliability-weighted normalization of feature weights (downweights small-n buckets).
+3) Evidence gating: require at least two independent reliable signals OR support_total ≥ threshold to make a positive call; otherwise abstain/default False.
+4) Cap per-feature log-odds contribution to ±0.8 (avoid single-feature domination).
+5) Special handling rules:
+   - For infant (age ≤1) or very small n destination/deck: require extra supporting evidence (e.g., reliable_count ≥ 2).
+   - For destination values with n ≤ 5: enforce stronger shrinkage (increase k locally) or treat as neutral until more data.
+   - Re-bucket spending using log-percentiles or per-planet percentiles; flag single-amenity outliers (very high VRDeck) as separate binary outlier feature.
+6) Group/family reconciliation (post-score, order-independent): if group members have labels, enforce majority as per earlier rule; if only predictions exist and group_mean_p is extreme → apply consensus.
+
+H. New confidence calibration (recommended mapping)
+- support_total ≥ 0.08 → High confidence (use p_final threshold).
+- 0.04 ≤ support_total < 0.08 → Medium confidence (accept threshold-based decision, but log + monitor).
+- support_total < 0.04 → Low confidence → abstain or default Not Transported (conservative).
+Note: with very small data you can be even more conservative (raise Low threshold to 0.05). Almary’s support_total ≈ 0.0235 → Low.
+
+I. How this changes batch prediction consistency
+- Deterministic, order-independent pipeline:
+  - Compute p_final for all rows first (single-pass).
+  - Compute group reconciliation and abstentions in one deterministic post-pass.
+  - Persist audit trail: p_final, p_shrunks, support_total, top contributors, whether abstained.
+- This prevents ad-hoc overrides and makes behavior reproducible between runs and batches.
+
+J. Metrics to monitor (daily/weekly)
+- Brier score (overall calibration) — target decreasing trend.
+- Calibration plot (predicted probability buckets vs actual outcomes).
+- False positive rate, especially among:
+  - Deck F / Deck E / Earth / TRAPPIST passengers
+  - Age = infant / child
+  - Spending = 0
+- support_total distribution and fraction of predictions that are abstained / defaulted.
+- Per-feature error rates (e.g., false positive rate for CryoSleep=True).
+- Trigger re-fit / re-weight when +50 new labels or when a per-feature FPR exceeds a control limit.
+
+K. Handling edge cases like Almary and Philda (concrete rules)
+- If support_total < 0.04 OR reliable_count < 2:
+  - Option A (recommended for low-risk automation): abstain and send to review.
+  - Option B (if you must auto-return a binary label): default to Not Transported to reduce false positives.
+- For infants (n small): require two reliable signals to predict True.
+- For newly observed categorical values (n=0): treat p_i_shrunk = p0 and flag as low-evidence.
+
+L. Rollout & implementation checklist (priority order)
+1) Implement per-value Laplace smoothing and reliability shrinkage (k = 5).
+2) Implement reliability-weighted base-weight normalization and capped log-odds aggregation (logit-space).
+3) Compute support_total, reliable_count and implement abstain/default safety rule.
+4) Log top contributors and support_total for each prediction.
+5) Run leave-one-out (LOO) evaluation on the current 22-row set to sanity-check in-sample effect; then re-evaluate after each +50 labeled rows and move to a parametric model (regularized logistic or tree) once >100–200 labels.
+6) Start collecting labels and audit logs immediately and schedule weekly recalibration.
+
+M. Expected short-term tradeoffs
+- Conservative abstain/default policies will reduce false positives (good) but may increase abstentions (manual workload) or false negatives if defaulting to Not Transported. In small-data regimes, a conservative bias toward “safety” (reduce false positives) is generally preferred.
+
+N. Suggested immediate next actions (pick top 3)
+1) Deploy the revised scoring pipeline (steps A–K above) in staging; enable verbose logging for first 500 predictions.
+2) Enforce the safety rule: abstain or default to Not Transported if support_total < 0.04 or reliable_count < 2.
+3) Provide me permission to produce: (A) a compact Python implementation of the pipeline (smoothing, shrinkage, logit combining, support_total, abstain rules, and group reconciliation), and (B) a leave-one-out evaluation on the current 22-row set so you can see in-sample behavior.
+
+If you want, I will:
+- Produce a minimal, drop-in Python function implementing the new scoring + abstain pipeline (parsing, Laplace smoothing, shrinkage, reliability-weighted logit aggregation, support_total, reliable_count check, and explainability fields).
+- Run a quick leave-one-out on the current sample (22 rows) to quantify in-sample changes (Brier, accuracy, how many abstentions) and show how many previous false positives would be prevented.
+
+Would you like the Python implementation, the LOO evaluation, or both?
+
+============================================================

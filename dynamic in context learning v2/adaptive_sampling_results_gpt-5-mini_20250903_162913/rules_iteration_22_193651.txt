@@ -1,0 +1,42 @@
+PREDICTIVE RULES - ITERATION 22
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. [Treat CryoSleep as a strong positive signal only when not contradicted by spending: if CryoSleep = True AND total_spend (RoomService+FoodCourt+ShoppingMall+Spa+VRDeck) == 0 then predict Transported = True]
+
+2. [If CryoSleep = True AND any spend category > 0 then predict Transported = False (treat CryoSleep+spend as a contradiction pointing to not transported)]
+
+3. [Allow high non-luxury spending to override CryoSleep: if FoodCourt > 1000 OR ShoppingMall > 1000 OR (RoomService > 1500) then predict Transported = True regardless of CryoSleep, unless luxury-spend rules (Spa/VRDeck) produce a stronger contradictory signal]
+
+4. [Recognize luxury-spend patterns as negative: if Spa + VRDeck > 1000 OR Spa > 3000 OR VRDeck > 3000 OR total_spend > 3000 then predict Transported = False]
+
+5. [Distinguish non-luxury concentration: if (RoomService + FoodCourt + ShoppingMall) > 2000 AND (Spa + VRDeck) <= 500 then predict Transported = True]
+
+6. [Treat one very large non-luxury channel as signal for transported: if FoodCourt > 2000 OR ShoppingMall > 2000 then predict Transported = True]
+
+7. [Age-based priors: if Age < 5 then predict Transported = True (very young children have high transported probability); if 5 <= Age < 18 then increase probability of Transported and predict True when combined with at least one supporting signal (CryoSleep = True OR non-luxury spend > 300 OR cabin-majority transported); if Age >= 60 then treat CryoSleep as decisive: CryoSleep = True -> predict True; CryoSleep = False -> predict False]
+
+8. [When spends are all zero and CryoSleep = False do not default to not transported — if Age < 18 (or Age missing and cabin contains minors) then predict Transported = True; otherwise if Age unknown or >50 and no other positive indicators predict False]
+
+9. [VIP is a soft positive: if VIP = True then raise transported probability but require absence of strong contradictory spending (total_spend > 1000 OR Spa + VRDeck > 500 OR CryoSleep = True with contradictory spend) before forcing True; require at least one supporting non-contradictory signal (total_spend < 1000 OR non-luxury spend > 200 OR cabin-mate signal) to predict True]
+
+10. [Destination modulation: adjust CryoSleep and spend thresholds per destination — for PSO J318.5-22 treat CryoSleep alone as weaker (require an additional supporting signal such as age < 18 or non-luxury spend > 300 to predict True); for TRAPPIST-1e and 55 Cancri e non-luxury spending (FoodCourt/ShoppingMall) is a stronger indicator of transported]
+
+11. [Cabin-deck modifiers: use the cabin deck letter as a weight, not an absolute rule — decks A/B/C increase the credibility of CryoSleep = True (lower threshold to predict True), while decks G/F lower CryoSleep credibility (require an extra supporting signal to predict True); decks with historically low transported rates require confirmation from spend/age/VIP]
+
+12. [Cabin-group propagation only when robust: when multiple passengers share a cabin, propagate a Transported = True label to cabin-mates only if at least one member has a strong, non-contradictory signal (CryoSleep = True with zero spend OR non-luxury spend > 1000 OR VIP = True with low luxury spending); otherwise do not enforce unanimous cabin labels]
+
+13. [Missing CryoSleep handling: treat CryoSleep = NaN conservatively as False unless at least two independent positive indicators are present (VIP = True, non-luxury spend sum > 500, Age < 18, or a cabin-mate with CryoSleep = True), in which case predict True]
+
+14. [Missing demographics handling: when HomePlanet or Age are missing, require at least two supporting signals from CryoSleep, spend-pattern (non-luxury > 500), VIP, cabin-majority, or deck-support to predict Transported = True]
+
+15. [Resolve spend vs CryoSleep conflicts by prioritized thresholds: if spending and CryoSleep disagree, defer to CryoSleep when CryoSleep is corroborated by deck (A/B/C) or age < 5; allow non-luxury spending thresholds (FoodCourt or ShoppingMall > 1000 OR RoomService+FoodCourt+ShoppingMall > 2000) to override CryoSleep when present]
+
+16. [Prevent over-reliance on VIP or CryoSleep alone: require VIP = True or CryoSleep = True to be combined with low contradictory luxury spending and at least one corroborating indicator (age group, non-luxury spend, cabin agreement, or favorable deck) before predicting True]
+
+17. [Flag mixed heavy-spend profiles: if both non-luxury and luxury channels are very large (e.g., FoodCourt or ShoppingMall > 1000 AND Spa or VRDeck > 1000) treat case as uncertain and require cabin-majority or age signal to predict True; otherwise predict False]
+
+18. [When model uncertainty remains (no strong positive or strong negative signals), default conservatively to False unless two independent weak positives exist (e.g., Age < 18 AND ShoppingMall > 300, or VIP = True AND non-luxury spend > 200), then predict True]
+
+============================================================

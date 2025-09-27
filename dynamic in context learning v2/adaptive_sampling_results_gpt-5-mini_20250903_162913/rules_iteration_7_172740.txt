@@ -1,0 +1,34 @@
+PREDICTIVE RULES - ITERATION 7
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. [If a Cabin identifier is shared by multiple passengers, use the cabin-group majority: if >50% of known/derived signals in that cabin indicate Transported = True then predict True for the whole cabin group; if >50% indicate False then predict False.]
+
+2. [If CryoSleep = True then refine by spending and age: predict Transported = True when CryoSleep = True AND (total_spend == 0 OR Age <= 18 OR premium_cabin_indicator = True); otherwise (CryoSleep = True AND non_luxury_spend = RoomService+FoodCourt+ShoppingMall > 500) predict Transported = False.]
+
+3. [Treat VIP as a conditional amplifier, not an absolute: predict Transported = True when VIP = True AND (CryoSleep = True OR premium_cabin_indicator = True OR non_luxury_spend <= 50); if VIP = True but non_luxury_spend > 500 or luxury_spend (Spa+VRDeck) > 1000 then do not automatically predict True (use other spend-based rules).]
+
+4. [If non_luxury_spend = RoomService + FoodCourt + ShoppingMall > 500 OR any single non_luxury amenity (RoomService or FoodCourt or ShoppingMall) > 1000 then predict Transported = True.]
+
+5. [If luxury_spend = Spa + VRDeck > 1000 AND luxury_spend / max(1, total_spend) >= 0.6 AND non_luxury_spend < 300 then predict Transported = False; otherwise if luxury_spend is high but non_luxury_spend is also high, defer to non_luxury_spend rules (predict True).]
+
+6. [Age-based adjustments: predict Transported = True for infants/toddlers (Age <= 5) when total_spend == 0 or when CryoSleep is True; predict Transported = True for minors (Age < 18) when non_luxury_spend > 300; predict Transported = False for seniors (Age >= 60) by default unless overridden by very high non_luxury_spend (>1000) or strong cabin-group majority = True.]
+
+7. [Destination priors as modifiers: increase probability of Transported = True for PSO J318.5-22 passengers when CryoSleep = True or Age <= 18; treat TRAPPIST-1e as mixed — rely primarily on spending, age and cabin-group rules rather than a blanket destination rule.]
+
+8. [When spending data is partially missing, impute conservatively as zero for decision thresholds but require at least one positive signal (nonzero spend, CryoSleep=True, VIP=True, premium_cabin_indicator, or cabin-group majority) to predict True; do not predict True solely on missing values.]
+
+9. [Use spend composition (ratio) as a tie-breaker: if total_spend > 0 and (non_luxury_spend / total_spend) >= 0.6 and non_luxury_spend > 300 then predict Transported = True; if (luxury_spend / total_spend) >= 0.6 and luxury_spend > 1000 then predict Transported = False.]
+
+10. [Override safety net: if multiple independent positive signals occur (>=2 of: CryoSleep=True with qualifying condition, VIP=True with qualifying condition, non_luxury_spend>500, cabin-group majority=True, Age<18 with spend>300) then predict Transported = True.]
+
+11. [If nearly all amenity spends are zero, CryoSleep = False, VIP != True, no premium cabin indicator, and cabin-group majority is False or unknown, then predict Transported = False (do not let zeros alone force True).]
+
+12. [Define premium_cabin_indicator generally as presence of a 'P' cabin suffix or cabin position consistent with premium decks; use it to bias predictions toward True only when combined with VIP, CryoSleep, or very low personal spend (i.e., occupant likely assigned to reserved/transported group).]
+
+13. [When demographic signals conflict (e.g., CryoSleep = True but high non_luxury_spend, or VIP = True but high luxury_spend with no non_luxury activity), prioritize concrete behavior signals (non_luxury_spend amounts and cabin-group majority) over single-label signals (CryoSleep or VIP alone).]
+
+14. [Apply all rules in priority order: cabin-group majority and concrete spending-composition rules first, then combined-signal overrides (rule 10), then CryoSleep/VIP/age conditional rules, and finally default fallbacks for seniors and all-zero passengers.]
+
+============================================================

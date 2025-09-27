@@ -1,0 +1,22 @@
+PREDICTIVE RULES - ITERATION 3
+============================================================
+
+IMPROVED PREDICTIVE RULES:
+
+1. [If CryoSleep = True AND (RoomService + FoodCourt + ShoppingMall + Spa + VRDeck) == 0 then predict Transported = True]
+2. [If CryoSleep = True AND (RoomService + FoodCourt + ShoppingMall + Spa + VRDeck) > 0 then predict Transported = False]
+3. [Let non_lux_spend = RoomService + FoodCourt + ShoppingMall. If non_lux_spend >= 1000 then predict Transported = True]
+4. [Let luxury_spend = Spa + VRDeck. If luxury_spend > non_lux_spend AND luxury_spend >= 1000 then predict Transported = False]
+5. [If VIP = True then predict Transported = True only when at least one strong transport signal is present: (non_lux_spend >= 100) OR (CryoSleep = True with zero spend) OR (Age < 18) OR (Destination = PSO J318.5-22) OR (cabin-group majority Transported by strong signals); otherwise do not force Transported = True based on VIP alone]
+6. [If Age < 18 then predict Transported = True (children and infants strongly associated with Transported), with highest priority among demographic rules]
+7. [If Age >= 60 then predict Transported = False only when combined signals indicate low transport likelihood: non_lux_spend <= 100 AND luxury_spend > non_lux_spend; otherwise do not force False for elderly (allow spending/destination signals to override)]
+8. [If Destination = PSO J318.5-22 AND (CryoSleep = True OR Age < 18 OR non_lux_spend == 0) then predict Transported = True; if Destination = PSO J318.5-22 but none of those signals present, defer to spending and cabin-group rules]
+9. [If Destination = TRAPPIST-1e then use spending balance: if non_lux_spend >= 500 predict Transported = True; if luxury_spend >= 1000 and luxury_spend > non_lux_spend predict Transported = False; otherwise defer to other signals]
+10. [If Cabin deck letter is in {G,F} AND CryoSleep = True (or missing CryoSleep with zero spend) then predict Transported = True; if Cabin deck letter is early (A-C) increase Transported probability when combined with Age < 18 or VIP = True]
+11. [For cabin-grouped passengers (same deck/number/side): if group size >= 2 and >= 75% of group have strong unanimous signals for Transported (examples: CryoSleep=True with zero spend OR non_lux_spend >= 1000 OR Age < 18) then assign Transported = True to all group members; similarly if >= 75% have strong unanimous signals for Not Transported (examples: CryoSleep=False with luxury_spend >> non_lux_spend >=1000 and non_lux_spend small) then assign Transported = False to all members]
+12. [If CryoSleep is missing/NaN treat it as unknown; prefer spending-derived and cabin-group signals over assuming CryoSleep = False]
+13. [If critical demographics (Age or HomePlanet) are missing and cabin-group contains at least one member with a strong transport signal, use the cabin-group strong-signal majority to predict the missing-case passenger]
+14. [When signals conflict, apply this priority order to decide prediction: (1) CryoSleep with zero spend, (2) non_lux_spend thresholds, (3) luxury_spend dominance, (4) Age < 18, (5) cabin-group unanimous strong signals, (6) VIP conditional rule, (7) Age >= 60 conditional rule, (8) Destination tie-break rules]
+15. [If a passenger has negligible total spend (total_spend == 0) but CryoSleep is False and Age <= 5 and cabin-group or destination signals indicate transport (PSO or repeated Cryo patterns), predict Transported = True; otherwise treat zero-spend non-cryo as ambiguous and rely on group/destination rules]
+
+============================================================

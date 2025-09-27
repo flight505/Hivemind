@@ -1,0 +1,261 @@
+PREDICTIVE METRICS - ITERATION 76
+============================================================
+
+Updated Predictive Metrics Report — v3.6.1 (post_0103_01)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened: A second low‑n batch failure pattern emerged (0103_01). Batch size n==1; record had very small total spend (sum_spend ≈ 17), single nonzero channel (VRDeck), top1_share ≈ 1.0, and missing FoodCourt value (NaN). The scorer predicted False but actual = True. This is a micro_concentrated False Negative (FN).
+- Why it matters now: previously we focused on zero_spend FNs and concentrated_top1 FPs. This case shows a third, distinct risk: low_total_spend + single‑channel concentration ("micro_concentrated") can be informative and/or cause overconfident wrong predictions if not handled as its own pattern.
+- Immediate corrective priorities:
+  1. Add a micro_concentrated pattern detector (sum_spend ∈ (0, S_low], top1_share ≥ T_mc, num_nonzero_channels ≤ 2) and treat it explicitly in gating, calibration, and pooling.
+  2. Enforce symmetric n==1 gating for zero_spend, concentrated_topK and micro_concentrated records when subslices are untrusted (route to priority_audit unless extreme consensus).
+  3. Update calibrator + GLM_fallback to include channel×sum_spend_bucket×context interactions (top1_channel × sum_spend_bucket × Age_bucket × Destination × CryoSleep), and add channel‑level priors to hierarchical pooling.
+  4. Increase SE/variance floors for micro_concentrated records and damp direction‑aware logit shifts when sum_spend is small and/or model_disagreement is nontrivial.
+  5. Fix NaN handling/imputation + missing indicators and surface them to calibrator and novelty scoring.
+
+1) What specific metric/pattern signals led to this error?
+- Pattern signals present for 0103_01:
+  - n == 1 (single record in batch).
+  - sum_spend = 17 (very low; below micro threshold S_low).
+  - top1_share ≈ 1.0 (VRDeck is the only channel with spend).
+  - num_nonzero_channels = 1.
+  - pattern_type (as previously defined) → concentrated_top1, but not flagged separately as micro_concentrated until now.
+  - FoodCourt = NaN → missing_indicator_high (increased novelty_score).
+  - N_subslice (ordered_top1 × Age_bucket × Destination × CryoSleep) likely < min_n_by_pattern (subslice untrusted).
+  - pooled_prior biased by global marginal toward False (no channel‑specific low‑sum pooling), and calibrator lacked micro_concentrated × context interactions.
+  - SE floors too low for micro_concentrated patterns (no dedicated floor), resulting in overconfident logit and an auto decision.
+- Measurable pre‑decision risk rules (should flag this case):
+  - (sum_spend ≤ S_low) AND top1_share ≥ 0.75 AND num_nonzero_channels ≤ 2 AND n==1 → micro_concentrated risk.
+  - novelty_score ≥ 0.65 OR missing_feature_count ≥ 1.
+  - Trusted_subslice == False OR N_subslice < min_n_by_pattern.
+  - |pooled_prior − p_ens| > 0.20 OR model_disagreement ≥ 0.10.
+
+2) How should the decision rules be modified to prevent similar errors?
+- New pattern detection and symmetry:
+  - Define micro_concentrated_flag when:
+    - 0 < sum_spend ≤ S_low (S_low = 50 by default; sweepable 10–100)
+    - top1_share ≥ T_mc (T_mc = 0.75; sweepable 0.60–0.90)
+    - num_nonzero_channels ≤ 2
+  - Treat micro_concentrated as its own pattern_type and include it in symmetric small‑batch gating.
+- Symmetric n==1 gating (updated):
+  - If n==1 AND pattern_type ∈ {zero_spend, concentrated_top1, concentrated_top2, concentrated_top3, micro_concentrated} AND NOT Trusted_subslice:
+    - Route to priority_audit (no auto_accept/auto_reject) unless extreme multi‑model consensus (see below).
+  - Extreme consensus short‑circuit:
+    - extreme_accept_threshold[pattern] (e.g., micro: 0.999) AND ensemble_agreement ≥ agreement_threshold → auto_accept.
+    - extreme_reject_threshold analogous for auto_reject.
+- Direction‑aware logit_shift update (pre‑calibration):
+  - Add sum_spend damping to prevent strong shifts on micro sums:
+    - sum_damp = min(1.0, max(sum_spend / S_damp, ε)), with S_damp = 200 (sweepable) and ε = 0.05 to avoid zeroing entirely.
+  - Keep model_disagreement damping (w_dis = 0.80).
+  - Revised logit_shift:
+    - pooled_prior → polarity = 2*pooled_prior − 1
+    - δ_logit_pattern initial set (updates):
+      - concentrated K1: 0.70 (reduced from 0.75)
+      - K2: 0.60
+      - K3: 0.50
+      - zero: 0.70
+      - micro_concentrated: 0.40 (new, conservative)
+    - novelty_scale = (1 − min(novelty_score, 0.95))
+    - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+    - logit_shift = polarity * δ_logit_pattern[pattern] * novelty_scale * dis_damp * sum_damp
+    - Clip |logit_shift| ≤ δ_logit_pattern[pattern]
+  - Rationale: small sums should reduce shift magnitude strongly; micro_concentrated δ is small because the amount spent is tiny and cannot justify large shifts without contextual evidence.
+- Auto_accept / auto_reject guard (updated):
+  - Require all three to auto_accept:
+    - p_final ≥ accept_threshold (pattern/trusted dependent)
+    - se_combined ≤ accept_se_max
+    - ensemble_agreement ≥ agreement_threshold_for_accept
+  - Otherwise route to audit. For micro_concentrated, set stricter se and agreement requirements.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Low absolute spend + single-channel concentration (micro_concentrated) is not equivalent to zero_spend nor to large concentrated spends; it is its own semantic pattern and may be predictive in particular contexts (e.g., channel-specific promotions, VRDeck targeted activity for certain age groups/destinations).
+- Missingness (NaN) in some channels can increase novelty but also be a data collection artifact. Always surface missingness as a feature and do not conflate it with zero_spend without provenance.
+- Batch size n==1 continues to amplify prior bias; untrusted subslices cause the system to lean on global priors, which can be misleading for micro patterns. Conservative gating must include micro_concentrated.
+- Channel‑specific behaviors matter: some channels (VRDeck, Spa, etc.) have different predictive value at low spend — channel-level priors are necessary.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Add pattern & sum_spend-aware SE floors (new / revised):
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor = {K1:0.10, K2:0.09, K3:0.13}
+  - zero_nontrusted_floor = 0.12
+  - micro_concentrated_nontrusted_floor = 0.15 (new)
+  - multi_channel_nontrusted_floor = 0.09
+  - extreme_novelty_floor = 0.14
+- Variance model (expanded):
+  - var_slice ≈ μ_subslice*(1−μ_subslice)/(N_subslice + 1)
+  - var_channel ≈ μ_channel*(1−μ_channel)/(N_channel + 1)
+  - var_pattern uses κ_pattern scaled by (1 − sum_spend_norm) and spend_entropy: var_pattern = κ_pattern * (1 + (1 − sum_spend_norm)) * (1 + (1 − spend_entropy))
+  - var_novelty_conditional = κ_novelty * novelty_score^2 (strong if subslice untrusted)
+  - var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern + β_channel*var_channel
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- z_adj changes: penalize low sum_spend (increases acceptance z threshold):
+  - z_adj = base_z * (1 + γ_FP*FP_risk + γ_dis*model_disagreement + γ_nov*novelty_score + γ_sum_low*(1 − min(sum_spend/S_norm, 1))) * (1 − λ_trust_if_trusted)
+  - Example γ_sum_low = 0.8; S_norm = 200.
+- Calibrator must return p_final_mean and p_final_uncertainty (quantiles) so decisions incorporate uncertainty.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Treat micro_concentrated as first‑class pattern in slice_trust_table and calibrator; include sum_spend_bucket in slice keys so pooled_priors are contextually correct across batches.
+- Enforce symmetric small‑batch gating across zero_spend, concentrated_topK, micro_concentrated when subslice untrusted (reduce inconsistent auto decisions between batches).
+- Pin snapshot_id for entire batch and log per‑record provenance (applied_logit_shift, pooled_prior components, N_subslice, N_channel, model_disagreement). That avoids batch‑to‑batch drift due to changing slices mid‑batch.
+- Improve deterministic scorer: direction‑aware shifts, variance floors, and gating should be driven by the same config snapshot per batch.
+- Standardize NaN imputation and missing indicators across batches to avoid per-batch inconsistencies.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- Add three new monitoring slices and canaries:
+  - micro_concentrated ECE / Brier / FN rate (sum_spend buckets ≤ S_low).
+  - per‑channel, low_sum ECE (VRDeck_low_sum, Spa_low_sum, etc.).
+  - n==1 audit routing fraction and time‑to‑trust.
+- Calibrator & GLM improvements:
+  - Train a covariate‑aware calibrator that outputs predictive uncertainty (LightGBM quantile ensemble or small Bayesian NN). Inputs must include sum_spend_bucket and top1_channel_id.
+  - Grouped CV by ordered_topK_id and micro_concentrated keys to avoid leakage.
+- AL sampling: prioritize cases where micro_concentrated prediction contradicts label (pred False / actual True) and high novelty. Fast‑label these into slice_trust_table to reach min_n_by_pattern faster.
+- Slice_trust_table: include channel-level aggregates and sum_spend_bucket dimension (key examples below).
+- CI tests: add micro_concentrated tests (including 0103_01) as mandatory regressions to ensure gating and audit routing fire.
+
+COMPLETE technical updates (deterministic, ready‑to‑implement)
+
+A. New/changed pattern definitions
+- zero_spend_flag: sum_spend == 0
+- concentrated_topK: as before (ordered topK shares)
+- micro_concentrated_flag (new): 0 < sum_spend ≤ S_low AND top1_share ≥ T_mc AND num_nonzero_channels ≤ 2
+  - S_low = 50 (sweepable 10–100)
+  - T_mc = 0.75 (sweepable 0.60–0.90)
+
+B. Revised hierarchical pooling & pooled_prior
+- Add channel priors:
+  - μ_channel, N_channel per channel (VRDeck, Spa, etc.)
+  - τ_channel (default 120; sweepable 40–300)
+- pooled_prior (extended):
+  - pooled_prior = (τ_pattern * μ_global + τ_channel * μ_channel + N_subslice * μ_subslice) / (τ_pattern + τ_channel + N_subslice)
+  - τ_pattern values increased slightly for micro pattern (to avoid overfitting tiny subslices): τ_micro = 320 (sweepable)
+- min_n_by_pattern add micro:
+  - min_n_by_pattern_micro = 80 (sweepable 40–160)
+- τ_pattern updates:
+  - K1:100, K2:160, K3:220, zero:260, micro:320
+
+C. Calibrator & GLM fallback (retrain plan)
+- Retrain GLM_fallback v16 → v16.1 with explicit interactions:
+  - zero_spend × CryoSleep × Age_bucket × HomePlanet
+  - ordered_topK × top1_channel × sum_spend_bucket × Age_bucket × Destination
+  - micro_concentrated × top1_channel × Age_bucket × Destination × CryoSleep
+- Train covariate calibrator (LightGBM quantile ensemble recommended) to return p_mean and p_10/p_90 or std. Use grouped CV by ordered_topK_id and ordered_topK_id × sum_spend_bucket.
+- Inputs (minimal): p_after_logit_shift, pattern_type, top1_channel_id, top1_share, sum_spend_bucket, num_nonzero_channels, spend_entropy, novelty_score, pooled_prior, N_subslice, N_channel, model_disagreement, CryoSleep, Age_bucket, HomePlanet, Cabin_deck, Destination, missing_count.
+- Output: p_final_mean, p_final_uncertainty (sd or quantiles).
+
+D. Direction‑aware logit_shift (final formula)
+- sum_damp = clamp(sum_spend / S_damp, ε, 1.0) where S_damp = 200, ε = 0.05
+- dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95)) with w_dis = 0.80
+- novelty_scale = (1 − min(novelty_score, 0.95))
+- logit_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp (clipped)
+- δ_pattern set: {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40}
+
+E. SE / variance floors (updated)
+- trusted_slice_floor = 0.02
+- concentrated_nontrusted_floor = {K1:0.10, K2:0.09, K3:0.13}
+- zero_nontrusted_floor = 0.12
+- micro_concentrated_nontrusted_floor = 0.15
+- multi_channel_nontrusted_floor = 0.09
+- extreme_novelty_floor = 0.14
+
+F. Decision gating (pseudocode)
+- If Trusted_subslice and p_final ≥ accept_threshold_trusted and se_combined ≤ accept_se_max → auto_accept.
+- Else if n==1 and pattern_type ∈ {zero_spend, concentrated_topK, micro_concentrated} and NOT Trusted_subslice:
+  - If p_final ≥ extreme_accept_threshold[pattern] AND ensemble_agreement ≥ agreement_threshold → auto_accept
+  - Else if p_final ≤ extreme_reject_threshold[pattern] AND ensemble_agreement ≥ agreement_threshold → auto_reject
+  - Else → priority_audit
+- Else apply standard thresholding with z_adj and p_final_uncertainty; if insufficient confidence route to audit.
+
+G. Hyperparameters (v3.6.1 initial; sweepable)
+- S_low = 50 (10–100)
+- T_mc = 0.75 (0.60–0.90)
+- S_damp = 200 (100–500)
+- min_n_by_pattern: {K1:50, K2:30, K3:40, zero:60, micro:80}
+- τ_pattern: {K1:100, K2:160, K3:220, zero:260, micro:320}
+- τ_channel = 120 (40–300)
+- δ_logit_pattern = {K1:0.70, K2:0.60, K3:0.50, zero:0.70, micro:0.40}
+- micro_concentrated_nontrusted_floor = 0.15 (0.10–0.25)
+- extreme_accept_threshold_micro = 0.999
+- agreement_threshold = 0.98
+- w_dis = 0.80
+- γ_sum_low = 0.8 in z_adj
+
+H. CI tests, validation experiments & acceptance criteria
+- CI test matrix additions:
+  - M1: 0103_01 (micro_concentrated, n==1, untrusted subslice) → expected: priority_audit (not auto_reject).
+  - M2: micro_concentrated trusted subslice → standard thresholding allowed.
+  - M3: concentrated_top1 untrusted, n==1 (0102_01) → priority_audit (not auto_accept).
+  - Existing tests (0099_01, 0099_02, 0101_01) remain mandatory.
+- Validation experiments:
+  - Retrain calibrator with grouped CV; test on historical micro_concentrated FNs and concentrated_top1 FPs.
+  - Shadow deploy updated scorer (symmetric gating + micro handling): measure audit queue size, change in per‑pattern FNs/FPs.
+- Acceptance targets vs v3.5.8 baseline:
+  - micro_concentrated FN rate: ≥40% relative reduction on historical micro FN cases (target).
+  - concentrated_top1 FP rate: ≥25% relative reduction.
+  - zero_spend FN rate: ≥30% relative reduction.
+  - overall FN increase ≤3% absolute (aim ≤1%).
+  - Audit queue ≤1.5× baseline for first 2 weeks, with trend to baseline as subslices accumulate.
+
+I. Monitoring & alerting updates
+- New dashboards & canaries:
+  - micro_concentrated ECE, Brier, precision/recall.
+  - per‑channel, low_sum (≤S_low) ECE and FN/FP rates (e.g., VRDeck_low_sum).
+  - n==1 FP/FN rate, fraction routed to audit, time‑to‑trust.
+  - Ensemble agreement & model_disagreement histograms.
+  - Missing_count impact and NaN imputation health.
+- Alerts:
+  - micro_concentrated FN rate > 20% above baseline for 24h → block auto_reject/auto_accept for micro_concentrated.
+  - concentrated_top1 FP rate > 20% → block auto_accept for concentrated_top1 until investigated.
+  - n==1 audit routing fraction falling below expected (indicating gating broken) → immediate alert.
+
+J. Immediate operational actions (0–72 hours)
+1. Engineering:
+   - Implement micro_concentrated detector; add sum_spend_bucket, top1_channel_id, missing_count to daily rollups & feature store.
+   - Fix NaN handling: impute zeros but include missing indicators; ensure consistent handling across batch snapshots.
+   - Update slice_trust_table schema to include sum_spend_bucket and top1_channel_id as keys for aggregation; seed with historical counts.
+2. Scoring engine (stopgap / shadow):
+   - Enforce symmetric n==1 gating for zero_spend, concentrated_topK and micro_concentrated (route to priority_audit).
+   - Add sum_damp to logit_shift and raise micro SE floor to 0.15.
+   - Persist per‑record provenance fields (including missing_count).
+   - Shadow this scorer across recent batches (include 0099_01, 0099_02, 0101_01, 0102_01, 0103_01).
+3. ML:
+   - Retrain GLM_fallback (interactions described) and covariate calibrator (quantile outputs). Grouped CV by ordered_topK_id and micro_concentrated keys.
+   - Prepare AL sampling prioritized for micro_concentrated contradictions and concentrated_top1 contradictions.
+4. Ops & Monitoring:
+   - Activate new canaries and dashboard widgets for micro_concentrated and per‑channel low_sum slices.
+   - Block full live rollout until shadow & canaries meet acceptance criteria.
+5. Product / Auditing:
+   - Fast‑labeling path for priority contradictions (micro_concentrated predictions that disagree with labels).
+   - Triage to collect labels to accelerate subslice growth for micro_concentrated keys.
+
+Deliverables (next artifacts; priority order)
+1. Deterministic scorer skeleton (v3.6.1) implementing:
+   - micro_concentrated detection + ordered_topK hashing + sum_spend_bucket
+   - symmetric n==1 gating (audit routing)
+   - direction‑aware logit_shift with sum_damp and model_disagreement damping
+   - raised SE floors for micro_concentrated and per‑record provenance logging
+   - snapshotable config for batch processing
+2. Minimal CI test suite including 0099_01, 0099_02, 0098_02, 0101_01, 0102_01 and new 0103_01.
+3. zero_subslice + ordered_topK + channel_low_sum aggregation script + updated slice_trust_table schema seeded with historical aggregates.
+4. GLM_fallback v16.1 + covariate calibrator retrain plan & validation report (grouped CV).
+5. Dashboards & canary configuration for micro_concentrated, per‑channel low_sum slices, and n==1 metrics.
+6. AL sampling plan for micro_concentrated & concentrated_top1 contradictions.
+
+CI test examples (explicit expected outcomes)
+- 0103_01 (micro_concentrated, untrusted) → priority_audit (not auto_reject).
+- 0102_01 (concentrated_top1 untrusted) → priority_audit (not auto_accept).
+- 0101_01 (zero_spend untrusted) → priority_audit (not auto_reject).
+- Trusted subslice versions of these → allow normal thresholding.
+
+One‑line summary
+v3.6.1: Add micro_concentrated pattern handling + channel‑aware pooling, enforce symmetric n==1 gating for zero_spend/concentrated/micro patterns (route untrusted cases to audit), damp logit_shifts for low sum_spend and high disagreement, raise micro SE floors, retrain covariate calibrator with sum_spend×channel×context interactions — preventing FNs like 0101_01 and 0103_01 and FPs like 0102_01 while preserving batch consistency.
+
+Recommended next artifact to prepare first
+- Produce the deterministic scorer skeleton + minimal CI tests (high priority). This is shadowable and yields immediate protection (symmetric gating + micro pattern detection + provenance logging + raised floors). In parallel, seed the updated slice_trust_table aggregation script and start retraining the calibrator/GLM_fallback.
+
+If helpful, I can:
+- produce the deterministic scorer skeleton + minimal CI tests now (recommended immediate step), or
+- produce the zero_subslice + channel_low_sum aggregation script + updated slice_trust_table schema in parallel.
+
+Which should I prepare first?
+
+============================================================

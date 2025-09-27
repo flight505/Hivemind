@@ -1,0 +1,314 @@
+PREDICTIVE METRICS - ITERATION 92
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): The batch of 2 produced two opposite edge errors:
+  - 0114_01 (previously triaged): predicted True but label=False (FP). Root cause previously analyzed: dispersed but borderline-high spend pattern treated as high-confidence positive.
+  - 0115_01 (new): predicted False but label=True (FN). Snapshot: all spend channels zero or missing (sum_spend=0), CryoSleep NaN, VRDeck NaN, HomePlanet=Mars, Age=26, batch n==1. The scorer treated the all-zero / missingness pattern as a strong negative signal and produced a confident negative prediction; fallback/gating did not catch it.
+- Immediate implication: two different edge patterns (dispersed-borderline-high and all-zero/missingness) both escaped robust gating and variance handling in n==1 small-batch situations. We must (A) make spend-pattern and missingness first-class, (B) increase uncertainty for fragile slices, and (C) harden n==1 & small-batch gating with per-slice consistency checks and fallback/ensemble requirements.
+- Top priorities (0–72h):
+  1. Add missingness/all-zero detection: all_zero_flag, missingness_count, cryo_imputed_flag, missing_feature_patterns; implement small-batch_stopgap for all_zero + missingness combos.
+  2. Keep and extend v3.11.1 changes (dispersion detection, borderline_sum_flag, var_dispersion, var_borderline) and add var_missingness/var_all_zero.
+  3. Expand pooled_prior & GLM_fallback to include spendpattern × Age_bucket × HomePlanet × missingness interactions.
+  4. Harden n==1 gating: both borderline_multichannel_high and all_zero_missing patterns should route to audit unless strong per-slice consistency AND GLM_fallback/ensemble consensus exist.
+  5. Retrain calibrator/GLM_fallback with missingness and all_zero upweighting; shadow-run before promotion.
+  6. Add canaries for 0114_01 and 0115_01 (NO auto-accept/reject by default).
+
+Direct answers to the six requested questions (concise)
+1) Signals that led to these errors
+   - 0114_01 (FP): sum_spend ≈ 907 (near S_high=1000), dispersed across 5 channels (top1_share≈0.473). Model over-weighted aggregate spend while lacking dispersion features & pooled_prior interactions; variance underestimated.
+   - 0115_01 (FN): sum_spend = 0, num_nonzero_channels = 0, CryoSleep = NaN, VRDeck = NaN. The scorer treated imputed/missing & zero-spend as strong negative. GLM_fallback & pooled_prior lacked per-slice priors for all_zero × HomePlanet × Age. se_combined low → auto-decision.
+   - Common: both occurred in n==1 batch and escaped stricter gating.
+
+2) Decision-rule changes to prevent recurrence
+   - Implement feature detection:
+     - borderline_sum_flag (existing), dispersion_high (existing), all_zero_flag = (sum_spend == 0 AND num_nonzero_channels == 0).
+     - missingness_pattern codes (e.g., cryo_missing, vrdeck_missing, name_missing).
+   - Gating (pattern-aware pseudocode):
+     - If n==1:
+         - If absolute_concentrated_high: existing v3.11.0 rules.
+         - If borderline_multichannel_high: require strong_dispersion_consistency AND (ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06) OR (GLM_fallback_agrees AND pooled_prior directionality consistent) else priority_audit.
+         - If all_zero_flag OR cryo_missing combinations:
+             - If strong_zero_consistency (consistency_zero ≥ 0.80 & N_zero_samples ≥ 15): allow auto-decision only if (ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06) AND GLM_fallback agrees.
+             - Else: priority_audit.
+     - If n ≤ 3: similar but slightly stricter thresholds (agreement +0.002, se −0.01).
+     - For any pattern with high pooled_prior novelty_score or low N subslice: route to audit.
+   - Always persist gating_reasons.
+
+3) New pattern insights
+   - Dispersed high spenders vs concentrated high spenders: opposite label polarities exist and must be separated.
+   - All-zero spenders are heterogeneous: some zero spenders (often with missing CryoSleep or certain HomePlanet/Age combos) can have positive labels — missingness itself can carry informative signal and needs explicit modeling.
+   - Batch size matters: n==1 and small n increase fragility; pooled priors and variance must compensate or gating must block auto-decisions.
+   - HomePlanet (e.g., Mars) and missingness interactions are under-captured in current pooled priors.
+
+4) Confidence recalibration summary
+   - Add new variance terms: var_dispersion, var_borderline, var_missingness, var_all_zero.
+   - Example forms:
+     - var_missingness = κ_miss * missingness_count * (1 − zero_consistency_score) * novelty_scale
+     - var_all_zero = κ_zero * (1 − consistency_zero) * log(1 + sum_imputed_features)
+   - Dynamic SE floors (examples):
+     - dispersed_borderline & weak_consistency → se_floor = 0.20–0.25
+     - all_zero & weak_consistency → se_floor = 0.25–0.30
+     - dispersed_borderline & strong_consistency → se_floor = 0.07
+     - concentrated_consistent → se_floor = 0.06
+   - Retrain calibrator to output p10/p50/p90 and sd, include spend_entropy_norm, num_nonzero_channels, topk_shares, borderline_sum_flag, all_zero_flag, missingness features, and ensemble_agreement.
+
+5) Consistency adjustments
+   - Standardize detection of spend patterns and missingness across scorer, pooled_prior, calibrator, GLM_fallback, and gating.
+   - Create slice_trust_table entries for:
+     - borderline_multichannel_high × (top1_channel × Age_bucket × HomePlanet)
+     - all_zero × (HomePlanet × Age_bucket × Cabin_deck)
+   - Persist per-record provenance for these features and gating reasons.
+
+6) Metric improvements for edge cases
+   - New slices to monitor and report:
+     - borderline_multichannel_high per top1_channel (ECE, Brier, FP/FN, contradiction_count).
+     - all_zero_missing per (HomePlanet × Age_bucket × cryo_missing).
+     - n==1 auto_accept_rate per slice.
+   - CI canaries: add 0114_01 and 0115_01 with NO auto-accept/reject expectation (default priority_audit).
+   - Active labeling: prioritize all_zero contradictions and borderline_multichannel contradictions.
+
+Detailed failure chains — per-record (what went wrong, why)
+- 0114_01 (recap)
+  - Snapshot highlights:
+    - sum_spend = 907 (borderline), num_nonzero_channels = 5, top1_share ≈ 0.473, borderline_sum_flag = True, dispersion_high = True, n_batch = 1.
+  - Failure chain:
+    - Scorer gave weight to sum_spend → strong positive.
+    - No explicit dispersion feature in pooled_prior/GLM_fallback → positive pooled_prior contribution.
+    - Variance lacked var_dispersion/var_borderline → se_combined low; gating allowed auto-accept.
+    - Result: confident FP.
+  - Fixes: see v3.11.1 recommendations (dispersion features, pooled_prior interactions, var_dispersion/var_borderline, new gating).
+
+- 0115_01 (new FN error)
+  - Snapshot:
+    - PassengerId: 0115_01
+    - HomePlanet: Mars
+    - CryoSleep: NaN (missing)
+    - Cabin: F/24/P
+    - Destination: TRAPPIST-1e
+    - Age: 26.0
+    - VIP: False
+    - RoomService/FoodCourt/ShoppingMall/Spa = 0.0
+    - VRDeck = NaN
+    - sum_spend = 0.0
+    - num_nonzero_channels = 0
+    - all_zero_flag = True
+    - missingness_count ≥ 2 (cryo + vrdeck)
+    - n_batch = 1
+  - Failure chain (why predicted False, actual True):
+    1. Scorer treated all_zero_flag and missingness as strong negative features (historically many zero-spenders are negative), producing a negative base logit.
+    2. Pooled_prior lacked zero_pattern × HomePlanet × Age interactions (Mars × Age26 × all_zero) — if historical positive tendency exists for this subslice it was not injected.
+    3. GLM_fallback/calibrator lacked missingness-aware features and was likely aligned with the main scorer (or the ensemble disagreed but se_combined low).
+    4. Variance model lacked var_missingness/var_all_zero → se_combined underestimated uncertainty and gating allowed auto-decision.
+    5. Outcome: confident FN for an edge case.
+  - Immediate triage actions:
+    - Mark 0115_01 as canary and add to active-label queue.
+    - Inspect pooled_prior components used and fallback output.
+    - If channel_consistency_zero < threshold OR pooled_prior incomplete → add to priority_audit and seed for training.
+
+Revised pattern & signal definitions (v3.11.2; first-class additions)
+- all_zero_flag: sum_spend == 0 AND num_nonzero_channels == 0.
+- missingness_profile: vector of booleans for key fields (cryo_missing, vrdeck_missing, name_missing, cabin_missing).
+- zero_subpattern buckets: all_zero × HomePlanet × Age_bucket × Cabin_deck.
+- borderline_multichannel_high (as in v3.11.1): dispersed_high AND borderline_sum_flag.
+- spend_entropy_norm, num_nonzero_channels, topk_shares (existing), plus:
+  - zero_consistency_score = (α + pos_count_zero) / (α + pos_count_zero + neg_count_zero), α default = 20.
+
+Channel-aware pooled_prior (v3.11.2)
+- Extend pooled_prior to include:
+  - μ_channel_spendpattern_age (existing)
+  - μ_zero_pattern_homeplanet_age (new)
+  - μ_missingness_pattern_homeplanet_age
+- Rationale: inject local directionality for both dispersed-borderline and all_zero/missing patterns for n==1 cases.
+
+Direction-aware, pattern-adaptive logit_shift (v3.11.2)
+- Extend shift fractions with zero_shift_frac:
+  - zero_shift_frac = clamp(base_zero_shift_frac + w_zero_dir*(zero_consistency_score − 0.5)*2 + w_zero_miss*(missingness_count/num_important_fields), min, max)
+  - If all_zero_flag & weak_zero_consistency → damp shift to near-zero.
+- Raw_shift pipeline identical to v3.11.1 but pattern_damp selects conc_shift_frac / disp_shift_frac / zero_shift_frac.
+
+VARIANCE / SE MODEL (explicit additions)
+- New variance terms:
+  - var_missingness = κ_miss * missingness_count * novelty_scale * (1 − zero_consistency_score)
+  - var_all_zero = κ_zero * (1 − zero_consistency_score) * sqrt(1 + sum_imputed_features)
+- Combined var_combined = existing_terms + var_top1_share + var_dispersion + var_borderline + var_missingness + var_all_zero.
+- se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Dynamic SE floors (examples):
+  - dispersed_borderline & weak_consistency → floor = 0.20
+  - all_zero & weak_consistency → floor = 0.25–0.30
+  - all_zero & strong_consistency → floor = 0.07
+  - concentrated_abs & strong_consistency → floor = 0.06
+
+DECISION GATING (coherent, pattern-aware; updated)
+- New gating tiers (high-level):
+  1. Trusted_subslice pass → existing auto_accept rules (unchanged).
+  2. n == 1 patterns:
+      - absolute_concentrated_high: v3.11.0 behavior retained.
+      - borderline_multichannel_high: v3.11.1 rules (strong_dispersion_consistency required).
+      - all_zero_flag / missingness_profile:
+           - If zero_consistency_score ≥ C_high and N_zero_samples ≥ N_min_zero_samples:
+               - allow auto-decision only if (ensemble_agreement ≥ dispersed_consistent_agreement (0.995) AND se_combined ≤ accept_se_max_trusted (0.06)) AND GLM_fallback agrees.
+           - Else → priority_audit.
+  3. n ≤ 3: require GLM_fallback agreement AND ensemble_agreement ≥ 0.997 AND se_combined ≤ 0.05 OR route to audit.
+  4. Always persist gating_reasons; never auto-decide on pattern slices with contradictory pooled_prior or low sample counts.
+
+Calibrator & GLM_fallback retrain plan (24–72h)
+- Calibrator:
+  - Outputs: p10/p50/p90 and sd.
+  - New features: all_zero_flag, missingness_profile, spend_entropy_norm, num_nonzero_channels, top1_share/top2/top3, borderline_sum_flag, normalized_spend_by_channel, concentration_type, zero_consistency_score, p_after_logit_shift, ensemble_agreement.
+  - Loss: quantile loss + ECE regularizer; upweight contradictions in all_zero & borderline_multichannel slices (weight multiplier 3–5 depending on slice).
+  - CV grouping: by (top1_channel, spend_pattern_bucket, HomePlanet, all_zero_flag).
+- GLM_fallback:
+  - Add interactions: zero_flag × HomePlanet × Age_bucket; missingness_profile interactions; top1_channel × spendpattern × Age_bucket × HomePlanet.
+  - Regularization: elastic net; monitor coefficient sign stability for new interaction terms.
+- Acceptance targets:
+  - Reduce contradictions in all_zero slice by ≥30–40% on holdout; reduce borderline_multichannel contradictions by ≥30–40%.
+  - Calibrator must produce credible p10/p90 spreads for these slices reflecting the increased uncertainty.
+
+Monitoring, metrics & alerts (what to add)
+- Slice monitors:
+  - all_zero_missing per (HomePlanet × Age_bucket × cryo_missing): ECE, Brier, FP, FN, contradiction counts.
+  - borderline_multichannel_high per top1_channel: ECE, Brier, FP/FN.
+  - n==1 routing: fraction auto_accepted vs routed_to_audit per slice.
+  - zero_consistency_score drift & N_zero_samples.
+- Alerts:
+  - all_zero_missing FP rate > 20% above baseline for any (HomePlanet × Age_bucket) over 24h → block auto_accept + alert.
+  - all_zero_missing FN rate > 15% above baseline over 24h → block auto_reject + urgent triage.
+  - borderline_multichannel_high FP/FN thresholds same as v3.11.1.
+  - sudden spike in cryo_missing occurrences → alert.
+- Dashboards:
+  - spendpattern heatmap with audit inflow and outcomes; separate heatmap for zero/missingness slices.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- CI canaries:
+  - 0114_01: default = priority_audit (NO auto-accept). Conditional auto-decision only if channel_consistency_disp ≥ 0.80 AND GLM_fallback agrees.
+  - 0115_01: default = priority_audit (NO auto-reject/accept). Conditional auto-decision only if zero_consistency_score ≥ 0.80 AND GLM_fallback agrees.
+  - Existing canaries retained/updated.
+- Validation experiments:
+  - Retrain calibrator & GLM_fallback; shadow-run for 14 days on live traffic slices enriched for borderlines and all_zero; track audit queue size, contradictions, and targeted metric improvements.
+- Acceptance targets (vs baseline):
+  - all_zero contradictions: ≥30–40% relative reduction.
+  - borderline_multichannel contradictions: ≥30–40% relative reduction.
+  - overall FN increase ≤ 3 percentage points absolute (target ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+
+Operational actions (0–72 hours) — prioritized
+1. Engineering (0–24h):
+   - Implement all_zero_flag, missingness_profile, cryo_imputed_flag; persist these fields.
+   - Implement stopgap gating: n==1 & (borderline_multichannel_high OR all_zero_missingness) → priority_audit unless channel_consistency high & fallback/consensus criteria met.
+   - Persist gating_reasons and per-record provenance (see below).
+2. Scoring engine (24–48h; shadow):
+   - Add var_missingness and var_all_zero into variance calc; add disp_shift_frac and zero_shift_frac logic; expose per-record raw_shift components.
+3. ML (24–72h):
+   - Retrain GLM_fallback & calibrator including missingness & all_zero features; upweight contradictions; run grouped CV and check sign stability.
+   - Seed active-label queue for all_zero contradictions.
+4. Ops & Monitoring (24–72h):
+   - Deploy dashboards and canaries (0113_01, 0114_01, 0115_01) and alerts; shadow-run ≥72h before promotion.
+5. Product / Audit (24–72h):
+   - Fast-label workflow for priority_audit records; provide triage UI showing spendpattern and missingness provenance.
+6. Release criteria:
+   - Shadow metrics meet acceptance targets; audit queue manageable.
+
+Per-record provenance to log (required additions)
+- concentration_type {none, absolute, relative}
+- dispersion_type {none, dispersed_borderline, dispersed_high}
+- borderline_sum_flag (bool)
+- all_zero_flag (bool)
+- missingness_profile vector: cryo_missing, vrdeck_missing, name_missing, etc.
+- missingness_count (int)
+- spend_entropy_norm
+- num_nonzero_channels
+- top1_share, top2_share, top3_share
+- normalized_spend_by_channel
+- channel_S_high_used (quantile and timestamp)
+- zero_consistency_score, channel_consistency_score_abs/rel/disp
+- N_conc_samples_abs, N_conc_samples_rel, N_disp_samples, N_zero_samples
+- conc_shift_frac_used, disp_shift_frac_used, zero_shift_frac_used (value and formula version)
+- μ_channel_homeplanet_age_spendpattern components and τ weights
+- var_top1_share, var_rel_concentration, var_dispersion, var_borderline, var_missingness, var_all_zero
+- GLM_fallback_probs, GLM_fallback_agreement_flag
+- p10/p50/p90, p_final_sd
+- gating_reasons (explicit codes, e.g., 'borderline_multichannel_stopgap', 'all_zero_missing_stopgap')
+- scorer_version, pooled_prior_snapshot_id, channel_S_high_snapshot_id
+
+Updated hyperparameters (v3.11.2 initial; sweepable)
+- Keep prior v3.11.1 hyperparams; add:
+  - base_zero_shift_frac = 0.40
+  - w_zero_dir = 0.35
+  - w_zero_miss = 0.20
+  - κ_miss = 0.05
+  - κ_zero = 0.045
+  - N_min_zero_samples = 15
+  - zero_consistency_high (Z_high) = 0.80
+  - all_zero_weak_se_floor = 0.25
+  - all_zero_strong_se_floor = 0.07
+
+CI TESTS (explicit expected outcomes; include 0115_01)
+- Canaries:
+  - 0115_01 (all_zero, cryo_missing, Mars Age 26): NO auto-decision; expect gating_reasons include 'all_zero_missing_stopgap'. Conditional auto-decision allowed only if zero_consistency_score ≥ 0.80 AND GLM_fallback agrees.
+  - 0114_01 (multi-channel borderline): NO auto-accept by default; as before.
+  - Maintain existing canaries.
+- Tests:
+  - Confirm that when zero_consistency_score is low and N_zero_samples < threshold, records are routed to audit.
+  - Confirm se_combined increases for all_zero & borderline records in shadow.
+
+Monitoring & Alerting (exact triggers)
+- For each HomePlanet × Age_bucket:
+  - all_zero_missing FP rate > 20% above baseline over 24h → block auto_accept + alert.
+  - all_zero_missing FN rate > 15% above baseline over 24h → block auto_reject + urgent triage.
+  - zero_consistency_score drop > 0.1 over 7 days → retrain flag.
+- For top1_channel:
+  - borderline_multichannel_high FP rate > 20% above baseline over 24h → block auto_accept for that channel + alert.
+- n==1 audit routing fraction below expected → alert.
+
+Acceptance criteria (post-shadow -> live)
+- all_zero contradictions: ≥30–40% relative reduction across top slices.
+- borderline_multichannel contradictions: ≥30–40% relative reduction.
+- overall FN increase ≤ 3% absolute (target ≤1).
+- Audit queue ≤1.5× baseline for first 2 weeks, trending down.
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.11.2) implementing:
+   - all_zero_flag, missingness_profile, spend_entropy, num_nonzero_channels, topk_shares, borderline_sum_flag ingestion
+   - channel-adaptive conc_shift_frac, disp_shift_frac, zero_shift_frac
+   - var_dispersion, var_borderline, var_missingness, var_all_zero
+   - n==1 stopgap gating for borderline_multichannel_high & all_zero_missingness + provenance logging
+2. CI updates adding 0114_01 and 0115_01 and updating 0113_01 expectations.
+3. Slice_trust_table seeding with per-slice consistency metrics including zero_consistency_score.
+4. GLM_fallback + calibrator retrain plan + grouped CV validation report (quantile outputs).
+5. Dashboards & canary configuration for spendpattern and zero/missingness slices.
+6. Active learning labeling plan for all_zero & borderline contradictions.
+
+Quick triage checklist to run now for 0115_01 (operational)
+1. Confirm all_zero_flag and missingness_profile (cryo_missing=True, vrdeck_missing=True).
+2. Compute zero_consistency_score for (Mars, Age_bucket=25–29, Cabin_deck=F) over last 90 days.
+3. Inspect pooled_prior components used (was μ_zero_pattern_homeplanet_age present? what τ weights were used?).
+4. Inspect GLM_fallback output and agreement flag; if fallback missing missingness features, retrain ASAP.
+5. Inspect se_combined and var_missingness/var_all_zero (if available) and gating_reasons stored.
+6. If zero_consistency_score < Z_high or pooled_prior lacked zero interactions → mark for priority_audit + add to active-label queue and seed training sample.
+
+Why this will reduce batch errors going forward
+- Making spend-pattern and missingness first-class prevents conflating different causal slices (concentrated vs dispersed vs zero/missing) so signals cannot dominate incorrectly.
+- Adding pooled_prior interactions for spendpattern and zero/missing patterns injects local directionality into n==1 cases reducing blind reliance on global aggregates.
+- Adding var_missingness and var_all_zero increases uncertainty for fragile slices and avoids unsafe auto-decisions in small batches.
+- Hardened gating for n==1 and small n prevents overconfident decisions without consensus or sufficient provenance.
+- Persisting richer provenance accelerates triage and active learning to close the feedback loop.
+
+One-line corrective action recommendation (now)
+- Implement spend-pattern (concentration/dispersed) and missingness/all_zero detection + stronger n==1 stopgap gating (route borderline_multichannel_high and all_zero_missingness to priority_audit unless strong per-slice consistency AND GLM_fallback/near-perfect ensemble agreement); add 0114_01 and 0115_01 canaries to CI immediately.
+
+If you want, I will:
+- implement the deterministic scorer skeleton + CI updates (recommended immediate artifact) and run a 72h shadow with the new gating, or
+- produce the channel_S_high, zero_consistency seeding scripts and slice_trust_table update in parallel.
+
+Next recommended steps (immediate)
+1. Push the stopgap gating rules to production quickly (prevents further n==1 mistakes).
+2. Implement logging/provenance for missingness/all_zero and dispersion features.
+3. Retrain GLM_fallback & calibrator with the new features in shadow and run grouped CV focusing on all_zero & borderline slices.
+4. Shadow-run for 72h, inspect canary behaviors, then promote if acceptance targets met.
+
+If you'd like, I can produce:
+- the scorer skeleton implementation plan (API + feature definitions + provenance layout), or
+- the exact retrain specification (dataset selection, upweighting schema, CV folds, loss function modifications) for the calibrator and GLM_fallback.
+
+============================================================

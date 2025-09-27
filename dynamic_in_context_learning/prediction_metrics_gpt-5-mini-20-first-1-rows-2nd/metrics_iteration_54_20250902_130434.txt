@@ -1,0 +1,250 @@
+PREDICTIVE METRICS - ITERATION 54
+============================================================
+
+Updated Predictive Metrics Report — v3.4.3 (post_0078_01)
+
+Version & high‑level goal
+- Version: v3.4.3 (post_0078_01)
+- Goal: reconcile two failure families observed in recent batches:
+  1) False negatives caused by over‑conservative, channel‑only FP gating in undersampled channel×cluster slices (examples: 0074_01, 0076_01), and
+  2) False positives caused by ensemble over‑trust on concentrated multi‑channel spend patterns where specific channel pairs/combinations are historically noisy (example: 0078_01).
+- Strategy (what changed vs v3.4.2):
+  - Keep sample_count‑aware posterior+ensemble fusion (p_combined) but add pairwise (channel×channel) priors and absolute spend awareness.
+  - Add model_disagreement and channel_pair_FP_risk to decision logic so strong ensemble evidence is not blindly accepted when historical pairwise FP risk is high.
+  - Tighten and make symmetric Accept/RejectRisk rules; add contradiction→priority_audit routing.
+  - Provide updated calibration/uncertainty math that includes pairwise variance and model disagreement.
+
+Executive summary — immediate takeaway and top priorities
+- Immediate failure mode observed (new batch):
+  - Primary new error: 0078_01 predicted True (accept) but actual False (FP).
+    - Spend breakout: FoodCourt = 5840, VRDeck = 9654, Spa = 321, total_spend = 15,815.
+    - top1 = VRDeck (≈ 61%), top2_share ≈ 0.98 (very concentrated top2), spend_entropy low. This pattern looks like other concentrated patterns that previously led to FNs — but here the true label is False.
+  - Root tension: relaxing channel-only gating to recover FNs (v3.4.2) makes the scorer more likely to accept concentrated spend patterns — helpful for previously missed TPs but risky when specific channel pairs are historically noisy (FoodCourt+VRDeck).
+- Top priorities (deploy in order):
+  1. 0–48h (blockers): implement channel_pair posterior table and fast lookup; add pairwise FP_risk + new spend features to preprocessing; implement p_combined that incorporates channel_pair priors; shadow-run on recent batches including 0074_01, 0076_01, 0078_01.
+  2. 2–14d: retrain GLM with channel_pair interactions + absolute_spend features; retrain calibrators that include pairwise covariates; run stratified validation and tuned thresholds.
+  3. Weekly: active learning loop prioritizing contradiction cases (ensemble strong vs pair_FP_risk high) for human audits and weekly retraining.
+
+Detailed answers (six questions)
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Numeric recap (0078_01):
+  - RoomService = 0, FoodCourt = 5840, ShoppingMall = 0, Spa = 321, VRDeck = 9654 → total_spend ≈ 15,815.
+  - top_channel = VRDeck, top_contrib_share ≈ 0.61 (top band), top2_share ≈ 0.98 (very concentrated top2); spend_entropy low.
+  - Age 38, HomePlanet Europa, CryoSleep False.
+- How the metrics failed:
+  - Ensemble models (aggregator, GLM, SRM) strongly signaled transport because concentrated top2 + high absolute spends are often predictive.
+  - Channel priors (per‑channel posterior) were de‑weighted in p_combined due to the v3.4.x aim to avoid over‑shrinking in undersampled slices — this was good for recovering previous FNs.
+  - There was no explicit channel_pair prior or channel_pair variance in the decision logic. FoodCourt+VRDeck is a historically noisy combination in our logs (high FP rate). Without pairwise prior, the scorer relied on ensemble evidence alone.
+  - Model disagreement was low (models agreed) so the ensemble looked confident; no contradiction rule fired because the channel_pair evidence was missing, leading to an FP accept.
+- Net effect: removing/suppressing channel gating for undersampled channels improved recall in some slices but allowed FP increases in records where channel pair history, absolute spend, or cluster/demographic conditional priors would have warranted caution.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+Key principle: extend posterior+ensemble fusion to be hierarchical: include (a) per‑channel priors, (b) per‑channel‑pair priors (channel combinations), and (c) ensemble evidence, with data‑driven trust weights and explicit contradiction logic.
+
+Concrete rule set (v3.4.3):
+
+- New posterior representations (persisted and exposed):
+  - Per‑channel: TP_kC, FP_kC (decayed), posterior_mean_ch = (TP + s_ch) / (N + 2*s_ch), posterior_se_ch = sqrt(P*(1−P)/(N+1)); sample_count_ch = N.
+  - Per‑channel_pair (ordered pair or unordered pair depending on semantics): TP_chpair, FP_chpair (decayed), posterior_mean_pair = (TP + s_pair) / (N_pair + 2*s_pair), posterior_se_pair similar; sample_count_pair = N_pair.
+  - Stability scores for both.
+
+- Hierarchical prior fusion:
+  - Compute trust weights:
+    - w_pair_post = sample_count_pair / (sample_count_pair + τ_pair)
+    - w_ch_post = sample_count_ch / (sample_count_ch + τ_ch)
+  - Compute P_prior (combine pair + channel priors):
+    - If denom = (w_pair_post + w_ch_post) > 0:
+      - P_prior = (w_pair_post * posterior_mean_pair + w_ch_post * posterior_mean_ch) / denom
+      - var_prior = (w_pair_norm * var_pair + w_ch_norm * var_ch) where w_pair_norm = w_pair_post/denom.
+    - Else use global_prior and pooled var.
+  - Ensemble: E = wA*aggregator_p + wG*GLM_p + wS*SRM_p (defaults preserved; aggregator tends to be strongest).
+  - Posterior vs ensemble trust:
+    - alpha_post = (sample_count_pair + sample_count_ch) / (sample_count_pair + sample_count_ch + τ_total)
+    - p_combined = alpha_post * P_prior + (1 − alpha_post) * E
+
+- Augment features & gating for concentrated spends:
+  - New features required in preprocessor (required for both detection and calibration):
+    - total_spend, log_total_spend, spend_percentile_by_demo, spend_zscore_by_demo, channel_pair_id, num_nonzero_channels, top2_share, spend_entropy, absolute_top_channel_value, model_disagreement = std(models outputs).
+  - Define concentrated_top2_flag as before (top2_share ≥ 0.98) and extreme_total_spend_flag (total_spend > 99th percentile for the passenger's demo/cluster).
+
+- Decision rules (concrete thresholds and bands):
+  - single_spike bands (same as v3.4.2): low [0.50–0.70), medium [0.70–0.95), extreme ≥ 0.95 (applies to p_combined and to spend shape bands as relevant).
+  - For medium concentrate cases (the FN family) we keep earlier relaxations — but add pairwise checks to avoid FPs:
+    - If pair_sample_count ≥ cluster_min_n_pair:
+      - Use P_prior heavily: require p_combined ≥ p_accept_threshold_pair (see defaults) AND aggregator_p ≥ agg_threshold_pair if pair_FP_risk > noisy_pair_threshold.
+    - If pair_sample_count < cluster_min_n_pair:
+      - Rely on ensemble E and additional safeguards:
+        - Accept if E ≥ E_high (models agree and strong) AND model_disagreement ≤ σ_low AND not in historically noisy pairlist.
+        - If E in [E_med_low, E_high) and concentrated_top2_flag true and total_spend extreme, route to priority audit.
+        - If pair is in historically noisy whitelist (list of channel pairs with FP_rate high), require stronger ensemble signatures (higher E & low disagreement) or manual audit.
+  - For extreme single_spike (high top2_share and high total_spend): do not auto‑reject solely on channel priors; but if pair_FP_risk high and ensemble moderate, route to priority audit rather than auto‑accept.
+
+- Contradiction and symmetric decision logic:
+  - Updated AcceptRisk and RejectRisk (incorporates pair FP risk, spend magnitude, model_disagreement):
+    - AcceptRisk = FP_prior_weight * (1 − E) + λ1 * spend_extremeness + λ2 * model_disagreement
+    - RejectRisk = FP_pair_risk_weight * E + λ1 * spend_extremeness + λ2 * model_disagreement
+    - DecisionRisk = max(AcceptRisk, RejectRisk)
+  - Priority audit if DecisionRisk > audit_threshold OR (AcceptRisk > accept_min AND RejectRisk > reject_min) (contradiction)
+  - For noisy pairs with high pair_FP_risk: escalate to manual audit unless E very high and model_disagreement very low.
+
+- Concrete numeric defaults (initial; tune in validation):
+  - s_ch = 5; s_pair = 8
+  - τ_ch = 50; τ_pair = 75; τ_total = 80
+  - cluster_min_n = 30; cluster_min_n_pair = 15
+  - ensemble weights: wA = 0.5, wG = 0.3, wS = 0.2
+  - E_high = 0.88; E_med_low = 0.70
+  - agg_threshold_pair = 0.85
+  - noisy_pair_threshold: historical FP_rate ≥ 0.55 with sample_count_pair ≥ 50
+  - model_disagreement thresholds: σ_low = 0.05, σ_high = 0.15
+  - audit_threshold = 0.40; priority_audit_threshold = 0.60
+  - β_shrink = 0.2, γ1,γ2 for calibration adjustments below.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Concentrated top2 spend is informative but its predictive value depends strongly on which channels are involved and on absolute spend magnitude:
+  - Some channel combinations (e.g., VRDeck+FoodCourt) appear frequently in non‑transport purchases (high FP historically), while the same concentrated pattern with ShoppingMall or RoomService is more transport‑indicative in other clusters.
+- Channel behavior is strongly heterogeneous across cluster/demographic slices:
+  - The same channel pair can be signal in some clusters and noise in others; therefore conditional (channel×cluster and channel_pair×cluster) priors are essential.
+- Operational modeling lesson:
+  - Correcting recall gaps by globally downweighting channel priors can create FP regressions where pairwise priors or absolute spend caps would have prevented acceptance.
+  - Models can agree (low disagreement) because they see similar input features — but agreement alone is insufficient when the historical pairwise FP rate is high.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Two‑stage uncertainty fusion (channel + pair + ensemble):
+  - Compute var_pair and var_ch from Beta posterior formulas:
+    - var_post = P*(1−P)/(N + 1) (use decayed counts).
+  - Build var_prior as weighted sum of pair/channel variances (weights = normalized w_pair_post, w_ch_post).
+  - var_ensemble estimated via bootstrap/SEs across aggregator/GLM/SRM.
+  - var_combined = alpha_post^2 * var_prior + (1 − alpha_post)^2 * var_ensemble
+  - se_combined = sqrt(max(var_combined, base_min_se^2)), base_min_se = 0.01
+- Adjust z‑scaling so strong ensemble evidence is not over‑shrunk, but noisy pair evidence increases the margin:
+  - base_z = 1.645
+  - z_adj = base_z * (1 + γ1*(FP_pair_risk) + γ2*model_disagreement) * (1 − min(0.5, E))
+    - initial γ1 = 1.0, γ2 = 0.6
+  - p_lower = p_combined − z_adj * se_combined
+- Final shrink:
+  - p_final = p_lower / (1 + β * combined_FP_risk * (1 − E)), combined_FP_risk = max(FP_pair_risk, FP_channel_risk)
+  - β = 0.2 initial
+- Calibrators:
+  - Retrain Platt/isotonic calibrators including covariates [combined_FP_risk, top2_share, spend_entropy, spend_percentile_by_demo, model_disagreement].
+  - Per‑channel_pair calibrator only if sample_count_pair ≥ 150; else EB‑pooled calibrator across similar pairs.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Persist and version:
+  - Persist both channel and channel_pair posterior tables with fields: TP, FP, posterior_mean, posterior_se, sample_count, last_update, rescue_allow_override. Snapshot each batch.
+- CI / precommit gating:
+  - Block any deploy that increases per_channel_pair_medium_spike_FP_rate > baseline + 10% without manual review.
+  - Canary: shadow run stratified by cluster/channel_pair; require no FP increase > 20% on priority pairs and no FN increase > 20% on priority channels.
+- Monitoring & dashboards:
+  - Add per_channel_pair × age_bucket FN_rate / FP_rate, DecisionRisk distribution, model_disagreement, total_spend percentile drift, priority_audit latency, audit recovery rate for known FNs and known FPs (like 0078_01).
+- Audit routing and capacity:
+  - Create priority audit queue for contradictions (AcceptRisk & RejectRisk both > 0.25) and for noisy pairs with concentrated spends; monitor capacity and tune thresholds.
+- Release controls:
+  - Staged rollout and shadowing of pairwise prior changes: 10% → 50% → 100% with stop gates based on canary metrics.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- Expose new per‑record metrics to scorer & logs:
+  - channel_pair_id, sample_count_pair, posterior_mean_pair, posterior_se_pair, combined_FP_risk, total_spend, spend_zscore_by_demo, top2_share, spend_entropy, num_nonzero_channels, model_disagreement, decision_provenance, reason_code.
+- Model & training changes:
+  - GLM_fallback v9:
+    - Add channel_pair interactions (top_channel × second_channel), absolute_spend, log_total_spend, spend_percentile_by_demo, top2_share, model_disagreement, pair_FP_risk.
+    - Balanced resampling: for high‑priority channel_pairs, upsample both positives and negatives but upweight recent positives; don't do one‑sided negative oversample.
+    - Synthetic augmentation: generate realistic extreme and near‑extreme concentrated spends from positive classes when label support exists to improve model generalization.
+  - SRM/aggregator:
+    - Return score + bootstrap SE and expose per‑model uncertainty.
+- Active learning & loop:
+  - Route contradictions + noisy pair concentrated accepts to human audit with high labeling priority; add these to weekly retrain buffer with elevated weight.
+  - Continually re‑estimate τ_ch, τ_pair, s_ch, s_pair using rolling validation.
+- Robustness & reproducibility:
+  - Use bootstrap ensembles for per‑model SEs; persist deterministic RNG seeds; log full decision provenance for each record for audit and debugging.
+
+Updated deterministic scoring pipeline (v3.4.3)
+1. Snapshot load: channel table + channel_pair table (TP/FP/mean/se/sample_count), model versions, calibrators, deterministic RNG seed.
+2. Preprocess per record: compute top_channel, second_channel, channel_pair_id, top_contrib_share, top2_share, spend_entropy, total_spend, log_total_spend, spend_percentile_by_demo, num_nonzero_channels, concentrated_top2_flag, extreme_spend_flag, model_disagreement.
+3. Channel & pair lookup: retrieve posterior_mean_ch, posterior_se_ch, sample_count_ch and posterior_mean_pair, posterior_se_pair, sample_count_pair.
+4. Model inference: aggregator_p + SE, GLM_p + SE, SRM_p + SE.
+5. Compute E, w_pair_post, w_ch_post, P_prior, alpha_post, p_combined, var_combined, se_combined.
+6. Calibrate p_combined → p_final using z_adj and shrink, then apply calibrated Platt/isotonic mapping with covariates.
+7. Compute AcceptRisk, RejectRisk, DecisionRisk; apply single_spike band routing, noisy_pair special rules and audit logic.
+8. Output decision (Accept/Reject/Audit) with reason_code and persist full provenance including all per‑record metrics and model SEs.
+9. Post‑batch validations and alerts; snapshot channel & pair posterior updates once human labels are in.
+
+Default hyperparameters (v3.4.3 initial)
+- Channel smoothing s_ch = 5; pair smoothing s_pair = 8.
+- τ_ch = 50; τ_pair = 75; τ_total = 80.
+- cluster_min_n = 30; cluster_min_n_pair = 15.
+- Ensemble weights: aggregator 0.5, GLM 0.3, SRM 0.2.
+- single_spike bands: low 0.50–0.70, medium 0.70–0.95, extreme ≥ 0.95.
+- concentrated_top2_flag threshold: top2_share ≥ 0.98.
+- noisy_pair_threshold: FP_rate ≥ 0.55 with sample_count_pair ≥ 50.
+- E_high = 0.88; E_med_low = 0.70; model_disagreement σ_low = 0.05.
+- p_accept thresholds: p_combined ≥ 0.80 (depends on pair counts); E ≥ 0.88 for low-sample accepts.
+- DecisionRisk thresholds: audit if > 0.40; priority audit if > 0.60.
+- Calibration: base_z = 1.645; base_min_se = 0.01; β = 0.2, γ1 = 1.0, γ2 = 0.6.
+- per_channel_pair calibrator min_n = 150.
+
+Validation experiments & acceptance criteria
+- Holdout & stratified LOO:
+  - Stratify by cluster, top_channel, channel_pair, Age_bucket; include priority cases: 0069_01, 0070_01, 0071_01, 0073_01, 0074_01, 0076_01, 0078_01.
+- Metrics:
+  - Per_channel_per_pair FN/FP rates, Brier score, ECE, CI coverage, DecisionRisk precision/recall for audits, audit workload (queue size & latency).
+- Success criteria vs v3.4.0 (targets to be met simultaneously):
+  - Keep FP reductions on historically noisy channels/pairs (ShoppingMall/FoodCourt/VRDeck and top noisy pairs) ≥ 40% vs v3.3 baseline OR not degrade more than 10% vs v3.4.0, AND
+  - Recover ≥ 70% of previously missed TPs like 0074_01 & 0076_01 vs v3.4.0, AND
+  - Reduce similar FPs to 0078_01 by ≥ 50% vs v3.4.2 shadow run, AND
+  - Keep overall FN increase ≤ 10% and audit fraction within operational capacity.
+- Parameter sweeps:
+  - τ_pair ∈ {30, 75, 150}, s_pair ∈ {5, 8, 12}, cluster_min_n_pair ∈ {10, 15, 25}, E_high ∈ {0.85, 0.88, 0.90}, noisy_pair_threshold ∈ {0.50, 0.55, 0.60}.
+- Ablations:
+  - with/without p_prior pair; with/without model_disagreement gating; varying contradiction thresholds.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+   - Compute and persist channel_pair posterior table (TP/FP/posterior_mean/posterior_se/sample_count) with weekly decay; add channel_pair_id to feature store.
+   - Add total_spend, spend_percentile_by_demo, spend_zscore_by_demo, top2_share, spend_entropy to feature store.
+2. Scoring engineers:
+   - Implement p_combined with pairwise priors and se_combined; add model_disagreement; implement contradiction audit logic and noisy_pair special gating in scorer; run shadow inference on recent batches (must include 0074_01, 0076_01, 0078_01).
+   - Log full provenance and produce delta visualization against v3.4.2 results.
+3. ML:
+   - Retrain GLM_fallback v9 with channel_pair interactions + absolute spend features; produce shadow model.
+   - Retrain Platt/isotonic calibrator including new covariates; generate per‑pair calibrators where sufficient data exists.
+4. Ops/SRE:
+   - Add precommit CI tests (pairwise canary) and staged rollout controls.
+   - Confirm audit capacity for priority audits (expected increase from contradiction routing).
+5. Product/ops:
+   - Write human audit instructions for concentrated multi‑channel spend cases and noisy pairs (what signals to look for).
+
+How v3.4.3 would handle 0078_01 (concrete flow)
+1. Feature extraction: total_spend ≈ 15,815; top_contrib_share≈0.61; top2_share≈0.98 (concentrated_top2_flag true); pair_id = {VRDeck, FoodCourt}; spend_percentile_by_demo high (likely > 95th).
+2. Channel_pair lookup: sample_count_pair & posterior_mean_pair checked. If channel_pair identified as historically noisy (pair_FP_risk high and sample_count_pair ≥ threshold) → P_prior will reflect high FP_risk and alpha_post will give some weight; p_combined calculated.
+3. Decision gating:
+   - If pair_FP_risk high and either model_disagreement > σ_low or ensemble E moderate (< E_high): route to priority audit (NOT auto‑accept).
+   - If pair_sample_count low but ensemble E is very high (≥ E_high), and model_disagreement very low, and total_spend not extreme by demographic, accept; else audit.
+4. Net effect: 0078_01 would be flagged for priority audit rather than directly accepted — reducing FP risk while preserving the recovery pathways for previous FNs (0074_01, 0076_01).
+
+Expected tradeoffs & mitigations
+- Tradeoffs:
+  - Adding pairwise priors and contradiction audits will increase audit volume (priority queue). Relaxing some channel gating to recover FNs can increase FP risk if not paired with pairwise priors.
+- Mitigations:
+  - Stage rollouts and canaries for pairwise logic.
+  - Targeted retraining for high‑impact noisy pairs to improve model discrimination (reduce audit load).
+  - Use active learning to convert audits into high‑value labels and retrain weekly.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudocode + unit tests implementing v3.4.3 rules (pairwise priors, p_combined, contradiction audit).
+- Channel_pair posterior table generation script and retention/decay process.
+- Shadow retrain: GLM_fallback v9 (channel_pair interactions) + stratified validation report.
+- LOO validation comparing v3.3, v3.4.0, v3.4.1, v3.4.2, v3.4.3 with operating points and parameter sweeps.
+- Audit log schema, CI precommit rules, dashboard KPI spec.
+- 72‑hour implementation checklist (owners, artifacts, canary criteria).
+
+One‑line summary
+v3.4.3 augments sample_count‑aware posterior+ensemble fusion with channel_pair priors, absolute spend and model_disagreement gating, and contradiction→priority_audit logic — reducing FPs on noisy channel combinations (e.g., 0078_01) while preserving gains recovering FNs (0074_01, 0076_01).
+
+Recommended immediate next action
+- Run a shadow rerun on the last N batches (include 0074_01, 0076_01, 0078_01) with the new scorer (p_combined + channel_pair priors + contradiction rules). I can:
+  - produce the deterministic scorer skeleton (Python pseudocode + unit tests) now (recommended) OR
+  - prepare and run the shadow rerun and return the stratified validation report + suggested operating point.
+Which would you like me to do first?
+
+============================================================

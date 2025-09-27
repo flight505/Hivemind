@@ -1,0 +1,209 @@
+PREDICTIVE METRICS - ITERATION 15
+============================================================
+
+Executive summary — immediate takeaway and top priorities
+- Immediate cause: this batch error (0031_02) is a different failure mode than the earlier multi‑channel spending issue. It exposes insufficient modeling/weighting for age‑driven segments (very young children) and inadequate segment pooling for zero‑spend profiles. The pipeline under‑weighted Age (and Age×Cabin/Deck/Destination interactions), so a young passenger with zero spend was treated as low‑evidence/negative and predicted False despite being Transported=True.
+- Top priorities (deploy in order):
+  1. Add Age‑bucketing + hierarchical pooling and an explicit child_flag override pathway (Age ≤ 3) so low‑spend young passengers get appropriate prior/feature weight and segment smoothing.
+  2. Keep the spending-group fixes (grouped spending, n_effective, covariance, dominance guard) but add an "all_spend_zero" guard that invokes segment/age logic instead of letting zero-spend suppress positive signal by absence.
+  3. Recalibrate confidence (p_lower) per segment (Age buckets) and apply Platt/isotonic scaling to logit_final so CI thresholds reflect segment-level calibration.
+  4. Strengthen batch pre‑commit checks (distribution shifts on Age, Spending, new bins) and an audit path for segments with historically high FN or high abstain rates.
+  5. Run LOO/stratified evaluation focusing on Age buckets and spending profiles; tune thresholds (p_lower_group_strong/secondary) from validation.
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Low Age impact: Age had a relatively small base weight (0.07) and Age binning likely produced small n for very young ages, so Age contributed little to signed_contrib_i.
+- Small-n neutralization + shrinkage: Per‑bin Laplace + reliability shrinkage with aggressive small‑n neutralization suppressed any small positive age signal when n_bin < min_bin_count; combined with zero spends, the passenger accumulated insufficient positive support.
+- No explicit zero‑spend child handling: absence of spend was treated as neutral/negative (lack of positive evidence) rather than interpreted in context (young children often have low spend but may still be transported).
+- Decision thresholds tuned to prefer abstain/false for low evidence: support_pos_min, p_lower thresholds and dominance guard created a conservative rule that favours False when feature evidence is weak or per-bin support is small.
+- Snapshot & binning fragility: Age bin granularity likely split infants into bins with n below min_bin_count → heavier shrinkage to global p0.
+
+2) How should decision rules be modified to prevent similar errors in future batches?
+- Add Age-bucket segmentation and hierarchical pooling:
+  - Create Age buckets (example: 0–3, 4–12, 13–24, 25–44, 45–64, 65+). Ensure min_bin_count applies at bucket level; merge single-year bins into these buckets so infants get robust counts.
+  - When a fine-grained age bin has n < min_bin_count, pool into the parent age bucket and use pooled counts for p_b_shrunk and reliability.
+- Child override pathway:
+  - Introduce child_flag = (Age ≤ 3). If child_flag and all_spend_zero (or low_total_spend) then compute segment_prior for (Age_bucket, Cabin_deck, Destination) with hierarchical pooling. If segment_prior p_seg_shrunk ≥ 0.62 and r_seg ≥ 0.6 → Predict True. Else Abstain.
+- All_spend_zero guard:
+  - Detect all_spend_zero and route to an "absence of spend" logic: do not let lack of spending drag the outcome negative unless other reliable negative evidence exists.
+- Age-conditioned baseline & calibration:
+  - Use age-conditioned p0_age when n_age >= min_segment_count for smoothing/logit baseline, or apply an age_offset to logit0 weighted by r_age.
+- Re-balance base_weights modestly to reflect importance of Age and Cabin for child segments (see suggested new base_weights below), but prefer data-driven reweighting after +50 labels.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Low‑spend does not mean low probability: very young passengers commonly have low/no spending yet are not less likely to be transported — so "zero spend" is not uniformly negative.
+- Age interactions matter: Age interacts with Cabin/Deck and Destination. Age alone or spend alone can be misleading; combining Age buckets with Cabin/Destination reveals segments with systematically higher transported rates.
+- Binning and pooling choices materially change behavior in tails: when per‑bin counts are small, naive per‑bin neutralization erases real patterns. Hierarchical pooling is critical for stable tail estimates.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Calibrate globally then per‑segment:
+  - Fit a global Platt (logistic) calibration on logit_final → p_calibrated.
+  - Then compute per‑segment calibration curves for Age buckets (and SpendingGroup buckets) and correct p_calibrated or maintain segment‑specific p_lower thresholds.
+- Revised confidence tier thresholds (recommended starting points; tune on validation):
+  - High confidence (auto-accept): p_lower ≥ 0.70 AND support_abs_total ≥ 0.08 AND reliable_count_in_direction ≥ 2 AND top_contrib_share ≤ 0.35.
+  - Medium confidence: p_lower ≥ 0.58 AND support_abs_total ≥ 0.05.
+  - Low confidence / Abstain preferred: p_lower < 0.58 OR support_abs_total < 0.05 OR top_contrib_share > 0.45 OR multi_spend_extreme_count ≥ 2.
+- Segment-specific acceptance relaxation:
+  - For child_flag (Age ≤ 3) with reliable age_bucket evidence (r_age ≥ 0.6), allow medium-confidence acceptance at p_lower ≥ 0.62 (instead of 0.58). For group-dominant spending, keep stricter p_lower_group_strong ≥ 0.70.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Snapshot/version control for bins and counts:
+  - Persist snapshot_id for bin boundaries, per-bin counts (n_bin, t_bin), Corr_ij, and use the same snapshot for an entire batch commit.
+  - Only update snapshot in a controlled deployment with validation.
+- Deterministic merging rules:
+  - Merging adjacent bins must be deterministic, reproducible, and documented in the snapshot so batch runs are consistent.
+- Stable default fallbacks:
+  - If Abstain unavailable, use explicit policy mapping (e.g., prefer False for ambiguous spending extremes, but prefer True for child_flag segments when segment prior > 0.62).
+- Batch pre‑commit checks and pause thresholds:
+  - If distribution shift in Age (KS test) or fraction of all_spend_zero passengers increases > 2× historical, pause auto-commit for sampling and audit.
+  - If spending_group_dominant fraction > 1% of batch → pause and sample K for human review.
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New diagnostic fields to persist (in addition to earlier list):
+  - age_bucket_id, child_flag, age_segment_n, age_segment_t, all_spend_zero, total_spend, segment_prior, segment_r, pooled_bin_source (indicates pooled parent), calibration_version.
+- Hierarchical pooling: implement Bayesian/Empirical Bayes pooling for small bins (age, spend bins, combined segments) so tails borrow strength from parents.
+- Segment-specific CI coverage monitoring:
+  - Track CI coverage rate (proportion true y inside [p_lower, p_upper]) per Age bucket and per SpendingGroup; alert if < expected (calibration failure).
+- Add a light-weight fallback GLM per segment:
+  - For low-support segments (n_segment < threshold), fall back to a small calibrated GLM trained on a few reliable features (Age_bucket, Cabin_deck, Destination, CryoSleep) — this reduces brittleness.
+- Human-in-the-loop for edge cases:
+  - Add audit queue for Abstain and for conflicting cases where segment priors and spending-group disagree (multi_spend_extreme_count ≥ 2 and child_flag contradictions).
+
+Updated deterministic scoring pipeline (v2.0) — complete (production‑ready, includes child logic)
+- Baseline prior:
+  - p0_global = (T + 1) / (N + 2); logit0_global = ln(p0_global / (1 − p0_global))
+  - Also compute p0_age_bucket for Age buckets where n_age ≥ min_segment_count_age (min_segment_count_age = 30); if available use to form age_offset for logit0 (see below).
+- Age bucketing & pooling:
+  - Age buckets: [0–3, 4–12, 13–24, 25–44, 45–64, 65+]. When a finer bin has n < min_bin_count, merge into bucket; compute n_age, t_age.
+  - child_flag = (Age ≤ 3)
+- Spending preprocessing (unchanged from previous patch):
+  - winsorize @ 0.995, s_i = log1p(x_winsorized), TotalSpend_log1p = Σ s_i, multi_spend_extreme_count, ratio_top_channel, multi_channel_profile_flag.
+- Special flags:
+  - all_spend_zero = (TotalSpend_log1p == 0)
+  - low_total_spend = (TotalSpend_log1p ≤ small_total_spend_threshold; e.g., ≤ 0.5)
+- Per-bin Laplace smoothing and reliability shrinkage (alpha=1; k=5) + hierarchical pooling:
+  - For bin b (including Age_buckets and combined segments): compute p_b_smoothed with Laplace, then p_b_shrunk with k.
+  - If n_b < min_bin_count (10) → pool with parent bin (e.g., Age_bucket parent or sibling) until pooled_n ≥ min_bin_count; track pooled_bin_source.
+- Age-conditioned baseline/logit offset:
+  - If n_age ≥ min_segment_count_age (30):
+    - logit0_effective = logit0_global + r_age * (ln(p0_age/(1−p0_age)) − logit0_global), where r_age = n_age / (n_age + k_age) and k_age = 10.
+  - Else logit0_effective = logit0_global.
+- Feature deltas, small‑n neutralization:
+  - raw_delta_b = ln(p_b_shrunk / (1 − p_b_shrunk)) − logit0_effective
+  - small-n neutralization: same rules as before (n_small = 3 small_n_factor = 0.5; spending_small_bin_factor = 0.35 if spending bin n < min_bin_count).
+  - clip raw_delta_b to ±max_delta (max_delta = 0.8).
+- Grouped spending (unchanged major design, with minor additions):
+  - Compute per-channel signed contribs and group aggregator; n_effective_spend = Σ n_channel (pooled counts); r_group = n_effective_spend / (n_effective_spend + k2_group); k2_group = 7.
+  - For cov_delta_ij: use empirical Corr_ij when available; otherwise default Corr_spend = 0.6.
+  - Treat SpendingGroup as single synthetic feature with delta and se computed as before.
+- Base weights (relative; normalized after reliability scaling) — revised defaults:
+  - CryoSleep = 0.26
+  - Cabin/Deck = 0.22
+  - HomePlanet = 0.11
+  - SpendingGroup = 0.12
+  - Destination = 0.09
+  - Age = 0.11
+  - Side = 0.05
+  - VIP = 0.04
+  - Rationale: raise Age from 0.07 → 0.11 to reflect observed segment importance; spending_group is moderate but still important.
+- Age multipliers / child_override:
+  - child_multiplier = 1.5 applied to Age raw_w_age if child_flag is True and r_age ≥ 0.4.
+  - For child_flag + all_spend_zero:
+    - Compute segment_prior p_seg_shrunk for (Age_bucket, Cabin_deck, Destination) using hierarchical pooling. If p_seg_shrunk ≥ 0.62 and r_seg ≥ 0.6 → immediate Predict True (bypass normal group-dominance False pathways). Else if p_seg_shrunk ∈ [0.58, 0.62) and r_seg ≥ 0.6 → set p_lower acceptance threshold to 0.60 instead of 0.58; else proceed to normal pipeline (likely Abstain).
+- Final weights, dominance and Abstain rules (incorporates previous spending-dominant guards):
+  - Normalize raw_w_i to sum = 1
+  - Compute signed_contribs, logit_final = logit0_effective + Σ signed_contrib_i
+  - Compute se_logit_final with covariance propagation
+  - p_lower = sigmoid(logit_final − z * se_logit_final), z=1.28 (90%), adjust to 1.64 (95%) in high‑safety regimes
+  - Decision rules:
+    - If support_abs_total < T_low(0.035) and max(reliable_pos_count,reliable_neg_count) < 2 → Abstain
+    - If child_override condition (above) → Predict True
+    - If spending_group top contributor → use spending guard described earlier (prefer Abstain unless p_lower ≥ 0.70 or secondary rule p_lower ≥ 0.62 and n_effective_spend ≥ 8)
+    - Non-group-dominant: Predict True if support_pos > support_neg AND (support_pos ≥ support_pos_min (0.06) OR reliable_pos_count ≥ 2) AND p_lower ≥ 0.55; Predict False symmetrically; else Abstain
+- Calibration step:
+  - After logit_final compute p_calibrated via Platt scale fit on historical LOO/validation set → produce p_final, p_lower, p_upper.
+
+Concrete updated parameter defaults (deployable)
+- Laplace alpha = 1; shrinkage k = 5; reliability k2 = 5
+- group k2_group = 7; k_age (for age offset) = 10
+- max_delta = ±0.8; small_n_threshold = 3; small_n_factor = 0.5; spending_small_bin_factor = 0.35
+- spending_winsor_pct = 0.995; spending_bins = 20; min_bin_count = 10
+- dominance_top_share_threshold = 0.45; dominance_group_n_min = 20; dominance_group_secondary_n_min = 8
+- multi_spend_extreme_threshold = 2; group_cov_default = 0.6
+- p_lower_pos_threshold = 0.55; p_lower_group_strong = 0.70; p_lower_group_secondary = 0.62
+- T_low = 0.035; support_pos_min = 0.06; support_neg_min = 0.05
+- z = 1.28 (90%); consider 1.64 if policy demands
+- child_multiplier = 1.5; child_override_primary_p = 0.62; child_override_secondary_p = 0.58; min n_age for full age_offset = 30
+- batch_dominance_alert_rate = 0.01; batch_age_shift_alert_factor = 2.0
+
+Validation & experiments to run immediately
+- LOO evaluation on current labeled set using v2.0 scoring (no retrain of base_weights yet). Report: Brier, calibration (ECE), accuracy, recall, precision, abstain fraction, per-age bucket confusion matrix, per-spending-profile confusion matrix. Confirm corrections for 0026_01, 0031_01 and 0031_02.
+- Threshold sweep:
+  - p_lower_pos_threshold ∈ {0.50, 0.55, 0.60}
+  - child_override_primary_p ∈ {0.60, 0.62, 0.65}
+  - dominance_top_share_threshold ∈ {0.35, 0.45, 0.55}
+- Min_bin_count sweep: {5, 10, 20}; spending_bins ∈ {10, 20, 30}
+- Calibration experiments: fit Platt & isotonic; compute ECE overall and by Age bucket and SpendingGroup.
+- Coverage CI bootstrap: verify se_logit_final and p_lower produce correct nominal coverage for 90% CI across segments.
+- Focused stratified cross-tabs: Transported rate conditional on (Age_bucket × Cabin_deck) and (TotalSpend_bin × Destination).
+
+Monitoring & alerts (what to compute and thresholds)
+- Persist per-prediction: p_final, p_calibrated, p_lower, p_upper, se_logit_final, support_pos/neg/abs_total, reliable_pos/neg_count, top contributors, top_contrib_share, spending_group_signed_contrib, spending_group_se, multi_spend_extreme_count, spending_bin_id(s), age_bucket_id, child_flag, all_spend_zero, pooled_bin_source, snapshot_id, calibration_version.
+- Dashboards:
+  - Per-age-bucket FPR/FNR, CI coverage, ECE
+  - Fraction of all_spend_zero by Age bucket
+  - Batch abundance of child_flag and the child_override accept/abstain distribution
+  - Distribution of p_lower and se_logit_final
+  - Spending-group dominance fraction; if >1% → pause auto-commit and sample K for human review
+- Triggers:
+  - Pause commits if batch_age_distribution shifts by factor > 2 (KS or chi-square)
+  - Alert if per-age-bucket FNR increases > X% vs baseline
+  - Refit base_weights after +50 labels or if per-bin FPR/FNR drift beyond control limits
+
+Rollout checklist (prioritized)
+Immediate (24–48 h)
+1. Implement Age bucketization + hierarchical pooling; ensure infant (0–3) bucket available with pooled counts.
+2. Add child_flag, all_spend_zero logic and child_override pathway described above.
+3. Keep spending-group fixes (aggregate, covariance) and add all_spend_zero guard to avoid negative bias from absence of spend.
+4. Add calibration (Platt) pipeline and persist calibration_version.
+5. Add per-prediction diagnostics (age_bucket_id, child_flag, pooled_bin_source, all_spend_zero) and batch alerts for Age/spend shifts.
+Near-term (1–2 weeks)
+1. Run validation experiments and tune thresholds (child_override, p_lower thresholds).
+2. Set up dashboards for Age-bucket coverage & CI coverage; create audit queue for Abstain + child cases.
+3. Refit base_weights with regularization if enough labels (+50) and check impact.
+Medium-term (after +50 labels)
+1. Implement hierarchical Bayesian pooling across spending bins and Age buckets.
+2. Build a small segment GLM fallback for low-support segments.
+3. Explore interactions (TotalSpend × Destination, Age × Cabin) as explicit features.
+Long-term (100+ labels)
+1. Move to a small calibrated supervised model (regularized logistic/GLM) that encodes these aggregations and still provides uncertainty via bootstrap or Bayesian approximation.
+
+Case‑level diagnosis & expected outcomes (how v2.0 would handle problematic cases)
+- 0031_01 (previous FN: high multi-channel spend): spending_group aggregator + n_effective ensures combined evidence is recognized; covariance and se propagation reduce overconfidence but group_reliability boosts weight; rule allows Predict True if p_lower ≥0.62 and n_eff ≥8 or p_lower ≥0.70 for extreme. Expected correction → Predict True or at worst Abstain.
+- 0026_01 (previous FP: over‑confident small-n spend): extra_variance for spending extremes + dominance guard + prefer Abstain unless high p_lower reduces FP risk. Expected correction → Abstain or False rather than overconfident True.
+- 0031_02 (current batch error: Age=2, spends=0): Age bucket (0–3) has pooled counts; Age weight increased and child_multiplier applies. all_spend_zero guard routes to segment_prior; if segment evidence supports Transported (likely given label), child_override will Predict True or at minimum raise p_lower so outcome is not a False. Expected correction → Predict True (or Abstain if extreme low support), reducing FN.
+
+Expected tradeoffs
+- Recall improvements for child and pooled segments; initial rise in Abstain rate as pipeline prefers safe Abstain for ambiguous group-dominant cases.
+- Possible small increase in FP in child bucket if thresholds are loosened too much — validate and tune on LOO.
+- Operational overhead: more auditing for Abstains and batch pre‑commit pauses until calibration stabilizes.
+
+Short actionable checklist (deploy these first)
+1. Add Age buckets (0–3, 4–12, 13–24, 25–44, 45–64, 65+) with deterministic pooling rules.
+2. Add child_flag and all_spend_zero detection; implement child_override_pathway described above.
+3. Keep spending_group aggregator (n_effective and covariance) and ensure it does not suppress child logic.
+4. Add Platt calibration on logit_final and persist calibration_version.
+5. Add batch pre‑commit checks for Age distribution shifts and alert for spending_group_dominant fraction >1%.
+
+How we’ll measure success (KPI)
+- Primary: Reduction in FN for Age ≤ 3 group (target: >50% reduction on historical errors) and correction of cases like 0031_02.
+- Secondary: overall Brier score improvement, improved ECE (≤ 0.03 target), LOO accuracy/recall improvement, controlled abstain rate (initially up to +5% acceptable), per-bin FPR/FNR for key bins stabilized.
+- Refit base_weights when +50 labels show persistent drift in per-feature contributions.
+
+Would you like:
+- A) the concrete Python scoring function (deterministic) implementing v2.0 (including Age pooling, child_override and spending-group aggregation), or
+- B) an immediate LOO evaluation of v2.0 on your labeled set (reports: Brier, accuracy, abstain stats, per-age confusion matrices and whether 0026_01 / 0031_01 / 0031_02 are corrected), or
+- C) both (I can deliver the scorer and run LOO)?
+
+Recommendation: run B (LOO) first so we can tune child_override and p_lower thresholds on real labels; I can produce A in parallel so you can test in staging quickly.
+
+============================================================

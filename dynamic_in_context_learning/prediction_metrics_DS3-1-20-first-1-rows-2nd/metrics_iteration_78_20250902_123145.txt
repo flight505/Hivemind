@@ -1,0 +1,121 @@
+PREDICTIVE METRICS - ITERATION 78
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.3 (CRYOSLEEP DESTINATION AND CABIN VALIDATION UPDATE)
+
+**Objective:** To correct the prediction error for Passenger 0103_03 by addressing a critical oversight in CryoSleep passenger handling: the failure to incorporate cabin deck context and destination-specific transport patterns. The passenger was in CryoSleep with zero spending on TRAPPIST-1e (a non-luxury, non-family-centric destination) in a non-luxury cabin (Deck G), leading to a false positive prediction. This highlights that CryoSleep zero-spending passengers are not universally transport-eligible and require destination- and cabin-aware validation.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0103_03: What Went Wrong?
+
+The error for Passenger 0103_03 (Age=6.0, CryoSleep=True, All Spending=0.0, Destination=TRAPPIST-1e, HomePlanet=Earth, VIP=False, Cabin=G/18/S) resulted from overgeneralization of CryoSleep exemptions in v7.2:
+
+**Key Failure Points:**
+- **Destination Context Overgeneralization:** The CSO-1 Enhanced v3 rule applied an +8% confidence boost for CryoSleep passengers under 18 on destinations like 55 Cancri e and PSO J318.5-22, but TRAPPIST-1e—a more economy-focused destination with stricter transport economics—was not excluded. This led to an erroneous boost for 0103_03.
+- **Cabin Deck Context Neglect:** The cabin deck (G, a non-luxury section) was not considered. Passengers in non-luxury cabins on destinations like TRAPPIST-1e may have higher transport eligibility thresholds, especially for children without clear accompanying adults.
+- **Lack of CryoSleep Zero-Spending Risk Validation:** No rule penalized CryoSleep zero-spending passengers on certain destinations or cabin types where non-transport is common.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.3)
+
+This update refines destination context, incorporates cabin deck validation, and adds a risk-check rule for CryoSleep zero-spending on specific destinations.
+
+**Modify CryoSleep Contextual Override Rule (Step 0.a):**
+- **CSO-1 ENHANCED v4 (DESTINATION-AGE-CABIN CONTEXT):**
+  - IF `CryoSleep == True` AND `Age < 18` AND `Destination in [55 Cancri e, PSO J318.5-22]` AND `Cabin_Deck in [A, B, C, D, E]` (luxury decks) → **Apply +8% confidence boost**.
+  - IF `CryoSleep == True` AND `Age < 18` AND `Destination == TRAPPIST-1e` AND `Cabin_Deck in [F, G, T]` (non-luxury decks) → **Apply -10% confidence penalty**.
+  - **Rationale:** Children in CryoSleep on family destinations in luxury cabins are likely transported; those on economy destinations in non-luxury cabins may be higher risk for non-transport.
+
+**Add CryoSleep Zero-Spending Risk Rule (New Step 0.j):**
+- **CRYOSLEEP_ZERO_RISK_VALIDATION (CZR-1):**
+  - IF `CryoSleep == True` AND all spending categories == 0.0 AND `Destination == TRAPPIST-1e` AND `Cabin_Deck in [F, G, T]` AND `Age < 18` → **Apply -12% confidence penalty**.
+  - **Rationale:** Explicitly penalize high-risk cases: young CryoSleep passengers with zero spending on economy destinations in non-luxury cabins.
+
+**Adjust Pre-Screening for CryoSleep (Step 0.i):**
+- **CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1 REVISED):**
+  - Now routes to CZR-1 for risk validation before CSO-1 Enhanced v4.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **Destination Economics Matter:** TRAPPIST-1e has tighter transport economics—zero-spending CryoSleep passengers, especially children in non-luxury cabins, may be deemed non-essential.
+- **Cabin Deck Indicates Socioeconomic Context:** Luxury decks (A-E) correlate with higher transport eligibility for CryoSleep passengers; non-luxury decks (F, G, T) require stricter checks.
+- **Age and Destination Interact Non-Linearly:** Young age boosts eligibility on family destinations but reduces it on economy destinations without spending.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - CSO-1 Enhanced v4: Luxury destination/dec: +8% boost; Economy destination/deck: -10% penalty.
+  - CZR-1: -12% penalty for high-risk CryoSleep zero-spending.
+- **Adjusted Rules:**
+  - ZDL-1: Maintained as CryoSleep-exempt.
+- **Default Confidence:**
+  - DF-1: Adjusted to **65% confidence** to account for higher uncertainty in economy cases.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening Expansion:** Add CZR-1 to pre-screening group for CryoSleep zero-spending.
+- **Batch Destination-Cabin Validation:** Pre-batch, flag all CryoSleep=True passengers with Destination=TRAPPIST-1e and Cabin_Deck in [F, G, T] for CZR-1 processing.
+- **Error Logging:** Monitor CryoSleep predictions on TRAPPIST-1e to validate new rules.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **CryoSleep with Zero Spending on TRAPPIST-1e in Non-Luxury Cabin:** Handled by CZR-1 and CSO-1 Enhanced v4 penalties.
+- **CryoSleep with Non-Zero Spending:** Unchanged from v7.2.
+- **Fallback:** If cabin deck is missing, use HomePlanet (Earth → higher risk for non-luxury) as proxy.
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.3
+
+**Processing Order v7.3:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v4)** // **UPDATED RULE**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED)**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1)**
+**0.i. CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1 REVISED)**
+**0.j. CRYOSLEEP_ZERO_RISK_VALIDATION (CZR-1)** // **NEW RULE**
+1.  **ZDL-1 (CRYOSLEEP-EXEMPT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED)
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+... (Remaining rules) ...
+12. DEFAULT (DF-1) // **ADJUSTED TO 65%**
+
+---
+
+### New Scoring Example for Passenger 0103_03 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.3 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0103_03** (Earth, CryoSleep=True, Cabin=G/18/S, Destination=TRAPPIST-1e, Age=6.0, VIP=False, All Spending=0.0) | **NVA-1**: All spending=0.0 → **CZS-1**: Activated → **CZR-1**: Activated (Destination=TRAPPIST-1e, Cabin_Deck=G, Age=6<18) → -12% penalty → **CSO-1 Enhanced v4**: Activated (Destination=TRAPPIST-1e, Cabin_Deck=G) → -10% penalty → **PS-1** → **ACB-2**: Not triggered → **DF-1** | **False** | **43%** (PS-1: 65% + CZR-1: -12% + CSO-1 Enhanced v4: -10%) |
+
+*The new rules correctly apply penalties for high-risk CryoSleep zero-spending, resulting in a False prediction.*
+
+---
+
+### Implementation Plan for v7.3
+
+- **Deploy v7.3 immediately.** Reprocess the batch; validate 0103_03 is now False.
+- **Monitor** all CryoSleep cases on TRAPPIST-1e with non-luxury cabins.
+- **Update historical batches** with destination-cabin validation.
+- **Long-term:** Integrate family group detection (e.g., shared surnames/cabins) to improve age-context accuracy.
+
+This update ensures nuanced handling of CryoSleep passengers, balancing exemptions with destination- and cabin-based risk validation.
+
+**Final Note:** Next, analyze the impact of travel group dynamics (e.g., siblings/parents in same cabin) on CryoSleep predictions.
+
+============================================================

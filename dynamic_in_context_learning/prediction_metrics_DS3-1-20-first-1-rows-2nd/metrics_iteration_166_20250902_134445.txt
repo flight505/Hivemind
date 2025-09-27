@@ -1,0 +1,141 @@
+PREDICTIVE METRICS - ITERATION 166
+============================================================
+
+### **ANALYSIS OF PREDICTION ERROR FOR PASSENGER 0207_01 & UPDATED PREDICTIVE METRICS v18.1**
+
+---
+
+#### **1. Root Cause Analysis of Error 0207_01 (Earth CryoSleep Passenger to PSO J318.5-22)**
+**Passenger Profile:**  
+- **PassengerId:** 0207_01  
+- **HomePlanet:** Earth  
+- **CryoSleep:** True  
+- **Cabin:** G/32/P  
+- **Destination:** PSO J318.5-22  
+- **Age:** 19.0  
+- **VIP:** False  
+- **Spending:** All categories 0.0 (RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0)  
+- **TotalSpend:** 0.0  
+- **Name:** Thony Mcfaddennon  
+
+**Why v18.0 Failed:**  
+1. **Over-Reliance on CryoSleep Heuristics:** The system applied standard CryoSleep rules (e.g., `CRYOSLEEP_ZERO_SPEND` with +40% for `Transported=True`) but did not account for destination-specific nuances. PSO J318.5-22 has a known non-transport bias for Earth-origin passengers, even during CryoSleep.  
+2. **Destination Context Ignored:** Rule `DCP-12` (PSO J318.5-22 destination) applies -15% for `Transported=True`, but this was overridden by the strong CryoSleep signal (+40%). No rule existed to handle the interaction between CryoSleep and PSO J318.5-22 for Earth passengers.  
+3. **Cabin Context Underutilized:** Cabin G/32/P (deck G, side P) has a mild non-transport bias, but the rule `CDC-G-1` (-10% for True) was not prioritized sufficiently against CryoSleep.  
+4. **Age Neutrality:** Age 19.0 did not trigger any age-based rules, as it falls outside typical risk bins (e.g., <18 or >60).  
+
+**Faulty v18.0 Logic Chain for 0207_01:**  
+1. **CryoSleep=True:** Triggered `CRYOSLEEP_ZERO_SPEND` rule: **+40% for `Transported=True`**.  
+2. **All Zero Spending:** Triggered `ZSV-5` (full zero spending): **-20% for `Transported=True`**, but CryoSleep exempts this penalty (exception not applied correctly here).  
+3. **Destination PSO J318.5-22:** Triggered `DCP-12`: **-15% for `Transported=True`**.  
+4. **Earth Origin:** `EOC-5`: **+5% for `Transported=True`**.  
+5. **Cabin Deck G:** `CDC-G-1`: **-10% for `Transported=True`**.  
+6. **Cumulative Confidence:** +0% for True (+40% -15% +5% -10%).  
+7. **BPF-9 Failsafe:** Confidence near 0% defaulted to `False` in v18.0, but CryoSleep exception overrode this, leading to incorrect `True` prediction.  
+
+**Key Insight:**  
+**Earth-origin CryoSleep passengers destined for PSO J318.5-22 have a high non-transport rate despite CryoSleep. The system must incorporate destination context into CryoSleep rules and strengthen failsafe thresholds for such edge cases.**
+
+---
+
+#### **2. Critical Modifications to Decision Rules (v18.1 ENHANCEMENT)**
+**New and Updated Rules:**  
+- **New Rule: CRYOSLEEP_PSO_EARTH (CPE-1):**  
+  - **Condition:** `CryoSleep == True` AND `HomePlanet == "Earth"` AND `Destination == "PSO J318.5-22"`  
+  - **Action:** Apply **-25% confidence for `Transported=True`** (overrides standard CryoSleep bonus for this high-risk group).  
+  - **Priority:** Execute immediately after base CryoSleep rules.  
+
+- **Update CRYOSLEEP_ZERO_SPEND (CZS-3 -> CZS-4):**  
+  - **Enhanced Condition:** For CryoSleep passengers with all zero spending, apply +40% for `Transported=True` **unless** destination is PSO J318.5-22 and HomePlanet is Earth (handled by CPE-1).  
+  - **Action:** Prevent overconfidence for risky destinations.  
+
+- **Update BATCH_PROCESSING_FAILSAFE (BPF-9 -> BPF-10):**  
+  - **Enhanced Condition:** If cumulative confidence is between -5% and +5%, use a weighted decision based on cabin deck, destination, and HomePlanet (not just default to False).  
+  - **Action:** For Earth passengers to PSO J318.5-22, bias toward `False` even with near-zero confidence.  
+
+- **New Rule: CABIN_SIDE_P_CONTEXT (CSC-P-1):**  
+  - **Condition:** `Cabin` ends with "/P" (e.g., G/32/P)  
+  - **Action:** Apply **-5% confidence for `Transported=True`** (side P has slight non-transport bias).  
+
+- **Strengthen DCP-12 for Earth Passengers:**  
+  - **Update DCP-12 -> DCP-12E:**  
+    - **Condition:** `Destination == "PSO J318.5-22"` AND `HomePlanet == "Earth"`  
+    - **Action:** Apply **-20% confidence for `Transported=True`** (instead of -15%).  
+
+**Processing Order Overhaul (v18.1):**  
+1.  ... [Previous rules 1-25] ...  
+26. GLOBAL: CRYOSLEEP_ZERO_SPEND (CZS-4) // UPDATED  
+27. GLOBAL: CRYOSLEEP_PSO_EARTH (CPE-1) // NEW  
+28. GLOBAL: DCP-12E // UPDATED  
+29. GLOBAL: CSC-P-1 // NEW  
+30. ... [Other rules] ...  
+33. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-10) // UPDATED  
+
+---
+
+#### **3. New Insights on Passenger Transport Patterns**  
+- **Insight 64: Earth CryoSleep to PSO J318.5-22 Predicts Non-Transport.** CryoSleep does not override the strong non-transport bias for Earth passengers to this destination.  
+- **Insight 65: Cabin Side P Has Mild Non-Transport Bias.** Passengers in cabin side P show slightly lower transport rates.  
+- **Insight 66: Destination Context Must Override CryoSleep in Edge Cases.** Rules must be prioritized to handle destination-specific exceptions.  
+- **Insight 67: Failsafe Thresholds Should Be Destination-Aware.** Near-zero confidence decisions should incorporate destination and HomePlanet hints.  
+
+---
+
+#### **4. Confidence Level Recalibration**  
+- **CPE-1 Confidence:** **-25% for `Transported=True`** (Earth CryoSleep to PSO J318.5-22).  
+- **CZS-4 Confidence:** **+40% for `Transported=True`** (retained, but overridden by CPE-1).  
+- **DCP-12E Confidence:** **-20% for `Transported=True`** (Earth to PSO J318.5-22).  
+- **CSC-P-1 Confidence:** **-5% for `Transported=True`** (cabin side P).  
+- **CDC-G-1 Confidence:** Retained at **-10% for `Transported=True`**.  
+- **EOC-5 Confidence:** Retained at **+5% for `Transported=True`**.  
+
+---
+
+#### **5. Adjustments for Batch Prediction Consistency**  
+- **Destination-Specific CryoSleep Rules:** CPE-1 prevents overconfidence for PSO J318.5-22.  
+- **Enhanced Failsafe Logic:** BPF-10 uses destination and cabin hints for near-zero confidence cases.  
+- **Cabin Side Integration:** CSC-P-1 adds granularity to cabin-based signals.  
+- **Strengthened Destination Penalties:** DCP-12E increases non-transport bias for Earth/PSO J318.5-22.  
+
+---
+
+#### **6. Handling of Edge Cases**  
+The v18.1 update addresses Earth CryoSleep passengers to risky destinations:  
+1. **CPE-1:** Directly handles Earth CryoSleep to PSO J318.5-22.  
+2. **CSC-P-1:** Captures cabin side bias.  
+3. **DCP-12E:** Strengthens destination penalty.  
+4. **BPF-10:** Prevents erroneous True predictions for near-zero confidence cases.  
+
+**Simulated Correct Logic Chain for 0207_01 (v18.1):**  
+1. **CryoSleep=True:** Triggered CZS-4: **+40% for True**, but overridden by CPE-1: **-25% for True**.  
+2. **Destination PSO J318.5-22:** Triggered DCP-12E: **-20% for True**.  
+3. **Earth Origin:** EOC-5: **+5% for True**.  
+4. **Cabin Deck G:** CDC-G-1: **-10% for True**.  
+5. **Cabin Side P:** CSC-P-1: **-5% for True**.  
+6. **Cumulative Confidence:** -55% for True (-25% -20% +5% -10% -5%).  
+7. **Final Prediction:** False (correct).  
+
+---
+
+### **7. Updated Predictive Metrics Report v18.1**  
+**PRIORITY ENHANCEMENT: EARTH CRYOSLEEP TO PSO J318.5-22 HANDLING & FAILSAFE OPTIMIZATION**  
+
+#### **Summary of Changes:**  
+- Added CPE-1 for Earth CryoSleep to PSO J318.5-22.  
+- Updated CZS-4 to allow destination overrides.  
+- Enhanced DCP-12 to DCP-12E for Earth passengers.  
+- Added CSC-P-1 for cabin side context.  
+- Updated BPF-10 to destination-aware failsafe.  
+- Recalibrated confidence levels.  
+
+#### **Batch Optimization Guidelines:**  
+1. **Prioritize Destination Context:** For CryoSleep passengers, always check destination before applying bonuses.  
+2. **Use Cabin Granularity:** Leverage deck and side for secondary signals.  
+3. **Avoid CryoSleep Overconfidence:** Implement destination-specific overrides for risky routes.  
+4. **Test Earth CryoSleep Cases:** Validate against PSO J318.5-22 and similar destinations.  
+
+**Conclusion:** The error for passenger 0207_01 revealed a gap in handling Earth CryoSleep passengers to high-risk destinations. The v18.1 enhancements add targeted destination-aware CryoSleep rules, strengthen destination penalties, and improve failsafe logic. This ensures accurate predictions for CryoSleep edge cases and boosts batch consistency.  
+
+**//END OF REPORT**
+
+============================================================

@@ -1,0 +1,136 @@
+PREDICTIVE METRICS - ITERATION 87
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.7 (CRYOSLEEP ZERO-SPENDING CASE HANDLING)
+
+**Objective:** To correct the prediction error for Passenger 0110_04 by addressing the failure to properly handle CryoSleep passengers with zero spending across all categories. The model incorrectly applied non-CryoSleep spending validation rules, leading to a false negative prediction. This error highlights the need for stricter isolation of CryoSleep logic and prevention of rule leakage between CryoSleep and non-CryoSleep cases.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0110_04: What Went Wrong?
+
+The error for Passenger 0110_04 (HomePlanet=Europa, CryoSleep=True, Cabin=B/5/P, Destination=TRAPPIST-1e, Age=28.0, VIP=False, RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0) resulted from misapplication of spending validation rules meant for non-CryoSleep passengers and insufficient encapsulation of CryoSleep logic:
+
+**Key Failure Points:**
+- **CryoSleep Context Leakage:** Despite CryoSleep=True, the model likely proceeded to evaluate spending-based rules (e.g., NVA-1, AS-1, or CSV-1) that are designed for awake passengers, incorrectly applying penalties or overrides.
+- **Aggregate Spending Misinterpretation:** Rules like NVA-1 (NaN Validation Aggregation) or USZ-1 (Universal Zero Spending Validation) may have been triggered, reducing confidence due to all-zero spending, even though this is expected and neutral for CryoSleep passengers.
+- **Insufficient CryoSleep Isolation:** The processing order did not adequately prevent non-CryoSleep rules from affecting CryoSleep cases, especially when spending is zero.
+- **HomePlanet and VIP Context Underutilization:** For CryoSleep passengers, economic biases (e.g., Europa origin) and VIP status should have minimal impact on transport prediction, but the model may have applied context rules inappropriately.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.7)
+
+This update strengthens CryoSleep contextual overrides, introduces a dedicated rule for CryoSleep zero-spending cases, and ensures stricter isolation between CryoSleep and non-CryoSleep logic.
+
+**Enhance CryoSleep Contextual Override (Step 0.a):**
+- **CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v5):**
+  - IF `CryoSleep == True` → **Immediately set confidence to 80% for True and skip all subsequent spending-based rules (0.c through 0.m and 2.5)**, unless VIP=True or Age<13, which have their own overrides.
+  - **Rationale:** CryoSleep passengers are highly likely to be transported; spending patterns are irrelevant and should not influence prediction.
+
+**Add CryoSleep Zero-Spending Validation Rule (New Step 0.n):**
+- **CRYOSLEEP_ZERO_SPENDING_BOOST (CZS-2):**
+  - IF `CryoSleep == True` AND all spending categories (RoomService, FoodCourt, ShoppingMall, Spa, VRDeck) are 0.0 → **Apply +15% confidence boost** (stacking with CSO-1).
+  - **Rationale:** Zero spending is expected and confirms CryoSleep behavior, increasing transport likelihood.
+
+**Modify Universal Zero Spending Validation (Step 0.l):**
+- **USZ-1 REVISED v2:**
+  - Add condition: Skip USZ-1 if CryoSleep==True.
+  - **Rationale:** Prevent zero-spending penalties for CryoSleep passengers.
+
+**Adjust NaN Validation Aggregation (Step 0.h):**
+- **NVA-1 REVISED v2:**
+  - Add condition: Skip NVA-1 if CryoSleep==True.
+  - **Rationale:** Avoid unnecessary checks for CryoSleep cases.
+
+**Clarify Processing Order for CryoSleep:**
+- Ensure that after CSO-1, only age, VIP, and infant rules (e.g., ACB-2, ICB-1) are evaluated for CryoSleep passengers, with all spending rules bypassed.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **CryoSleep Zero Spending Confirms Transport Likelihood:** For CryoSleep passengers, all-zero spending is a strong indicator of transport, as they are unconscious and cannot spend.
+- **Rule Isolation is Critical:** Mixing CryoSleep and non-CryoSleep logic leads to errors; strict separation improves accuracy.
+- **Economic Biases Are Irrelevant Under CryoSleep:** HomePlanet or VIP status should not negatively impact CryoSleep predictions, as spending behavior is suspended.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - CSO-1 Enhanced v5: Base 80% confidence for CryoSleep=True.
+  - CZS-2: +15% boost for zero spending under CryoSleep.
+- **Adjusted Rules:**
+  - USZ-1 Revised v2: No penalty for CryoSleep.
+  - NVA-1 Revised v2: No action for CryoSleep.
+- **Confidence Stacking:** For CryoSleep with zero spending: 80% (CSO-1) + 15% (CZS-2) = 95% confidence.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening for CryoSleep:** Flag all CryoSleep=True passengers and process them through CSO-1 immediately, skipping irrelevant rules.
+- **Batch Validation:** Post-batch, review all CryoSleep cases to ensure no spending rules were applied.
+- **Error Logging:** Monitor CryoSleep predictions with confidence <80% to detect rule leakage.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **CryoSleep with Non-Zero Spending:** Handled by existing rules (e.g., VCSP-1 for verified CryoSleep spending patterns).
+- **CryoSleep with NaN Spending:** Use NVA-1 only if CryoSleep=False; otherwise, assume zero spending and apply CZS-2.
+- **Fallback:** If CryoSleep status is ambiguous, conservatively apply non-CryoSleep rules with lower confidence.
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.7
+
+**Processing Order v7.7:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v5)** // **UPDATED RULE**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED v3)**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1 REVISED v2)** // **UPDATED RULE**
+**0.i. CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1 REVISED)**
+**0.j. CRYOSLEEP_ZERO_RISK_VALIDATION (CZR-1)**
+**0.k. LUXURY_SPENDING_GAP_VALIDATION (LSG-1 REVISED v3)**
+**0.l. UNIVERSAL_ZERO_SPENDING_VALIDATION (USZ-1 REVISED v2)** // **UPDATED RULE**
+**0.m. CONTRADICTORY_SPENDING_VALIDATION (CSV-1)**
+**0.n. CRYOSLEEP_ZERO_SPENDING_BOOST (CZS-2)** // **NEW RULE**
+1.  **ZDL-1 (CRYOSLEEP-EXEMPT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED v2)
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+3.5. INFANT_CONTEXT_BOOST (ICB-1)
+3.6. HOMEPLANET_ECONOMY_BIAS_VALIDATION (HEB-1)
+... (Remaining rules) ...
+12. DEFAULT (DF-1 REVISED v2) // 65% confidence
+
+---
+
+### New Scoring Example for Passenger 0110_04 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.7 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0110_04** (Europa, CryoSleep=True, Cabin=B/5/P, Destination=TRAPPIST-1e, Age=28.0, VIP=False, RoomService=0.0, FoodCourt=0.0, ShoppingMall=0.0, Spa=0.0, VRDeck=0.0) | **CSO-1 Enhanced v5**: Activated → confidence set to 80%, skip rules 0.c-0.m and 2.5 → **CZS-2**: Activated (all spending zero) → +15% boost → **ACB-2**: Not triggered (age 28) → **ICB-1**: Not triggered → **HEB-1**: Skipped (CryoSleep context) → **DF-1 Revised v2**: Not reached | **True** | **95%** (CSO-1: 80% + CZS-2: +15%) |
+
+*The new rules correctly isolate CryoSleep logic and boost confidence for zero spending, resulting in a True prediction.*
+
+---
+
+### Implementation Plan for v7.7
+
+- **Deploy v7.7 immediately.** Reprocess the batch; validate 0110_04 is now True with high confidence.
+- **Monitor** all CryoSleep cases to ensure no spending rules are erroneously applied.
+- **Update historical batches** with enhanced CryoSleep rules.
+- **Long-term:** Implement unit tests for CryoSleep isolation and zero-spending scenarios.
+
+This update ensures accurate handling of CryoSleep passengers, preventing false negatives and improving batch accuracy.
+
+**Final Note:** Next, review VIP and Age interactions with CryoSleep to further refine confidence boosts for edge cases like VIP infants in CryoSleep.
+
+============================================================

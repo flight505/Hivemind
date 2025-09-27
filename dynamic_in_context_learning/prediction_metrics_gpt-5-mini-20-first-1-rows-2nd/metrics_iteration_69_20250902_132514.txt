@@ -1,0 +1,316 @@
+PREDICTIVE METRICS - ITERATION 69
+============================================================
+
+Updated Predictive Metrics Report — v3.5.5 (post_0097_01)
+
+Version & high‑level goal
+- Version: v3.5.5 (post_0097_01).
+- High‑level goal: preserve v3.5.2/3 improvements (per‑channel spend bins, conditional concentrated‑spend exceptions, extended zero_spend trust, multi‑channel subslice trust) and the v3.5.4 concentrated_top1 fixes, while:
+  - eliminating confident false positives for concentrated top‑K patterns in novel contexts (new failure 0097_01),
+  - preserving recall for legitimate concentrated positives (e.g., 0084_01),
+  - making calibrator + uncertainty channel×pattern aware (top1/top2/topK),
+  - enforcing conservative single‑record (n==1) gating for untrusted top‑K patterns,
+  - accelerating active learning for concentrated/multi‑channel contradictions.
+
+Executive summary — immediate takeaway & top priorities
+- New failure observed (batch error): 0097_01 — Europa, CryoSleep=False, Cabin=A/2/S, Destination=TRAPPIST-1e, Age=54, RoomService=0, FoodCourt=1208, ShoppingMall=0, Spa=3, VRDeck=637 → predicted True, actual False (FP). Pattern: concentrated_top2 (FoodCourt + VRDeck dominate; top2_share ≈ 0.998).
+- Why this matters: v3.5.* changes focused on concentrated_top1 and multi_channel slices but did not sufficiently generalize to top‑K concentrated patterns (top2 combos). The calibrator and slice_trust_table lacked top2 combo awareness; single‑record gating allowed a confident FP for a novel top‑2 combination.
+- Top immediate priorities:
+  1. 0–48h: Apply conservative n==1 gating for untrusted concentrated_top2 (and general top‑K) — block auto‑accept unless extreme consensus.
+  2. 0–72h: Extend slice_trust_table to include top‑K subslices (ordered top2 combos and topK combos), compute priors and trust flags, and use hierarchical pooling for sparse combos.
+  3. 2–14d: Retrain GLM_fallback + covariate calibrator including top2 features (top2_share, topK_combo_id, pairwise channel interactions), novel pattern covariates and grouped CV by subslice_id and pattern_type.
+  4. Weekly: Aggressively prioritize labeling for concentrated contradictions (both FPs and FNs) — top2 combinations get high AL priority.
+
+Primary error details (concrete)
+- 0097_01 features:
+  - total_spend ≈ 1848; num_nonzero_channels = 3; top_channel_share ≈ 0.654 (FoodCourt), top2_share ≈ 0.998 (FoodCourt + VRDeck) → pattern_type = concentrated_top2.
+  - Model outcome: ensemble + calibrator produced high positive p_final → pred True. Actual was False → FP.
+- Contrast with prior failures:
+  - 0092_01 was concentrated_top1 ShoppingMall FP; v3.5.4 addressed top1 with trusted_subslice gating. 0097_01 shows the gap: top2 concentrated combos (two high channels together) are a distinct pattern and require their own trust and penalty logic.
+
+Short root causes
+- Missing top‑K (especially top2) pattern handling: slice_trust_table lacked ordered top‑2 combo subslices (channel pairs × context).
+- Calibrator lacked top2/topK covariates and pairwise channel interaction features — it favored absolute spend magnitude uniformly.
+- SE underestimation on rare top2 subslices → overconfident p_final.
+- Small‑batch (n==1) auto‑decision allowed confident FP in a novel top2 context.
+- Global concentrated relaxation (v3.5.3/v3.5.4) was applied unevenly to patterns where channel semantics differ (FoodCourt+VRDeck behave differently from RoomService concentrated positives).
+
+Answers to the six questions (targeted & actionable)
+
+1) What specific patterns in the current metrics led to this prediction error?
+- Observed pattern: concentrated_top2 where two channels (FoodCourt, VRDeck) account for nearly all spend (top2_share ≈ 0.998), low spend entropy, small residual spend in a third channel.
+- Why the model overpredicted:
+  - Ensemble & prior mixture over‑weighted absolute total_spend and global concentrated heuristics without channel‑pair context.
+  - Calibrator had no explicit top2 covariates (top2_share, top2_combo_id) and so mapped large p_combined → high p_final uniformly.
+  - slice_trust_table did not contain a trusted top2_subslice for (FoodCourt,VRDeck, Age=54, deck=A, dest=TRAPPIST-1e); novelty_score high; se floor too small for such sparse combos.
+  - n==1 gating allowed confident auto‑accept for untrusted, novel top2 pattern.
+- Measurable indicators to detect similar risk:
+  - top2_share ≥ 0.90 (or spend_entropy ≤ 0.15) combined with N_subslice (top2_combo key) < threshold.
+  - High novelty_score (inverse frequency of exact (topK_combo, age_bucket, deck, dest) key).
+  - High p_combined with elevated model_disagreement and combined se near default floor.
+  - n==1 batch size.
+
+2) How should the decision rules be modified to prevent similar errors?
+Principles:
+- Treat concentrated_topK as pattern_type specific: top1, top2, topK generalization. Trust must be per‑K and per‑combo (channel semantics matter).
+- Only relax concentrated penalties if a Trusted topK_subslice exists (or pooled evidence reaches effective N).
+- For untrusted topK combos, increase uncertainty and apply a negative logit shift scaled by novelty and K.
+
+Concrete rule changes (immediate implementable)
+- Pattern detection:
+  - concentrated_top1: top_channel_share ≥ 0.80 OR (spend_entropy ≤ 0.25 AND top_channel_share ≥ 0.70).
+  - concentrated_top2: top2_share ≥ 0.90 OR (spend_entropy ≤ 0.15 AND top2_share ≥ 0.75).
+  - Else multi_channel or dispersed.
+  - Pattern precedence: top1 → top2 → multi_channel → dispersed.
+- Trusted_topK_subslice:
+  - Key: (ordered_topK_channel_tuple, age_bucket, deck, destination).
+  - Trust criteria per K:
+    - K=1: N_subslice ≥ 50
+    - K=2: N_subslice ≥ 30
+    - K>=3: N_subslice ≥ 20
+  - And TP_rate ≥ slice_trust_TP_threshold (init 0.70). Sweep ranges noted below.
+  - Allow effective N via hierarchical pooling (see pooling).
+- Outlier logit penalty (untrusted concentrated):
+  - If pattern == concentrated_topK AND not Trusted:
+    - logit_new = logit_old − δ_logit_conc_K * novelty_scale
+    - δ_logit_conc_K init: {K=1: 0.90, K=2: 0.80, K>=3: 0.60}. Sweep ranges K=1 {0.6–1.2}, K=2 {0.5–1.0}.
+    - novelty_scale = min(1, novelty_score / novelty_scale_denom) where novelty_scale_denom ≈ 95th percentile of novelty_score.
+- SE & uncertainty:
+  - Base min SE per context:
+    - trusted_slice_floor = 0.02
+    - concentrated_nontrusted_floor_K1 = 0.07
+    - concentrated_nontrusted_floor_K2 = 0.09
+    - multi_channel_nontrusted_floor = 0.06
+    - extreme_novelty_floor = 0.10
+  - var_pattern scale κ_K: {K=1:1.0, K=2:1.5, multi:1.2}
+- n==1 gating:
+  - If batch n==1 AND pattern_type in {concentrated_top1, concentrated_top2} AND NOT Trusted:
+    - Do not auto‑accept. Route to priority_audit unless:
+      - p_final > extreme_consensus_threshold_K (K=1:0.995; K=2:0.998) AND ensemble agreement > 0.98 AND novelty_score < low_novelty_threshold.
+- Calibrator:
+  - Replace simple global Platt with covariate‑aware calibrator (LightGBM/GBM or shallow NN) that accepts p_combined and context features: pattern_type, topK_combo_id, top_channel_share, top2_share, spend_entropy, num_nonzero_channels, age_bucket, cabin_deck, destination, model_disagreement, subslice_trust_flag, novelty_score. Use grouped CV by subslice_id & pattern_type.
+  - Allow channel‑pair / combination features to learn negative/positive channel‑specific corrections (e.g., (FoodCourt,VRDeck) may decrease p).
+- Hierarchical pooling:
+  - When N_subslice < min_n_K, pool up to level(s): topK combo → single channel bin → channel spending bin → global. Use empirical Bayes shrinkage:
+    - w_subslice = N_subslice/(N_subslice + τ_K)
+    - pooled_prior = w_subslice * subslice_prior + (1−w_subslice) * higher_level_prior
+  - τ_K initial: K=1:100; K=2:200 (heavier pooling for rarer combos). Sweep ranges included below.
+
+3) What new insights does this error reveal about passenger transport patterns?
+- Two‑channel concentration (top2) is a distinct behavior pattern with semantics different from top1 concentration. High combined spends in FoodCourt+VRDeck often reflect leisure/consumption patterns that are not as predictive of transport outcome as high RoomService concentration.
+- Channel semantics (which channels are high) and demographic/context (age_bucket, deck, destination) materially change predictive direction — e.g., older passengers on certain decks with FoodCourt+VRDeck high spend may correlate with False.
+- Absolute spend magnitude alone is insufficient — the topK composition, pairwise channel interactions and context matter.
+- Single‑record (n==1) predictions are a frequent source of overconfident errors in novel topK combos.
+
+4) How should confidence levels be recalibrated for more accurate batch predictions?
+- Pattern‑aware variance model:
+  - var_slice ≈ posterior_mean_slice*(1−posterior_mean_slice)/(N_subslice + 1).
+  - var_pattern = κ_K * f(n_nonzero, spend_entropy, novelty_score) — κ_K as above; f() increases with lower entropy and higher novelty.
+- Combined variance:
+  - var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern.
+  - var_novelty_conditional = (no_trusted_subslice ? κ_novelty * novelty_score : small_floor).
+- SE floors (contextual):
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor_K1 = 0.07
+  - concentrated_nontrusted_floor_K2 = 0.09
+  - multi_channel_nontrusted_floor = 0.06
+  - extreme_novelty_floor = 0.10
+- z_adj for decisioning:
+  - z_adj = base_z * (1 + γ1 * FP_risk + γ2 * model_disagreement + γ3 * novelty_score)
+  - If trusted_slice_flag True → z_adj *= (1 − λ_trust)
+  - base_z = 1.645; γs init {1.0, 0.6, 1.0}; λ_trust = 0.35.
+- Calibrator change:
+  - Use covariate calibrator to map p_after_penalty + context → p_final; calibrator will typically reduce p_final for untrusted concentrated_top2 combos, and increase for trusted concentrated patterns.
+
+5) What adjustments are needed for better consistency across batch predictions?
+- Deterministic snapshotting: snapshot models, calibrator, slice_trust_table, hyperparams at batch start and tag outputs with snapshot_id.
+- Stricter small‑batch policy:
+  - For n < small_batch_min (small_batch_min = 10) apply stronger SE floors and stricter auto‑accept gating; n==1 conservative by default.
+- Provenance & audit logging: per record log pattern_type, topK_combo_id, N_subslice(s), p_prior components, p_ens, p_combined_prepenalty, applied_logit_shifts, var_components, se_combined, p_final, decision_reason_code.
+- Canary & rollout checks:
+  - Block rollout if concentrated_top2 FP rate increases > 5 percentage points vs canary baseline or if concentrated recall drops > 2 percentage points.
+- CI & regression: add unit tests for top2 concentrated FP (0097_01) and concentrated FN (0084_01).
+
+6) How can the metrics be improved to handle edge cases like this one?
+- New per‑record features to compute & persist:
+  - top_channel_id, top_channel_share, top2_share, topK_combo_id (ordered tuple), spend_entropy, num_nonzero_channels, pairwise_channel_flags (e.g., FoodCourt_VRDeck_flag), novelty_score, pattern_type.
+- Model & training changes:
+  - GLM_fallback v14 → include pattern_type, topK combo features (one‑hot/embedding for top combos, hashed encoding for long tail), top2_share, spend_entropy, num_nonzero_channels, interactions (pattern_type × age_bucket, pattern_type × deck, pairwise channels).
+  - Calibrator v4 → covariate GBM with grouped CV by topK_combo_id and pattern_type; monotonic constraints where domain knowledge supports.
+- Hierarchical smoothing:
+  - Empirical Bayes pooling for topK_subslice priors across related groups using τ_K pooling factors (higher τ for rarer K).
+- Active learning:
+  - Prioritize concentrated_top2 contradictions; sample them for manual label acquisition until N_subslice >= min_n_by_K or proxy confidence stabilizes.
+- Preprocessing & transforms:
+  - Keep raw spend values for subslice keying; use winsorized/log1p spends to the predictive models to reduce leverage of extremes.
+- Monitoring additions:
+  - Per‑pattern ECE, Brier, precision/recall, audit precision by pattern_type and by channel pair.
+  - Track time‑to‑trust: how many labels needed to mark a subslice Trusted.
+
+Updated deterministic scoring pipeline — v3.5.5 (condensed flow)
+1. Snapshot load at batch start: channel_spend_bin, channel_spend_stats, slice_trust_table (zero_spend, concentrated_subslices top1/top2/topK, multi_channel_subslices), models & calibrators, hyperparams, snapshot_id.
+2. Preprocessing per record:
+   - Compute total_spend, num_nonzero_channels, spend_entropy, ordered topK channels, top_channel_share, top2_share, topK_combo_id, Age_bucket, Cabin_deck, Destination.
+   - Determine pattern_type ∈ {zero, concentrated_top1, concentrated_top2, concentrated_topK, multi_channel, dispersed}.
+   - Compute novelty_score (inverse frequency of exact subslice key); generate concentrated_subslice_key for K matching pattern.
+3. Prior lookups:
+   - Look up channel_spend_bin priors & concentrated_topK_subslice priors (if present). Compute pooled prior via hierarchical weights:
+     - w_subslice = N_subslice/(N_subslice + τ_K)
+     - pooled_prior = w_subslice * subslice_prior + (1−w_subslice) * channel_bin_prior (and higher pools as needed).
+4. Model inference:
+   - Run GLM_fallback v14, aggregator and SRM; obtain p_ens ± se_ens and model_disagreement.
+5. p_combined_prepenalty:
+   - p_prior = pooled_prior.
+   - p_combined_prepenalty = α_prior * p_prior + α_ens * p_ens.
+6. Outlier & pattern handling (key change):
+   - If pattern_type == concentrated_topK:
+     - If concentrated_topK_subslice is Trusted → suppress concentrated penalty; low SE floor.
+     - Else → apply negative logit shift (δ_logit_conc_K * novelty_scale), inflate var_pattern and set concentrated_nontrusted_floor_K.
+   - If pattern_type == multi_channel: apply multi_channel rules and multi_channel_subslice trust similarly.
+7. Variance & SE:
+   - Compute var_combined = α_prior^2*var_prior + α_ens^2*var_ens + var_novelty_conditional + β_slice*var_slice + β_pattern*var_pattern.
+   - se_combined = sqrt(max(var_combined, base_min_se(context)^2)).
+8. Calibrate:
+   - p_after_penalty = inv_logit(logit(p_combined_prepenalty) + applied_logit_shifts).
+   - p_final = covariate_calibrator.predict([p_after_penalty, pattern_type, topK_combo_id, top_channel_share, top2_share, spend_entropy, num_nonzero_channels, model_disagreement, subslice_trust_flag, novelty_score]).
+9. Decisioning & gating:
+   - If Trusted_subslice_flag True and p_final ≥ accept_threshold_trusted → auto‑accept.
+   - Else if n==1 AND pattern_type in {concentrated_top1, concentrated_top2} AND NOT Trusted → route to priority_audit unless p_final > extreme_consensus_threshold_K & ensemble agreement high & novelty low.
+   - Else standard thresholding with pattern‑aware z_adj.
+10. Persist per‑record provenance and append contradictions to active learning queues.
+11. Post‑batch: update slice_trust_table counts with labels (exponential decay), retrain triggers if contradictions exceed thresholds.
+
+Default hyperparameters (initial; tuning required)
+- Pattern detection:
+  - top1 thresholds: as before.
+  - top2 threshold: top2_share ≥ 0.90 OR (spend_entropy ≤ 0.15 AND top2_share ≥ 0.75).
+- concentrated_min_n_by_K: {K=1:50 (sweep 30–100), K=2:30 (sweep 20–60), K>=3:20 (sweep 15–40)}.
+- slice_trust_TP_threshold = 0.70
+- τ_K (pooling factor) = {K=1:100 (sweep 40–200), K=2:200 (sweep 80–400)}
+- base_min_se:
+  - trusted_slice_floor = 0.02
+  - concentrated_nontrusted_floor_K1 = 0.07
+  - concentrated_nontrusted_floor_K2 = 0.09
+  - multi_channel_nontrusted_floor = 0.06
+  - extreme_novelty_floor = 0.10
+- δ_logit_conc_K = {K=1:0.9 (0.6–1.2), K=2:0.8 (0.5–1.0)}
+- extreme_consensus_threshold_K = {K=1:0.995, K=2:0.998}
+- small_batch_min = 10
+- base_z = 1.645; γs = {1.0, 0.6, 1.0}; λ_trust = 0.35
+- calibrator: LightGBM with grouped CV by subslice_id & pattern_type; allow monotonic constraints per channel where domain supports
+- ensemble weights start: aggregator 0.45, GLM 0.30, SRM 0.25 (tunable)
+
+Validation experiments & acceptance criteria
+- Test sets:
+  - Historical failing cases: 0084_01 (concentrated FN), 0086_01 (multi_channel FP), 0092_01 (concentrated_top1 FP), 0097_01 (concentrated_top2 FP).
+  - Synthetic concentrated_topK OOD cases across Age_bucket × deck × dest and channel pairs (FoodCourt+VRDeck, RoomService+VRDeck, etc.).
+  - Recent live batches (shadow).
+- Metrics to monitor:
+  - Per‑pattern precision/recall (concentrated_top1, concentrated_top2, multi_channel).
+  - Per‑combo FP rate for top pairs (FoodCourt+VRDeck).
+  - Overall Brier score, ECE, CI coverage.
+  - Small‑batch (n==1) FP/FN rates.
+  - Audit queue size and audit precision.
+- Acceptance criteria vs v3.5.4 baseline:
+  - Multi_channel/top2 FP rate: ≥30% relative reduction on historical multi_channel/top2 FP cases (esp. FoodCourt+VRDeck).
+  - Concentrated_top1 FP rate (per channel): ≥25% relative reduction (preserve v3.5.4 improvements).
+  - Concentrated recall loss ≤2% absolute.
+  - Overall FN increase ≤3% absolute.
+  - Audit queue may increase up to 1.5× for 2 weeks; must decline after 4 weeks as AL labels accumulate.
+- Parameter sweeps:
+  - concentrated_min_n_by_K, τ_K, δ_logit_conc_K, concentrated_nontrusted_floor_K2.
+- Ablations:
+  - Remove top2_subslice trust → measure re‑increase in top2 FP.
+  - Calibrator without top2 covariates → measure calibration deterioration for top2 slices.
+
+Unit test matrix (add to CI)
+- Case A (audit expected): concentrated extreme RoomService with no Trusted subslice → priority_audit.
+- Case B (trusted accept expected): zero_spend & CryoSleep True → auto‑accept.
+- Case C (trusted accept expected): zero_spend child deck F with Trusted subslice → auto‑accept.
+- Case D (concentrated accept expected): 0084_01 (RoomService concentrated) → if Trusted → auto‑accept; if not → audit.
+- Case E (concentrated_top1 nontrusted): 0092_01 (ShoppingMall concentrated) → reduced p_final & route_to_audit or predict False.
+- Case F (multi_channel FP): 0086_01 → reduced p_final & audit routing if untrusted.
+- Case G (concentrated_top2 nontrusted): 0097_01 (FoodCourt=1208, VRDeck=637 ...) → expected: substantial p_final reduction and route_to_audit for n==1; at minimum avoid confident FP auto‑accept.
+- Case H (OOD synthetic): unseen extreme multi_channel spends → verify logit penalty + higher SE + audit routing.
+- Case I (regression): ensure concentrated_spend recall for trusted subslices does not fall >2% abs.
+
+Per‑record provenance fields to persist (new)
+- snapshot_id, pattern_type, topK_combo_id (ordered), top_channel_id, top_channel_share, top2_share, topK_channel_list, spend_entropy, num_nonzero_channels, concentrated_subslice_key, N_subslice, subslice_trust_flag, subslice_posterior_mean, subslice_posterior_se, p_prior, p_ens, se_ens, p_combined_prepenalty, applied_logit_shift_amount, var_components_breakdown, se_combined, p_final, decision_reason_code, audit_routing_flag, model_disagreement_score, novelty_score, chosen_threshold, z_adj.
+
+Immediate operational actions (0–72 hours)
+1. Data engineering:
+   - Compute topK ordered combos and aggregate topK_subslice stats (N_subslice, TP_rate, posterior_mean, posterior_se) and add to slice_trust_table.
+   - Expose per‑record topK features and novelty_score into feature store.
+2. Scoring engine (shadow + safe):
+   - Implement immediate stricter n==1 gating for untrusted concentrated_top2 and topK: prevent auto‑accept for such records (route to priority_audit).
+   - Implement negative logit shift for untrusted concentrated_top2 (δ_logit_conc_K2 = 0.8) and raise concentrated_nontrusted_floor_K2 to 0.09.
+   - Add provenance logging fields.
+   - Shadow run updated scorer across last N batches including 0084_01, 0086_01, 0092_01, 0097_01.
+3. ML:
+   - Prepare retraining plan for GLM_fallback v14 and covariate calibrator with new topK features and grouped CV (2–14 days).
+   - Assemble active learning priority lists for concentrated_top2 contradictions (targeted sampling).
+4. Ops/SRE:
+   - Add canary metrics: concentrated_top2 FP rate by channel pair (FoodCourt+VRDeck), concentrated recall, n==1 auto_accept rate.
+   - Block full rollout until acceptance criteria met.
+5. Product/ops:
+   - Update audit triage to prioritize concentrated_top2 contradictions for human review and labeling.
+6. Monitoring:
+   - Dashboards for topK pattern distribution, novelty, per‑pattern ECE/Brier, and audit precision.
+
+How the updated pipeline will handle concrete cases
+- 0097_01 (FoodCourt+VRDeck concentrated FP):
+  - Preprocess: pattern_type = concentrated_top2; top2_combo_key = (FoodCourt, VRDeck, Age_bucket=50s, deck=A, dest=TRAPPIST-1e).
+  - Lookup: top2_subslice likely not Trusted (small N) → apply negative logit shift (δ_logit_conc_K2 × novelty_scale), inflate var_pattern, set SE floor = 0.09.
+  - Calibrator (pattern aware) downweights p_after_penalty → p_final reduced.
+  - n==1 gating triggers: because NOT Trusted, route to priority_audit unless extreme consensus; avoids confident FP auto‑accept.
+- 0092_01 (ShoppingMall concentrated):
+  - Preprocess: pattern_type = concentrated_top1.
+  - Lookup: if no Trusted subslice → negative logit shift (δ_logit_conc_K1) + SE floor 0.07; route to audit for n==1. If later labels support Trust → suppress penalty and low SE floor to restore recall.
+
+Expected tradeoffs & mitigations
+- Tradeoffs:
+  - Short‑term audit queue increase for concentrated_top2 + topK untrusted patterns while labels accumulate.
+  - Slightly more conservative predictions for untrusted top2 combos → lower FP but possibly more manual review.
+- Mitigations:
+  - Prioritize active learning for concentrated_top2 contradictions.
+  - Hierarchical pooling to draw strength from related slices (single channel, channel bin) to reduce audit load.
+  - Gradual relaxation of gating as subslice N and TP_rate stabilize.
+
+Deliverables (next artifacts)
+- Deterministic scorer pseudocode implementing topK/channel‑aware concentrated logic, pattern detection, conditional outlier penalties, covariate calibrator call, gating.
+- topK_subslice aggregation & retention/decay script (daily).
+- slice_trust_table extension docs (schema and decayed counts).
+- Retrain artifacts: GLM_fallback v14 + covariate calibrator + stratified validation report (include 0084_01, 0086_01, 0092_01, 0097_01).
+- CI unit test suite including new case 0097_01.
+- Dashboard & canary configuration for topK FP and concentrated recall.
+- 72‑hour implementation checklist mapped to owners.
+
+Pseudocode skeleton (high level)
+- For each record:
+  - compute total_spend, num_nonzero, spend_entropy, ordered topK, top_channel_share, top2_share, age_bucket, cabin_deck, destination
+  - determine pattern_type ∈ {zero, concentrated_top1, concentrated_top2, concentrated_topK, multi_channel, dispersed}
+  - form concentrated_subslice_key_K = (ordered_topK_tuple, age_bucket, deck, destination)
+  - lookup subslice_posterior & N_subslice; subslice_trust_flag = (N_subslice ≥ concentrated_min_n_by_K[K] AND TP_rate ≥ slice_trust_TP_threshold)
+  - pooled_prior = hierarchical_pooling(concentrated_subslice, channel_bin_prior, τ_K)
+  - run ensemble → p_ens ± se_ens; model_disagreement = var(models)
+  - p_combined_prepenalty = α_prior * pooled_prior + α_ens * p_ens
+  - If pattern_type is concentrated_topK AND NOT subslice_trust_flag:
+    - logit_shift = −δ_logit_conc_K * novelty_scale
+    - var_pattern += var_inflation_conc_K
+    - se_floor = concentrated_nontrusted_floor_K
+  - compute var_combined and se_combined = sqrt(max(var_combined, se_floor^2))
+  - p_after_penalty = inv_logit( logit(p_combined_prepenalty) + logit_shift )
+  - p_final = covariate_calibrator.predict([p_after_penalty, pattern_type, topK_combo_id, top_channel_share, top2_share, spend_entropy, num_nonzero, model_disagreement, subslice_trust_flag, novelty_score])
+  - If n==1 AND pattern_type concentrated_topK AND NOT subslice_trust_flag: route to priority_audit unless p_final > extreme_consensus_threshold_K & ensemble agreement high
+  - Else decide using p_final and z_adj
+  - Log provenance and update active learning queues if contradiction
+
+One‑line summary
+v3.5.5 generalizes concentrated handling to top‑K (not just top1), adds channel‑pair (top2) subslice trust and penalties, raises uncertainty for untrusted top2 combos, enforces conservative single‑record gating, and retrains a covariate calibrator — preventing confident top2 FPs like 0097_01 while preserving recall for legitimate concentrated positives.
+
+Recommended immediate next actions
+1) Implement topK_subslice aggregation and n==1 conservative gating for untrusted concentrated_top2 as a shadow/safe change within 24–48h (ensure 0097_01‑like records do not auto‑accept). 2) Prepare GLM_fallback v14 & covariate calibrator retrain (2–14d) with grouped CV and active learning focus on topK contradictions.
+
+I can deliver the deterministic scorer skeleton + minimal CI test suite (including 0097_01 and 0092_01) first, then the topK_subslice aggregation script and calibrator training plan. Which would you like me to produce first?
+
+============================================================

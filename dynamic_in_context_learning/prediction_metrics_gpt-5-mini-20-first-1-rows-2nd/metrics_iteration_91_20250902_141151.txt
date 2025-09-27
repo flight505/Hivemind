@@ -1,0 +1,321 @@
+PREDICTIVE METRICS - ITERATION 91
+============================================================
+
+Updated Predictive Metrics Report — v3.11.1 (post_0114_01 triage)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): n==1 record 0114_01 was predicted True but label=False (FP). The record had high total spend (sum_spend=907) distributed across many channels (num_nonzero_channels=5, top1_share≈0.473) and sits just below the global S_high=1000. The scorer treated this as a strong “high-spend” positive signal and produced a confident positive prediction. Root causes: (a) the system over-relied on aggregate spend as a positive signal without distinguishing concentrated vs dispersed patterns; (b) pooled_prior and GLM_fallback lacked explicit spend-pattern (dispersion) × Age × HomePlanet interactions; (c) variance/gating did not treat “borderline-high but dispersed” cases as high uncertainty → unsafe auto-decision on n==1; (d) no dedicated slice/monitor for borderline_multichannel_high patterns.
+- Immediate implication: v3.11.0 addressed concentrated_rel cases but missed dispersed/borderline-high patterns. We must treat dispersion (entropy/num_nonzero_channels/topk_shares) as first-class. For n==1 and borderline_total_spend near S_high, require stricter gating unless strong per-slice consistency and fallback/ensemble consensus exist.
+- Top priorities (0–72h):
+  1. Add dispersion detection: spend_entropy, num_nonzero_channels, topk_shares; implement borderline_sum_flag for sum_spend in [S_high − δ, S_high + δ] (suggest δ=150).
+  2. Expand pooled_prior & GLM_fallback to include spend_pattern × Age_bucket × HomePlanet interactions and spendpattern buckets (concentrated_abs/rel, dispersed_borderline, dispersed_high).
+  3. Add var_dispersion and var_borderline to variance; raise SE floors dynamically for dispersed & borderline cases.
+  4. Harden n==1 gating for borderline_multichannel_high: route to priority_audit unless strong per-channel dispersion consistency + GLM_fallback/ensemble consensus.
+  5. Persist per-record provenance for dispersion features and gating_reasons; add 0114_01 to CI canaries with NO auto-accept expectation by default.
+  6. Retrain calibrator/GLM_fallback to include dispersion features and upweight borderline_multichannel contradictions in loss.
+
+Direct answers to the six requested questions (concise)
+1) Signals that led to this error
+   - High total spend (sum_spend=907) but below global S_high (1000) → treated as high-spend positive.
+   - Dispersed pattern: num_nonzero_channels=5, top1_share≈0.473, top2_share≈0.262 → no concentration signal; model lacked explicit dispersion features so positive sum_spend dominated.
+   - pooled_prior lacked spendpattern × Age_bucket × HomePlanet interaction; historical negative association in this dispersed slice (Age 27, Earth) was not injected.
+   - Variance model did not include var_dispersion/var_borderline → se_combined underestimated uncertainty for borderline-high & dispersed single-record cases.
+   - n==1 gating only handled concentrated_high and relative_concentration_high—this dispersed/borderline slice bypassed strict gating.
+
+2) Decision-rule changes to prevent recurrence
+   - Define borderline_sum_flag: sum_spend in [S_high − δ, S_high + δ] (δ default 150); if true AND dispersion_high (num_nonzero_channels ≥ 3 AND top1_share ≤ 0.6 OR entropy_norm ≥ 0.45) → treat as borderline_multichannel_high.
+   - For n == 1 AND borderline_multichannel_high:
+       - If strong_dispersion_consistency (consistency_disp ≥ 0.80 & N_disp_samples ≥ 15):
+           - Allow auto-decision only when (ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06) OR GLM_fallback agrees AND pooled_prior directionality consistent.
+       - Else → priority_audit (stopgap).
+   - For n ≤ 3 use stricter thresholds (agreement +0.002, se −0.01).
+   - Always log gating_reasons; block auto-accept for borderline_multichannel_high unless strict criteria met.
+
+3) New pattern insights
+   - High total spend is not a monolithic positive predictor: concentrated_high and dispersed_high can have opposite polarities within the same channel or age slice.
+   - Borderline-total spend (near S_high) is particularly fragile — small distributional shifts or missing pooled_prior interactions lead to large prediction swings.
+   - Dispersion metrics (entropy, topk_shares, num_nonzero_channels) reveal distinct behavioral slices with different outcome propensities, often modulated by Age_bucket and HomePlanet.
+
+4) Confidence recalibration summary
+   - Add var_dispersion and var_borderline to capture uncertainty introduced by spread-out spend and proximity to S_high.
+   - Dynamic SE floors:
+       - dispersed_borderline & strong_dispersion_consistency → floor = 0.07
+       - dispersed_borderline & weak_dispersion_consistency → floor = 0.22
+       - concentrated_abs & strong_consistent_channel → floor = 0.06 (unchanged)
+       - default base_min_se(context) still applies for other cases.
+   - Retrain calibrator to output p10/p50/p90 and sd and include: spend_entropy, num_nonzero_channels, topk_shares, borderline_sum_flag, normalized_spend_by_channel, concentration_type, and p_after_logit_shift.
+
+5) Consistency adjustments
+   - Standardize spend_pattern detection (concentration vs dispersion vs borderline) across scorer, pooled_priors, calibrator, and gating so all components interpret the slice the same way.
+   - Compute and persist per-channel & per-pattern S_high_quantiles, medians, and dispersion baselines to make thresholds reproducible.
+   - Seed slice_trust_table with spendpattern × channel × HomePlanet × Age_bucket statistics.
+
+6) Metric improvements for edge cases
+   - Create "borderline_multichannel_high" per-channel slices (top1_share deciles × spend quantile) and track ECE/Brier/FP/FN.
+   - Add canary 0114_01 (multi-channel high-spend borderline, Age 27) with NO auto-accept expectation.
+   - Fast-label active learning to prioritize borderline_multichannel contradictions and retrain models more frequently on these slices.
+
+Detailed failure chain — 0114_01 (what went wrong, why)
+- Record snapshot (computed):
+  - PassengerId: 0114_01
+  - HomePlanet: Earth
+  - CryoSleep: False
+  - Cabin: G/20/S
+  - Destination: TRAPPIST-1e
+  - Age: 27.0
+  - VIP: False
+  - RoomService: 82.0
+  - FoodCourt: 157.0
+  - ShoppingMall: 429.0
+  - Spa: 238.0
+  - VRDeck: 1.0
+  - sum_spend = 907.0
+  - top1_channel = ShoppingMall; top1_share ≈ 0.473
+  - top2_channel = Spa; top2_share ≈ 0.262
+  - num_nonzero_channels = 5
+  - spend_entropy (un-normalized) ≈ moderate-high (multi-channel)
+  - borderline_sum_flag: True (907 in [850,1150] if δ=150)
+  - dispersion_high: True (num_nonzero_channels≥3 & top1_share<0.6)
+  - n_batch = 1
+- Why it failed (root causes):
+  1. Signal aggregation bias: the scorer gave strong positive weight to aggregate spend; concentrated_rel logic (v3.11.0) didn’t apply because pattern is dispersed.
+  2. Pooled prior: μ_channel_spendpattern_age not available for dispersed/borderline buckets; generic high-spend priors biased positive.
+  3. Calibrator/GLM_fallback: lacked explicit dispersion features and borderline_sum interactions → fallback likely agreed with main model or gating ignored fallback for this pattern.
+  4. Variance model: missing var_dispersion & var_borderline terms → se_combined low and allowed auto-accept.
+  5. Gating: gates were stricter for concentrated patterns but permissive for dispersed borderlines, allowing a confident but wrong auto-decision.
+  6. Possible label / distribution shift: if the underlying outcome propensity for dispersed high spenders changed recently, historical priors mislead predictions.
+  7. Outcome: ensemble mean and final score leaned positive → predicted True (FP).
+
+Revised pattern & signal definitions (v3.11.1; first-class)
+- absolute_concentrated_high (unchanged): top1_share ≥ T_ch_abs AND sum_spend ≥ S_high_channel_abs.
+- relative_concentrated_high (unchanged): top1_share ≥ T_ch_rel AND (sum_spend ≥ channel_S_high_quantile_Qp OR normalized_spend_by_channel ≥ m_rel).
+- dispersed_high (new): num_nonzero_channels ≥ 3 AND top1_share ≤ T_disp_share (T_disp_share default = 0.60) AND sum_spend ≥ S_disp_min (e.g., ≥ 300).
+- borderline_sum_flag (new): S_high − δ ≤ sum_spend ≤ S_high + δ (δ default = 150).
+- borderline_multichannel_high (new; first-class slice): dispersed_high AND borderline_sum_flag.
+- spend_entropy_norm: normalized Shannon entropy of per-channel spend; dispersion_high if entropy_norm ≥ 0.45 or num_nonzero_channels ≥ 3.
+- channel_consistency_disp (smoothed; track separately):
+  - consistency_channel_disp = (α + pos_count_disp) / (α + pos_count_disp + neg_count_disp)
+  - α default = 20; track N_disp_samples.
+- strong_channel_dispersion_directionality_flag: consistency_channel_disp ≥ 0.80 AND N_disp_samples ≥ 15.
+
+Channel-aware pooled_prior (v3.11.1)
+- Add spendpattern interactions: μ_channel_spendpattern_age, μ_channel_spendpattern_hp, μ_channel_spendpattern_vip_age.
+- Revised pooled_prior numerator (conceptual):
+  - pooled_prior = sum(τ_i * μ_i for i in {pattern, channel, channel_hp_vip, channel_hp_age, channel_spendpattern, spend_bucket, subslice, missing}) / denominator
+- Rationale: capture historical directionality for dispersed_high and borderline_multichannel patterns (e.g., multi-channel young adults on Earth may have different label odds).
+
+Direction-aware, pattern-adaptive logit_shift (v3.11.1)
+- Add disp_shift_frac analogous to conc_shift_frac:
+  - disp_shift_frac_channel = clamp(base_disp_shift_frac + w_disp_dir*(consistency_channel_disp − 0.5)*2 + w_disp_share*(entropy_norm − baseline_entropy), min, max)
+  - If borderline_multichannel_high and consistency_channel_disp high → allow limited directionality shift; if weak consistency → damp shift substantially.
+- Raw_shift pipeline (summary):
+  - polarity = 2 * pooled_prior − 1
+  - sum_damp = clamp(sum_spend / log(1 + S_damp), ε, 1.0)
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - concentration_damp / dispersion_damp = conc_shift_frac_channel or disp_shift_frac_channel depending on detected pattern
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp * pattern_damp * missing_cat_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- Rationale: ensure dispersed/borderline patterns only move predictions when historical evidence exists; otherwise damp movement.
+
+VARIANCE / SE MODEL (explicit additions)
+- New variance terms:
+  - var_dispersion = κ_disp * entropy_norm * (sum_spend / S_scale) * (1 − channel_consistency_disp)
+  - var_borderline = κ_border * (1 − exp(−|sum_spend − S_high| / S_border_scale)) * (1 − channel_trust_for_borderline)
+- Combined var_combined includes existing terms + var_top1_share (from v3.11.0) + var_dispersion + var_borderline.
+- se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Dynamic SE floors (examples):
+  - concentrated_abs & strong_channel_directionality → 0.06
+  - relative_concentrated_high & strong_channel_directionality → 0.07
+  - dispersed_borderline & strong_dispersion_directionality → 0.07
+  - dispersed_borderline & weak_dispersion_directionality → 0.20–0.25
+- Rationale: capture uncertainty for dispersed and borderline-high spenders and avoid overconfident auto-decisions.
+
+DECISION GATING (coherent, pattern-aware)
+- New gating tiers (high-level pseudocode):
+  1. If Trusted_subslice AND p_final_mean ≥ accept_threshold_trusted AND se_combined ≤ accept_se_max_trusted AND ensemble_agreement ≥ general_agreement_threshold → auto_accept (as before).
+  2. Else if n == 1 AND (absolute_concentrated_high OR relative_concentrated_high):
+       - Behavior per v3.11.0 (kept).
+  3. Else if n == 1 AND borderline_multichannel_high:
+       - If strong_dispersion_consistency:
+           - Auto-accept allowed only if (ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06) AND GLM_fallback_agrees OR pooled_prior directionality consistent → allow auto-decision.
+           - Else → priority_audit.
+       - Else → priority_audit.
+  4. Else if n ≤ 3 AND (dispersed_high OR borderline_multichannel_high):
+       - Require (GLM_fallback_agrees AND ensemble_agreement ≥ 0.997 AND se_combined ≤ 0.05) OR route to audit.
+  5. Else apply existing rules (true_zero/imputed_zero/cryo_zero).
+  6. Always persist gating_reasons; never auto-decision when gating_reasons non-empty for borderline/dispersed patterns.
+- Rationale: prevent permissive auto-accepts for dispersed borderlines.
+
+Calibrator & GLM_fallback retrain plan (24–72h)
+- Calibrator:
+  - Outputs: p10/p50/p90 and sd.
+  - New features: spend_entropy_norm, num_nonzero_channels, top1_share/top2_share/top3_share, borderline_sum_flag, normalized_spend_by_channel, concentration_type, dispersion_type, channel_consistency_abs/rel/disp, Age_bucket, HomePlanet, VIP, p_after_logit_shift, ensemble_agreement.
+  - Loss: quantile loss + ECE regularizer; upweight borderline_multichannel contradictions and dispersed_high slices (ShoppingMall/VRDeck/Spa and top dispersed channels).
+  - CV grouping: by (top1_channel, spend_pattern_bucket, HomePlanet).
+- GLM_fallback:
+  - Add interactions: top1_channel × spendpattern × Age_bucket × HomePlanet; top1_channel × top1_share × VIP; borderline_sum_flag × missingness.
+  - Retrain with elastic net and monitor coefficient sign stability and magnitudes on spendpattern slices.
+- Acceptance: calibrator reduces borderline_multichannel contradictions by ≥30% on holdout; produces credible p90–p10 spreads for these slices.
+
+Monitoring, metrics & alerts (what to add)
+- New slice monitors:
+  - borderline_multichannel_high per top1_channel: ECE, Brier, FP, FN, contradiction counts; breakdown by Age_bucket/HomePlanet/VIP.
+  - spend_entropy decile × sum_spend quantile monitoring with per-channel error rates.
+  - channel_consistency_disp drift & N_disp_samples.
+  - n==1 routing: fraction auto_accepted vs routed_to_audit per slice.
+- Alerts:
+  - borderline_multichannel_high FP rate > 20% above baseline for any channel over 24h → block auto_accept for that channel + alert.
+  - borderline_multichannel_high FN rate > 15% above baseline over 24h → block auto_reject for that channel + urgent triage.
+  - channel_consistency_disp drop > 0.1 over 7 days for top channel → retrain candidate.
+  - sudden increase in borderline_sum_flag cases in n==1 batches → alert (possible upstream change).
+- Dashboards:
+  - spendpattern heatmap (entropy × spend_quantile) with gating outcomes and audit queue inflow.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- CI changes / canaries:
+  - 0114_01 (multi-channel borderline, Age 27): default expectation = priority_audit (NO auto-accept). If channel_consistency_disp ≥ 0.80 and GLM_fallback agrees, CI asserts conditional auto-decision only.
+  - Keep 0113_01 canary (ShoppingMall concentrated Age64) as prior.
+- Validation experiments:
+  - Retrain calibrator & GLM_fallback with grouped CV; measure borderline_multichannel ECE/Brier per channel.
+  - Shadow deploy for 14 days; track audit queue size, per-slice contradictions, and acceptance targets.
+- Acceptance targets (vs baseline v3.10.0/v3.11.0):
+  - borderline_multichannel contradictions: ≥30–40% relative reduction on test set (priority on top-10 channels).
+  - concentrated_abs & relative_concentrated contradictions: maintain or improve prior reductions.
+  - overall FN increase ≤ 3 percentage points absolute (aim ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+
+Operational actions (0–72 hours) — prioritized
+1. Engineering (0–24h):
+   - Compute and ingest per-channel S_high_quantile (Q90/Q95), medians, and dispersion baselines (median entropy, median num_nonzero).
+   - Implement spend_entropy_norm, num_nonzero_channels, topk_shares, borderline_sum_flag; persist channel_S_high_used and normalized_spend_by_channel.
+   - Implement stopgap gating: n==1 & borderline_multichannel_high → priority_audit unless channel_consistency_disp_high & fallback/consensus criteria met.
+   - Persist gating_reasons/provenance fields (see list below).
+2. Scoring engine (24–48h; shadow):
+   - Add var_dispersion and var_borderline into variance calc.
+   - Apply pattern-adaptive shift (conc_shift_frac and disp_shift_frac); record raw_shift components.
+   - Expose per-channel pattern metrics in scorer logs.
+3. ML (24–72h):
+   - Retrain GLM_fallback & calibrator including dispersion features & quantiles; upweight borderline errors.
+   - Seed active-label queue for borderline_multichannel contradictions and run fast-label workflow.
+4. Ops & Monitoring (24–72h):
+   - Deploy dashboards, canaries (0113_01, 0114_01) and alerts; monitor shadow-run ≥72h before promotion.
+5. Product / Audit (24–72h):
+   - Implement fast-label workflows for borderline_multichannel contradictions prioritized by Age/HomePlanet combos.
+6. Release criteria:
+   - Shadow metrics meet acceptance targets; audit queue manageable.
+
+Per-record provenance to log (required additions)
+- concentration_type {none, absolute, relative}
+- dispersion_type {none, dispersed_borderline, dispersed_high}
+- borderline_sum_flag (bool)
+- spend_entropy_norm
+- num_nonzero_channels
+- top1_share, top2_share, top3_share
+- normalized_spend_by_channel
+- channel_S_high_used (quantile and timestamp)
+- channel_consistency_score_abs, channel_consistency_score_rel, channel_consistency_score_disp
+- N_conc_samples_abs, N_conc_samples_rel, N_disp_samples
+- conc_shift_frac_used, disp_shift_frac_used (value and formula version)
+- μ_channel_homeplanet_age_spendpattern components and τ weights
+- var_top1_share, var_rel_concentration (v3.11.0), var_dispersion, var_borderline
+- GLM_fallback_probs, GLM_fallback_agreement_flag
+- p10/p50/p90, p_final_sd
+- gating_reasons (explicit text codes)
+- scorer_version, pooled_prior_snapshot_id, channel_S_high_snapshot_id
+
+Updated hyperparameters (v3.11.1 initial; sweepable)
+- base_conc_shift_frac = 0.60
+- base_disp_shift_frac = 0.45
+- w_dir = 0.45
+- w_disp_dir = 0.35
+- w_share = 0.25
+- w_disp_share = 0.20
+- conc_shift_frac_min = 0.50
+- conc_shift_frac_max = 1.00
+- disp_shift_frac_min = 0.30
+- disp_shift_frac_max = 0.90
+- α_consistency = 20
+- N_min_conc_samples = 15
+- N_min_disp_samples = 15
+- channel_consistency_high (C_high) = 0.80
+- top1_share_threshold_abs (T_ch_abs) = 0.90
+- top1_share_threshold_rel (T_ch_rel) = 0.85
+- top1_share_disp_threshold (T_disp_share) = 0.60
+- channel_S_high_quantile = 0.90
+- normalized_spend_mult (m_rel) = 2.0
+- S_high_global = 1000 (legacy absolute)
+- S_border_delta = 150
+- S_damp = 200
+- S_border_scale = 100
+- w_dis = 0.80
+- κ_t1 = 0.045
+- κ_rel = 0.03
+- κ_disp = 0.035
+- κ_border = 0.04
+- accept_se_max_trusted = 0.06
+- accept_se_max_general = 0.05
+- concentrated_consistent_agreement = 0.99
+- concentrated_inconsistent_agreement = 0.999
+- dispersed_consistent_agreement = 0.995
+- dispersed_inconsistent_agreement = 0.9995
+
+CI TESTS (explicit expected outcomes; include 0114_01)
+- New/updated canaries:
+  - 0114_01 (multi-channel borderline, Age 27): NO auto-accept by default; expect gating_reasons include 'borderline_multichannel_stopgap'. Conditional auto-decision allowed only if channel_consistency_disp ≥ 0.80 AND GLM_fallback agrees.
+  - 0113_01 (ShoppingMall concentrated, Age 64): NO auto-reject by default; conditional auto-accept only if consistency_rel_high and fallback/consensus criteria met.
+  - Existing canaries (0112_01, 0110_01, 0108_02/03) retained with updated expectations where appropriate.
+- Trusted subslice variations → allow calibrated auto-decisions.
+
+Monitoring & Alerting (exact triggers)
+- For each top1_channel:
+  - borderline_multichannel_high FP rate > 20% above baseline over 24h → block auto_accept for that channel + alert.
+  - borderline_multichannel_high FN rate > 15% above baseline over 24h → block auto_reject for that channel + urgent triage.
+  - channel_consistency_disp drop > 0.1 over 7 days → retrain flag.
+- n==1 audit routing fraction < expected threshold → alert.
+- sudden increase in borderline_sum_flag occurrences → alert.
+
+Acceptance criteria (post-shadow -> live)
+- borderline_multichannel contradictions: ≥30–40% relative reduction across top-10 channels.
+- relative_concentrated contradictions: maintain prior improvements (≥30% reduction).
+- imputed_zero & cryo_zero contradictions: maintain prior targets.
+- overall FN increase ≤ 3% absolute (aim ≤1).
+- Audit queue ≤1.5× baseline for first 2 weeks, trending down.
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.11.1) implementing:
+   - spend_entropy, num_nonzero_channels, topk_shares, borderline_sum_flag ingestion
+   - channel-adaptive conc_shift_frac and disp_shift_frac
+   - var_dispersion & var_borderline
+   - n==1 borderline_multichannel stopgap gating + provenance logging
+2. CI updates adding 0114_01 and updating 0113_01 expectations.
+3. Slice_trust_table seeding with per-channel abs/rel/disp consistency metrics and Age/HomePlanet interactions.
+4. GLM_fallback + calibrator retrain plan + grouped CV validation report (quantile outputs).
+5. Dashboards & canary configuration for spendpattern slices.
+6. Active learning labeling plan for borderline_multichannel contradictions.
+
+Quick triage checklist to run now for 0114_01 (operational)
+1. Compute spend_entropy_norm and num_nonzero_channels for ShoppingMall+this record; confirm borderline_multichannel_high flag (should be True).
+2. Compute channel_S_high_quantile(Q90/Q95) and medians for ShoppingMall and for dispersed slices (last 90 days).
+3. Compute channel_consistency_disp for top channels (pos/neg counts for dispersed/borderline cases).
+4. Inspect pooled_prior components used for this record (was μ_channel_spendpattern_age present? what pooled_prior value and τ weights were used?).
+5. Inspect GLM_fallback output and agreement flag for this record.
+6. Inspect se_combined and var_dispersion/var_borderline (if available) and gating_reasons stored.
+7. If channel_consistency_disp < C_high or pooled_prior lacked spendpattern interactions → mark candidate for priority_audit + add to active-label queue.
+
+Why this will reduce batch errors going forward
+- Distinguishing concentration vs dispersion prevents asymmetric handling of high-spenders (e.g., concentrated shoppers vs multi-channel spenders), catching slices like 0113_01 and 0114_01 accurately.
+- Adding spendpattern × Age × HomePlanet pooled priors ensures local contextual directionality is injected even for n==1 cases.
+- Adding var_dispersion and var_borderline increases uncertainty for fragile slices and prevents unsafe auto-decisions.
+- Persisting richer provenance accelerates triage, active labeling, and closing the loop so the system adapts faster to distributional changes.
+
+One-line corrective action recommendation (now)
+- Implement spend-pattern detection (concentration vs dispersion) + borderline_sum gating and n==1 stopgap routing to priority_audit unless strong per-slice consistency + GLM_fallback or near-perfect ensemble agreement; add 0114_01 and 0113_01 canaries to CI immediately.
+
+If you want, I will:
+- implement the deterministic scorer skeleton + CI updates (recommended immediate artifact), or
+- produce the channel_S_high and dispersion seeding scripts and slice_trust_table update in parallel.
+
+Recommendation: implement the scorer skeleton + CI canaries first (covers immediate stopgap gating and provenance), shadow-run ≥72h while ML retrains calibrator and fallback in parallel.
+
+============================================================

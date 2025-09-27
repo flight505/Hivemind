@@ -1,0 +1,281 @@
+PREDICTIVE METRICS - ITERATION 89
+============================================================
+
+Updated Predictive Metrics Report — v3.10.0 (post_0112_01 triage)
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short): A single-record batch (PassengerId 0112_01) was predicted False but the true label is True. Pattern = concentrated_high spend on FoodCourt (FoodCourt=2537, sum_spend≈2654, top1_share ≈ 0.957) + VIP=True + HomePlanet=Europa. This is the mirror problem to prior failures: concentrated_high slices are fragile and the scorer is inconsistent across channels and contextual interactions (VIP/HomePlanet). The scorer’s uniform concentration-damping led to an under-shift for FoodCourt-concentrated positives.
+- Immediate implication: v3.9.0’s “uniform concentration damping” (conc_shift_frac = 0.6 globally) + lack of channel×context directionality and consistency terms causes bi-directional failures (FPs like 0110_01 and FNs like 0112_01). Single-record (n==1) gating remains the primary lever — it must be stricter but channel-aware so we don’t over-crowd the audit queue.
+- Top priorities (0–72h):
+  1. Make concentration-damping channel-aware (conc_shift_frac per channel) using a smoothed historical consistency_score for concentrated_high examples.
+  2. Add channel_consistency_score and channel_directionality signals into pooled_prior, variance, calibrator and gating logic.
+  3. Harden n==1 gating: require GLM_fallback agreement OR per-channel consensus + low uncertainty; otherwise priority_audit.
+  4. Adjust SE floors dynamically by channel_consistency (lower where consistent, raise where inconsistent) and include var_channel_consistency in se_combined.
+  5. Persist per-record provenance including channel_consistency_score, conc_shift_frac_used, and gating_reasons to speed triage and continuous learning.
+  6. Shadow-deploy and run CI including 0108_03, 0108_02, 0110_01, 0110_04, and new 0112_01 canary.
+
+Direct answers to the six requested questions (concise)
+1) Signals that led to this error
+   - Pattern: concentrated_high on FoodCourt (top1_share ≈ 0.957; sum_spend ≈ 2.65k).
+   - Context: VIP=True and HomePlanet=Europa (important interactions missing from prior pooled priors and GLM fallback).
+   - Modeling: global concentration-damping (conc_shift_frac) applied uniformly reduced the logit shift for concentrated_high records; pooled_prior lacked channel×homeplanet×vip term → under-weighted the positive signal.
+   - Insufficient channel-level consistency signal in variance/gating allowed unsafe auto-decisions.
+
+2) Decision-rule changes to prevent recurrence
+   - Make conc_shift_frac channel-aware (increase if channel shows consistent directionality; reduce otherwise).
+   - n==1 & concentrated_high:
+     - If channel_consistency_score ≥ C_high (e.g., 0.80) and N_conc_samples ≥ N_min → allow auto-decision only when (ensemble_agreement ≥ 0.99 AND se_combined ≤ 0.08) OR GLM_fallback agrees.
+     - Else route to priority_audit (stopgap).
+   - Always persist gating_reasons; block auto-rejects for concentrated_high positives unless consensus + low uncertainty + fallback agree.
+   - For n≤3 apply intermediate stricter bands (agreement +0.002, se −0.01).
+
+3) New pattern insights
+   - Concentrated_high is not uniformly dangerous: it is channel- and context-dependent. Some channels (e.g., FoodCourt in VIP+Europa combos in recent history) have strong, consistent positive association; other channels (Spa, VRDeck) are noisier/contradictory.
+   - Interactions matter: top1_channel × VIP × HomePlanet and top1_channel × Age_bucket produce materially different label odds in concentrated slices.
+   - Single-record fragility amplifies these interactions; a global damping factor cannot handle both FP → FN trade-offs.
+
+4) Confidence recalibration summary
+   - Add var_channel_consistency and var_dir_interaction to variance model; make SE floors dynamic by channel_consistency and sample counts.
+   - Retrain calibrator to output quantiles (p10/p50/p90) and sd; use quantile + sd + ensemble_agreement + channel_consistency to gate decisions rather than mean alone.
+   - For concentrated_high with high channel_consistency, lower SE floor (permit auto-decisions when evidence is strong). For low-consistency channels raise SE floor and require audit.
+
+5) Consistency adjustments
+   - Standardize imputation (numeric NaN→0 + imputation flag; categorical NaN→MISSING token + missing flag).
+   - Persist per-record provenance for every scored record (including channel_consistency_score, conc_shift_frac_used, pooled_prior components, gating_reasons).
+   - Snapshot gating configs and hyperparams with each scoring run to ensure reproducible behavior and CI comparability.
+
+6) Metric improvements for edge cases
+   - Add per-channel concentrated_high contradictions (ECE/Brier/FP/FN) by VIP/HomePlanet slices.
+   - Add canaries: VIP+Europa+FoodCourt concentrated_high; imputed_zero; cryo_zero.
+   - Active-label seeding and fast-label pipelines for channels with rising concentrated_high contradictions.
+
+Detailed failure chain (what went wrong, why) — 0112_01
+- Record snapshot (computed):
+  - PassengerId: 0112_01
+  - HomePlanet: Europa
+  - CryoSleep: False
+  - Cabin: B/1/S (not missing)
+  - Age: 48.0
+  - VIP: True
+  - RoomService: 0.0
+  - FoodCourt: 2537.0
+  - ShoppingMall: 87.0
+  - Spa: 17.0
+  - VRDeck: 13.0
+  - sum_spend = 2654.0
+  - top1_channel = FoodCourt; top1_share = 2537/2654 ≈ 0.957
+  - num_nonzero_channels = 3
+  - n_batch = 1
+- Failure chain:
+  1. Pattern detection: flagged concentrated_high (top1_share ≈ 0.96, sum_spend > S_high).
+  2. v3.9.0 applied uniform concentration-damping (conc_shift_frac=0.6) to shrink logit_shift magnitude for concentrated_high records — safety-first but channel-blind.
+  3. pooled_prior lacked explicit μ_channel×HomePlanet×VIP interaction; channel-specific positive signal for FoodCourt+VIP+Europa was not injected — polarity under-estimated.
+  4. Calibrator/GLM_fallback did not model the VIP×HomePlanet×top1_channel interaction strongly; fallback either disagreed or was not required by gating.
+  5. Variance model did not include var_channel_consistency → se_combined was not tuned to reflect channel’s historical directionality; gating allowed an auto-decision and the ensemble mean remained low → False predicted.
+  6. Result: under-prediction (FN). This mirrors v3.9.0’s other failure modes (0110_01 over-prediction) that came from the same global damping and lack of channel-context treatment.
+
+Revised pattern & signal definitions (v3.10.0; first-class)
+- concentrated_high_spend_flag (same): top1_share ≥ T_ch AND sum_spend ≥ S_high
+- concentrated_channel_directional_flag: concentrated_high_spend_flag AND channel_consistency_score ≥ C_dir (channel shows consistent directionality)
+- channel_consistency_score (smoothed):
+  - consistency_score_channel = (α + pos_count_conc) / (α + pos_count_conc + neg_count_conc)
+  - α (smoothing) default = 20; also expose N_conc_samples = pos_count_conc + neg_count_conc
+- strong_channel_directionality_flag: consistency_score ≥ 0.80 AND N_conc_samples ≥ 15
+- cryo_zero_interaction_flag (unchanged): CryoSleep==True AND true_zero_spend_flag
+
+Channel-aware pooled_prior (v3.10.0)
+- Add μ_channel_homeplanet_vip interaction and new τ_channel_hpv weight:
+  - pooled_prior = (τ_pattern * μ_pattern + τ_channel * μ_channel + τ_channel_hpv * μ_channel_hpv + N_subslice * μ_subslice + τ_spend_bucket * μ_spend_bucket + τ_missing * μ_missing_bucket + τ_channel_risk * μ_channel_risk + τ_cryo * μ_cryo) / (τ_pattern + τ_channel + τ_channel_hpv + N_subslice + τ_spend_bucket + τ_missing + τ_channel_risk + τ_cryo)
+- Rationale: inject contextualized channel priors (e.g., FoodCourt+VIP+Europa) so single-record pools can reflect these strong local statistics.
+
+Direction-aware, channel-adaptive logit_shift (v3.10.0)
+- New per-channel concentration damping:
+  - channel_consistency_score computed (smoothed)
+  - conc_shift_frac_channel = clamp(base_conc_shift_frac + w_dir * (consistency_score − 0.5) * 2, min=conc_shift_frac_min, max=conc_shift_frac_max)
+    - Example default: base_conc_shift_frac = 0.6, w_dir = 0.45, min = 0.5, max = 1.0
+    - If consistency_score = 0.90 → conc_shift_frac_channel ≈ 0.92 (much less damping for FoodCourt if consistent)
+    - If consistency_score = 0.30 → conc_shift_frac_channel ≈ 0.5 (more conservative)
+- Revised raw_shift pipeline (incorporates channel-specific frac and directional polish):
+  - polarity = 2 * pooled_prior − 1
+  - sum_damp = clamp(raw_sum / log(1 + S_damp), ε, 1.0)
+  - dis_damp = max(0, 1 − w_dis * min(model_disagreement, 0.95))
+  - novelty_scale = (1 − min(novelty_score, 0.95))
+  - concentration_damp = conc_shift_frac_channel
+  - missing_cat_damp = (missing_categorical_count > 0 ? missing_cat_shift_frac : 1.0)
+  - raw_shift = polarity * δ_pattern * novelty_scale * dis_damp * sum_damp * concentration_damp * missing_cat_damp
+  - logit_shift = clamp(raw_shift, −δ_pattern, δ_pattern)
+- Rationale: allow concentrated_high to exert its full influence when a channel+context historically supports it; otherwise maintain conservative damping.
+
+VARIANCE / SE MODEL (explicit additions)
+- New variance terms added:
+  - var_channel_consistency = κ_consistency * (1 − channel_consistency_score) * (top1_share)^2 * (sum_spend / S_scale)
+  - var_channel_dir_interaction = κ_dir_int * (1 − channel_consistency_score) * interaction_weight(HomePlanet, VIP, Age_bucket, top1_channel)
+- Combined:
+  - var_combined = var_prior + var_ens + var_novelty_cond + β_slice*var_slice + β_pattern*var_pattern + var_spend_extremity + var_missingness + var_missing_cat + var_concentration + var_channel_risk + var_cryo_interaction + var_channel_consistency + var_channel_dir_interaction
+  - se_combined = sqrt(max(var_combined, base_min_se(context)^2))
+- Dynamic SE floors:
+  - If concentrated_high AND strong_channel_directionality → floor = 0.06
+  - If concentrated_high AND weak_channel_directionality → floor = 0.22
+  - imputed_zero_nontrusted_floor = 0.22 (unchanged)
+  - true_zero_nontrusted_floor = 0.18
+- Rationale: tighten uncertainty where history is consistent and loosen where history contradicts.
+
+DECISION GATING (coherent, channel-aware)
+- New terms:
+  - channel_consistency_score and N_conc_samples used to choose gating tier.
+  - strong_consistent_channel: channel_consistency_score ≥ C_high (default 0.80) AND N_conc_samples ≥ N_min (default 15)
+- Gating pseudocode (high-level):
+  1. If Trusted_subslice AND p_final_mean ≥ accept_threshold_trusted AND se_combined ≤ accept_se_max_trusted AND ensemble_agreement ≥ general_agreement_threshold → auto_accept.
+  2. Else if n == 1 AND concentrated_high:
+       - If strong_consistent_channel:
+           - Auto-accept allowed if (ensemble_agreement ≥ 0.99 AND se_combined ≤ 0.08) OR GLM_fallback agrees with predicted class. Else → priority_audit.
+       - Else if N_conc_samples < N_min → priority_audit (lack of evidence).
+       - Else → require (GLM_fallback agrees OR ensemble_agreement ≥ 0.995 AND se_combined ≤ 0.06) else priority_audit.
+  3. Else apply previous fragile rules for true_zero/imputed_zero/cryo_zero as in v3.9.0.
+  4. For n ≤ 3, shift thresholds stricter (agreement +0.002, se −0.01).
+  5. Always persist gating_reasons; do not auto-decision when gating_reasons non-empty.
+- Rationale: avoids blanket blocking or accepting concentrated_high; instead uses evidence-weighted, channel-aware gating.
+
+Calibrator & GLM_fallback retrain plan (24–72h)
+- Calibrator:
+  - Output p10/p50/p90 and sd.
+  - Input features (additions): channel_consistency_score, conc_shift_frac_used, top1_channel_id, channel_directionality_flag, VIP, HomePlanet, Age_bucket, p_after_logit_shift, novelty_score, ensemble_agreement.
+  - Loss: quantile losses + ECE regularizer. Upweight concentrated_high contradictions and VIP+HomePlanet+top1_channel combos.
+  - CV grouping: by (top1_channel_id, sum_spend_bucket, HomePlanet).
+- GLM_fallback:
+  - Add interactions: top1_channel × VIP × HomePlanet; concentrated_high × missing_categorical_count × channel_consistency_score; cryo × true_zero.
+  - Retrain with L1/L2 and analyze coefficient sign-stability across time.
+- Acceptance: calibrator must reduce concentrated_high contradictions by ≥30% on held-out historical set and produce reliable p50/p90 spread consistent with observed contradictions.
+
+Monitoring, metrics & alerts (what to add)
+- New slice monitors:
+  - concentrated_high per top1_channel: ECE, Brier, FP, FN, contradiction counts; trend by VIP/HomePlanet.
+  - channel_consistency_score drift & N_conc_samples.
+  - n==1 routing metrics: fraction auto_accepted, routed_to_audit, and per-slice FN/FP.
+- Alerts:
+  - concentrated_high FP rate > 20% above baseline for any channel over 24h → block auto_accept for that channel.
+  - concentrated_high FN rate > 15% above baseline for any channel over 24h → block auto_reject for that channel + urgent triage.
+  - channel_consistency_score drift > 0.1 over 7 days for high-volume channels → retrain candidate.
+  - missing provenance or batch_snapshot mismatch → immediate alert.
+- Dashboards:
+  - per-channel concentrated_high panel (top channels ordered by contradiction delta), gating outcomes, audit queue inflow by pattern.
+
+CI TESTS, VALIDATION EXPERIMENTS & ACCEPTANCE CRITERIA
+- CI tests to add/update:
+  - Preserve M1..M4 from v3.7.x.
+  - M5–M8 from v3.9.0 preserved.
+  - New M9: 0112_01 (concentrated_high FoodCourt + VIP+Europa): initial stopgap expectation — priority_audit OR auto_accept only if channel_consistency_score ≥ 0.80 & GLM_fallback agrees. CI asserts "NO auto_reject" for this case under new scorer.
+  - Trusted subslice variations: allow calibrated auto-decisions.
+- Validation experiments:
+  - Retrain calibrator + GLM_fallback with grouped CV; evaluate concentrated_high per-channel ECE/Brier; measure relative improvement on holdout concentrated_high contradictions.
+  - Shadow deploy for 14 days; track audit queue size, per-slice contradictions, and acceptance criteria.
+- Acceptance targets (vs baseline v3.9.0):
+  - concentrated_high contradictions: ≥30–40% relative reduction on test set (per-channel improvements prioritized for top-10 channels).
+  - imputed_zero contradictions: ≥40% relative reduction.
+  - cryo_zero contradictions: ≥30% relative reduction.
+  - No more than 3 percentage points absolute FN increase overall (aim ≤1).
+  - Audit queue ≤1.5× baseline for first 2 weeks and trending down.
+
+Operational actions (0–72 hours) — prioritized
+1. Engineering (0–24h):
+   - Add channel_consistency_score & N_conc_samples ingestion (compute rolling window counts and smoothed consistency).
+   - Implement conc_shift_frac_by_channel logic and persist conc_shift_frac_used per record.
+   - Implement stopgap gating: n==1 & concentrated_high → priority_audit unless strong_consistent_channel & fallback/consensus criteria met. For safety, initial shadow config: route to audit by default for new top channels failing consistency criteria.
+   - Persist gating_reasons and new provenance fields.
+2. Scoring engine (24–48h; shadow):
+   - Add var_channel_consistency and var_channel_dir_interaction into variance calc.
+   - Apply channel-adaptive logit_shift; record raw_shift components.
+   - Expose per-channel metrics in scorer logs for monitoring.
+3. ML (24–72h):
+   - Retrain GLM_fallback & calibrator including new features + quantiles.
+   - Seed active-label queue for VIP+HomePlanet+top1_channel concentrated_high contradictions and run fast-label workflow.
+4. Ops & Monitoring (24–72h):
+   - Deploy dashboards, canaries (0110_01, 0110_04, 0112_01) and alerts; monitor shadow-run for ≥72h before promotion.
+5. Product / Audit (24–72h):
+   - Implement fast-label workflows for concentrated_high channel contradictions (VIP & HomePlanet combos prioritized).
+6. Release criteria:
+   - Shadow metrics meet acceptance targets for concentrated_high channels; audit queue manageable.
+
+Per-record provenance to log (required additions)
+- From v3.9.0 list plus:
+  - channel_consistency_score, N_conc_samples, conc_shift_frac_used, channel_directionality_flag
+  - μ_channel_homeplanet_vip (pooled sub-component), τ_channel_hpv
+  - GLM_fallback_probs, GLM_fallback_agreement_flag
+  - fallback_reason / fallback_features_used
+  - gating_reasons (explicit text codes)
+  - quantiles: p10/p50/p90, p_final_sd
+  - calibrator_version & calibrator_grouping_key
+
+Updated hyperparameters (v3.10.0 initial; sweepable)
+- base_conc_shift_frac = 0.6
+- w_dir = 0.45
+- conc_shift_frac_min = 0.50
+- conc_shift_frac_max = 1.00
+- α_consistency = 20
+- N_min_conc_samples = 15
+- channel_consistency_high (C_high) = 0.80
+- accept_se_max_trusted = 0.06
+- accept_se_max_general = 0.05
+- accept_se_max_conc_consistent = 0.08
+- general_agreement_threshold = 0.98
+- concentrated_high_consistent_agreement = 0.99
+- concentrated_high_inconsistent_agreement = 0.999
+- κ_consistency = 0.045
+- κ_dir_int = 0.03
+- τ_channel_hpv = 160
+- S_high (spend high) = 1000 (unchanged)
+- S_damp = 200
+- w_dis = 0.80
+
+CI TESTS (explicit expected outcomes; include 0112_01)
+- 0103_02 → priority_audit
+- 0103_01 → priority_audit
+- 0102_01 → priority_audit
+- 0107_01 → priority_audit
+- 0108_02 → priority_audit
+- 0108_03 → priority_audit
+- 0110_01 → priority_audit
+- 0110_04 → NO auto-reject; require fallback/strict gating
+- 0112_01 → NO auto-reject (prefer priority_audit by default). If channel_consistency_score ≥ 0.80 and GLM_fallback agrees, auto_accept permitted; CI will check that auto-accept only happens under that condition.
+- Trusted subslice variations → allow calibrated auto-decisions
+
+Monitoring & Alerting (exact triggers)
+- For each top1_channel:
+  - concentrated_high FP rate > 20% above baseline over 24h → block auto_accept for that channel + alert
+  - concentrated_high FN rate > 15% above baseline over 24h → block auto_reject for channel + urgent triage
+  - channel_consistency_score drop > 0.1 over 7 days for a top channel → retrain flag
+- n==1 audit routing fraction < expected threshold → alert
+- mismatch between batch_snapshot_id and per-record provenance → alert
+
+Acceptance criteria (post-shadow -> live)
+- concentrated_high contradictions: ≥30–40% relative reduction across top-10 channels
+- imputed_zero contradictions: ≥40% relative reduction
+- cryo_zero contradictions: ≥30% relative reduction
+- overall FN increase ≤3% absolute (aim ≤1)
+- Audit queue ≤1.5× baseline for first 2 weeks, trending down
+
+Deliverables (priority order)
+1. Deterministic scorer skeleton (v3.10.0) implementing:
+   - channel_consistency scoring & persistence
+   - channel-adaptive conc_shift_frac + channel-aware pooled_prior component μ_channel_homeplanet_vip
+   - var_channel_consistency & var_dir_interaction
+   - n==1 concentrated_high stopgap gating + provenance logging
+2. CI test updates adding 0112_01 expectations (NO auto-reject; conditional auto-accept allowed).
+3. Slice_trust_table seeding updates: add per-channel consistency stats & VIP/HomePlanet interactions.
+4. GLM_fallback + calibrator retrain plan + grouped CV validation report (quantiles).
+5. Dashboards & canary configuration for concentrated_high per channel, particularly VIP+HomePlanet combos.
+6. Active learning labeling plan for concentrated_high contradictions.
+
+One-line summary
+v3.10.0: Make concentrated_high handling channel- and context-aware — compute per-channel consistency and use it to adapt concentration damping, pooled priors, uncertainty floors and gating so single-record concentrated_high cases like 0112_01 are treated correctly (either accepted with high confidence when history supports them, or routed to audit when ambiguous).
+
+Recommended immediate artifact to prepare first
+- Build the deterministic scorer skeleton + CI test updates (includes 0108_02, 0108_03, 0110_01, 0110_04, 0112_01 expectations). Rationale: it's the smallest, safest change set to shadow quickly and prevent immediate FN/FP risk for concentrated_high slices while allowing the calibrator/GLM retrain to proceed.
+
+If you want, I will:
+- implement the deterministic scorer skeleton + CI updates now (recommended), or
+- produce the slice_trust_table seeding script in parallel.
+
+Which should I prepare first?
+
+============================================================

@@ -1,0 +1,99 @@
+CYCLE 4 STRATEGIC REFLECTION
+Generated on: 2025-09-09 13:51:21
+Cycle Performance: Best 60.20%, Average 58.65%
+Total Iterations: 10
+
+================================================================================
+
+Strategic reflection
+
+1) Patterns observed
+- C banding works: Partitioning by coarse C ranges (tiny, low, mid, high) simplified decisions and delivered most of the lift. The strongest gains came from early gating on C and then using D/E relations inside each band.
+- E–D margin (ed = E − D) is predictive: Large positive ed reliably mapped to class 4 in low C; low ed with high D tended to class 3. This single relational feature outperformed many absolute-threshold rules.
+- Extremes are easier: Very high E or very low D with particular C windows produced stable classes (2 and 4 pockets especially). Likewise, “very low E” regimes were predictable when conditioned on B or A+B sums.
+- A and B have value but were underused: sumAB and a few high-threshold checks helped route to class 1 (and some class 2 synergy with B), but we likely left signal on the table by not modeling richer A/B interactions.
+
+2) Failure analysis
+- Mid-C overlap (roughly C in 45–70) remains messy: Conflicts between rules for classes 1, 2, 3, and 4 suggest the current axis-aligned thresholds are too crude; E and D both moderate-to-high cause ambiguous routing.
+- Over-reliance on default class 1: The final default to 1 likely inflated false positives for class 1, especially in mid/high-C regions with mixed D/E. This hides systematic mistakes instead of resolving them.
+- Small-D, high-E ambiguity: We oscillate between classes 2 and 4 when D is tiny and E is high across different C bands, suggesting we need a more unified treatment of “D ≈ 0” regimes.
+- Coarse A/B usage: Using only sumAB or single high thresholds fails to discriminate cases where A vs B asymmetry matters or where A/B interacts with E and D in non-additive ways.
+
+3) Innovation opportunities
+- Oblique boundaries: Introduce decisions based on weighted linear combinations (e.g., w1*E + w2*C − w3*D) to carve diagonal/tilted regions that axis-aligned thresholds can’t capture.
+- Ratio/normalized features: E/D, D/E, E/(C+1), D/(C+1), and deviations from linear trends like E − (a*C + b) to encode “E relative to C” instead of absolute values.
+- Ranking/ordinal features: Use the relative order of variables (e.g., is E the max among A..E? is D the min?), which can offer robust signals across scales.
+- Scorecard/voting logic: Replace deep nesting with per-class scores aggregated from simple predicates; choose the argmax. This reduces brittle pockets and smooths boundaries.
+- Prototype distances: Compute distance to archetypal profiles for each class in (C, D, E) subspace, with A/B as tie-breakers, to improve mid-region resolution.
+
+4) Strategic direction
+- Prioritize a scoring/voting framework that combines ed, ratio features, and oblique linear forms; this should replace many micro “pockets” with smoother, more general rules.
+- Systematically unify small-D and high-E cases across all C bands using ratio features (E/D) and normalized thresholds so they no longer conflict.
+- Expand A/B utilization with max(A,B), |A−B|, and interactions with E and C to break ties in mid-C regions.
+- Reduce defaulting to class 1 by introducing a final tie-breaker score rather than a hard default.
+
+Creative planning for next cycle
+
+Strategy 1: Per-class scorecard with shared features and argmax selection
+- Mathematical operations to add:
+  - ed = E − D; rED = E/(D+1); rEC = E/(C+1); rDC = D/(C+1)
+  - sAB = A + B; mAB = max(A,B); dAB = |A − B|
+  - Centering: cC = |C − 50|, cE = |E − 50|, cD = |D − 50|
+  - Clipped positives: pos(x) = max(0, x − t); neg(x) = max(0, t − x)
+- Logical structure:
+  - Build four scores (S1..S4), each as a sum of a small number of weighted predicates (e.g., S4 gains with large ed, large rED, high E and low D; S2 gains with very low D and high E plus B synergy; S3 gains with high D relative to E; S1 gains with strong sAB and low E).
+  - Choose the class with the highest score; use mAB and dAB as tie-breakers.
+- Handling challenging patterns:
+  - Mid-C conflicts are smoothed by continuous score accumulation rather than brittle pockets.
+  - Small-D regimes gain distinct contributions for S2 vs S4 via rED and E thresholds.
+
+Strategy 2: Oblique decision hyperplanes and deviations from trends
+- Operations:
+  - Linear forms: L4 = E + 0.6*C − 0.8*D, L3 = D + 0.7*C − 0.5*E, L2 = −D + 0.5*E + 0.4*B, L1 = 0.6*sAB − 0.5*E
+  - Deviations: dE_C = E − (a*C + b), dD_C = D − (a’*C + b’)
+- Logical structure:
+  - Use 2–3 global planes as early gates (e.g., if L4 > t4 then favor 4 unless contradicted by L3 >> t3).
+  - Within each gate, fine-tune with a small number of thresholds or ratios.
+- Handling tricky inputs:
+  - Captures diagonal boundaries in mid C where both D and E are high, eliminating multiple overlapping pockets.
+
+Strategy 3: Unified treatment of tiny D and extreme E across all C
+- Operations:
+  - rED = E/(D+1)
+  - Min-max normalization within band: zE = E − median_E(C-band), zD = D − median_D(C-band) approximated by linear trends
+- Logical structure:
+  - Single global rule family: if D ≤ 10, use rED and E to separate class 2 (very high rED and E) from class 1 (low E) and class 4 (high E but moderated by C, using dE_C).
+- Handling challenges:
+  - Removes contradictions where D ≤ 10 previously led to 1, 2, or 4 inconsistently.
+
+Strategy 4: Ordinal/relative-order features to break ties
+- Operations:
+  - Indicators: I_Emax = [E is max(A,B,C,D,E)], I_Dmin = [D is min(…)]
+  - Rank gaps: gE = E − second_largest(A..E), gD = second_smallest(A..E) − D
+- Logical structure:
+  - Use I_Emax and gE to boost class 4; use I_Dmin with moderate C to boost class 2 or 1 depending on E; if A or B is dominant with low E, boost class 1.
+- Handling challenges:
+  - Robustly differentiates mixed mid-range cases where absolute values overlap, by using the relative context.
+
+Strategy 5: Prototype/centroid proximity with lightweight distances
+- Operations:
+  - Manhattan distances in (C,D,E): Dist_k = |C − Ck| + |D − Dk| + |E − Ek| with 4 hand-tuned prototypes; optional weights wC, wD, wE.
+  - Confidence margin: Δ = min_dist2 − min_dist1 to assess certainty.
+- Logical structure:
+  - Predict the nearest prototype’s class; if Δ is small (ambiguous), defer to A/B-driven tie-breakers (mAB, sAB, dAB).
+- Handling challenges:
+  - Especially useful in the mid-C corridor by capturing “typical shapes” of each class rather than many micro-rules.
+
+Implementation priorities for next cycle
+- Replace deep nested if-else with scorecard/voting (Strategy 1) as the backbone.
+- Add 1–2 oblique linear forms and rED/rEC ratios (Strategies 2 and 3) to handle mid-C and small-D cases.
+- Introduce at least one ordinal feature (Strategy 4) for tie-breaking in overlapping zones.
+- Keep a small, curated set of high-precision guardrails for extremes (e.g., E ≤ 5, E ≥ 95, D ≤ 5), but reduce ad hoc pockets.
+- Track and preserve high-yield, low-variance rules as cross-cycle invariants; expand the memory beyond 3 examples to retain stable gains.
+
+Expected impact
+- Smoother boundaries should reduce contradictory pockets and lower misclassification in C ≈ 45–70.
+- Ratios and oblique planes should better disentangle cases where both D and E are high.
+- Richer A/B usage provides reliable tie-breakers without overfitting.
+
+This plan emphasizes generalization via compact, expressive features and a more flexible decision structure, aiming to move beyond the 60% ceiling observed in Cycle 4.

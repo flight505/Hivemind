@@ -1,0 +1,299 @@
+PREDICTIVE METRICS - ITERATION 149
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+
+What happened (short)
+- Two brittle failure modes surfaced in recent 1‑record batch(s):
+  1. cryo_allzero false negative (previous canary): Passenger 0192_01 — CryoSleep=True, all spend channels = 0, Age=1.0. Model predicted Transported=False; actual=True.
+  2. single‑channel spend false positive (current batch): Passenger 0192_03 — Spa=898.0 (dominant), other spends small. Model predicted Transported=True; actual=False.
+- Root cause theme: rare / heterogeneous slices (cryo_allzero, top1_spend_dominant / implausible_spend) are under‑modeled and/or allowed to auto‑decide in n==1 batches while the calibrator under‑estimates uncertainty and per‑feature contributions dominate the logit.
+
+Net root causes (new + existing)
+- Missing explicit interaction features and stratified pooled priors for cryo_allzero × age/family/cohort and single_channel_dominant × channel/age → inconsistent learned directionality.
+- Insufficient per‑feature winsorization/logit capping: single large channel (Spa) can dominate the score.
+- Calibrator / variance model under‑estimated uncertainty for rare/implausible patterns in n==1 batches; quantile widths too narrow → overconfident auto‑decisions in both directions.
+- Decision gating allowed brittle n==1 auto‑decisions without symmetric corroboration checks.
+- Training data sparsity and heterogeneity: cryo_allzero and single_channel_dominant slices are mixtures of subpopulations; labels in these slices are directionally unstable.
+- Lack of data validation / implausible‑value detection (e.g., Spa = 898) and lack of imputation provenance.
+
+Immediate priorities (0–6h)
+- Emergency gating: block all auto‑decisions (accepts and rejects) for n==1 records with cryo_allzero_flag OR single_channel_dominant_flag OR implausible_spend_flag; route to priority_audit/canary. Add 0192_01 and 0192_03 (and prior canaries) to canary list.
+- Persist raw inputs and imputation provenance for canaries and recent fragiles.
+- Expose per‑component variance terms; raise SE floor for cryo_allzero n==1 and spend‑dominant n==1 cases (start se_floor = 0.50–0.60).
+- Require GLM_fallback + ensemble corroboration before any auto‑decision on fragile slices (symmetric for accept/reject).
+
+Concise answers to the six required questions (batch accuracy focus)
+
+1) What specific patterns caused this error?
+- Two patterns: (a) cryo_allzero (CryoSleep=True + all spends == 0) is a rare, heterogeneous slice with mixed labels; the model lacked stratified priors and explicit interactions so direction flips across subclusters. (b) top1_spend_dominant (Spa=898 dominates other spends) — the large single‑channel spend produced an outsized per‑feature logit contribution and drove the prediction despite conflicting contextual signals. The calibrator under‑estimated uncertainty for these rare patterns, and gating allowed a brittle n==1 auto‑decision.
+
+2) How should decision rules be modified to prevent recurrence?
+- Define fragile slice flags (cryo_allzero, single_channel_dominant, implausible_spend, high_imputation). For n_batch == 1 and fragile_flag: do NOT auto‑decide unless strict multi‑model corroboration (pooled_prior strength, GLM_fallback agreement, high ensemble agreement, small quantile width) is met. Make gating symmetric for accepts and rejects. Hold entire batch if batch_frac_fragile ≥ threshold (e.g., 5%).
+
+3) What new insights about transport patterns?
+- CryoSleep is not uniformly protective/negative — in combination with zero spending it is a mixture of behaviors (infants, non‑spenders, data artifacts). High single‑channel spending (e.g., massive Spa spend) is rare and not uniformly predictive — single channel dominance often correlates with data/behavioral heterogeneity and must be treated as fragile.
+
+4) How should confidence levels be recalibrated?
+- Use a heteroskedastic quantile calibrator that explicitly inflates uncertainty for cryo_allzero and single_channel_dominant slices and for implausible spend values. Add slice‑specific variance terms and raise SE floors for n==1 fragile cases (se_floor ≈ 0.50–0.60). Require small (p90−p10) quantile width before auto‑decision.
+
+5) What adjustments for batch consistency?
+- Treat batches and cohorts as decision units: compute batch_frac_fragile and hold batch if above threshold; detect cohort contradictions (mixed prediction signs within cohort) and hold. Require stronger corroboration for n==1 predictions on fragile slices.
+
+6) How can metrics be improved to handle edge cases like this?
+- Define slice‑level KPIs: FP_rate/FN_rate for cryo_allzero and single_channel_dominant by n, age_bucket, cohort. Add drift and novelty monitors for top1_share and per_channel max. Expand pooled priors stratification (cryo_allzero × age_bucket × family_size; single_channel_dominant × top_channel × age_bucket) and use mixture cluster priors.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Immediate emergency actions (0–6h)
+- Emergency gating (hotfix)
+  - If n_batch == 1 AND (cryo_allzero_flag == True OR single_channel_dominant_flag == True OR implausible_spend_flag == True) then block auto‑decision (both accepts and rejects) and route to priority_audit/canary.
+  - Add canaries: 0192_01 (cryo_allzero), 0192_03 (Spa‑dominant), and any prior canaries (e.g., 0190_01).
+- Flag definitions (compute before imputation where relevant)
+  - all_zero_flag: winsorized_sum_spend == 0 AND per_channel_nonzero_count == 0 (computed pre‑imputation).
+  - cryo_allzero_flag: CryoSleep == True AND all_zero_flag == True.
+  - top1_channel, top1_value_raw (raw), top1_value_winsorized, top1_share_raw = top1_value_raw / (sum_raw + ε).
+  - single_channel_dominant_flag: top1_share_raw ≥ DOMINANCE_TOP1_SHARE (start 0.90) AND top1_value_raw ≥ DOMINANCE_MIN_SPEND (start 200).
+  - implausible_spend_flag: any channel_raw > IMPLAUSIBLE_SPEND_THRESHOLD (start 1000 OR > 99.99th percentile × 3) OR channel_raw inconsistent with cohort scaling.
+- Persist provenance for canaries immediately:
+  - raw per_channel spends + imputation flags/methods, winsorized transforms, per_feature_logit_contributions, pooled_prior_snapshot_id, cohort_id, family_group_size, age_bucket, channel_entropy, novelty_distance, cryo_allzero_flag, single_channel_dominant_flag, implausible_spend_flag.
+- Expose variance components; raise SE floor:
+  - For n==1 & cryo_allzero: se_floor = 0.50.
+  - For n==1 & single_channel_dominant or implausible_spend: se_floor = 0.60.
+- Require GLM_fallback + ensemble corroboration for any auto‑decisions on fragile slices even after SE floor is set.
+
+B. Feature engineering updates (v→v+1)
+- Persist raw inputs and imputation provenance for all spend channels and demographics.
+- New/explicit features to add:
+  - all_zero_flag (computed pre‑imputation).
+  - cryo_allzero_flag = CryoSleep × all_zero_flag.
+  - top1_channel, top1_value_raw, top1_value_winsorized, top1_share_raw, top1_share_winsorized.
+  - single_channel_dominant_flag.
+  - implausible_spend_flag.
+  - per_channel_imputed_flags and imputed_count.
+  - channel_entropy = −Σ share_i log share_i (safe handling of zeros).
+  - per_channel_ratio_i = spend_i / (sum_spend + ε).
+  - novelty_distance (Mahalanobis) on (spend_vector + CryoSleep + age_bucket + HomePlanet).
+  - cluster_id from clustering on (spend_vector + CryoSleep + age_bucket + family_size).
+- Transform rules:
+  - Winsorize spends at GLOBAL_SPEND_UPPER (e.g., 99.5th percentile or absolute cap, start = 1000), then log1p.
+  - Compute all_zero_flag and top1_share_raw before imputation/winsorization to preserve provenance.
+  - Create saturating transforms and per‑feature logit caps.
+
+C. Pooled priors — expanded stratification & mixture modeling
+- Add new slices to pooled priors and stratify:
+  - cryo_allzero × age_bucket × family_size_bucket.
+  - single_channel_dominant × top1_channel × age_bucket.
+  - implausible_spend slice with cohort/context stratification.
+- For cryo_allzero and single_channel_dominant use mixture‑of‑priors: detect subclusters (via cluster_id) and store μ_cluster with N_cluster; blend with global prior.
+- Pseudo‑counts (start; sweepable):
+  - N0_cryo_allzero = 700
+  - N0_single_dominant = 500
+- Blending: τ_slice = N_slice / (N_slice + N0_slice); μ_blend = τ_slice*μ_slice + (1−τ_slice)*μ_global.
+- Persist pooled_prior_snapshot_id for each scoring run.
+
+D. Per‑feature logit caps, winsorization & directionality handling
+- Revised per_feature caps:
+  - CAP_PER_CHANNEL_LOGIT = 1.0 (per spend channel)
+  - CAP_TOP1_SPEND_LOGIT = 1.6
+  - CAP_CRIO_FEATURE_LOGIT = 1.0
+  - CAP_SINGLE_CHANNEL_DOMINANCE_LOGIT = 1.0
+- If single_channel_dominant_flag is True, dampen that channel’s contribution: apply multiplicative downweight α_dom (start α_dom = 0.6) before computing capped logit.
+- Enforce monotonic but capped contribution for spends: per_feature_logit = sign(l)*min(abs(l), cap).
+
+E. Variance / SE model (add cryo + spend dominance terms)
+- New variance components (initial κ values; sweepable):
+  - var_cryo_allzero = κ_cryo_allzero * indicator(cryo_allzero_flag); κ_cryo_allzero = 0.35
+  - var_cryo_age = κ_cryo_age * distance_in_age_bucket; κ_cryo_age = 0.25
+  - var_single_dom = κ_single_dom * indicator(single_channel_dominant_flag); κ_single_dom = 0.40
+  - var_implausible = κ_implausible * indicator(implausible_spend_flag); κ_implausible = 0.45
+  - var_imputation = κ_imputation * imputed_count_normalized; κ_imputation = 0.10
+  - var_novelty = κ_novelty * (novelty_distance / novelty_scale); κ_novelty = 0.30
+- Combine: var_combined = var_base + Σ(var_components). se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- SE floors (start):
+  - n==1 & cryo_allzero: se_floor = 0.50
+  - n==1 & single_channel_dominant / implausible_spend: se_floor = 0.60
+  - n==1 & other fragile: se_floor = 0.40
+  - stable slices: se_floor = 0.06–0.10
+
+F. Decision‑gating (pattern‑aware + batch/cohort aware) — symmetrical for accepts & rejects
+- Fragile_flag_v6 criteria (expanded):
+  - cryo_allzero_flag OR
+  - single_channel_dominant_flag OR
+  - implausible_spend_flag OR
+  - (all_zero_flag AND age_under5_flag) OR
+  - per_channel_imputed_flag_count ≥ 2 OR
+  - dominance_sign_consistency_score < DOMINANCE_CONSISTENCY_THRESHOLD OR
+  - novelty_distance ≥ NOVELTY_THRESHOLD
+- Batch/cohort checks:
+  - batch_frac_fragile = (#fragile_records_in_batch)/batch_size
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 5%) → hold auto_decisions for entire batch and route to audit
+  - If cohort_id present and predictions conflict in sign within cohort → hold cohort
+- n==1 fragile gating (symmetric):
+  - For fragile_flag and n_batch == 1, require ALL of:
+    - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice
+    - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice)
+    - ensemble_agreement ≥ A_high
+    - se_combined ≤ SE_accept_slice AND quantile_width ≤ QW_accept_slice
+  - Else → route to priority_audit (do not auto accept/reject)
+- Example starting thresholds (sweepable):
+  - BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+  - N0_cryo_allzero = 700; N_min_cryo_allzero = 80
+  - N0_single_dominant = 500; N_min_single_dominant = 60
+  - τ_high_slice = 0.95; A_high = 0.995
+  - SE_accept_cryo = 0.12; SE_accept_single_dom = 0.10
+  - δ_slice (fragile) = 0.05; QW_accept_slice = 0.12
+  - DOMINANCE_TOP1_SHARE = 0.90; DOMINANCE_MIN_SPEND = 200; IMPLAUSIBLE_SPEND_THRESHOLD = 1000
+
+G. Calibrator & GLM_fallback retrain plan (fragile slices focused)
+- Calibrator:
+  - Heteroskedastic quantile calibrator with p10/p50/p90 heads + variance net.
+  - Inputs: cryo_allzero_flag, single_channel_dominant_flag, implausible_spend_flag, cryo_age_bucket, winsorized_sum_spend, channel_entropy, per_channel_imputed_flags, novelty_distance, cluster_id, top1_share.
+  - Loss = quantile pinball + ECE penalty + Brier; strongly upweight fragile slices (×8–12).
+  - Output: p10/p50/p90, se_estimate; quantile width used by gating.
+- GLM_fallback:
+  - ElasticNet logistic on winsorized inputs with explicit interactions: cryo_allzero, cryo×age_bucket, cryo×family_size, single_channel_dominant × top_channel, top1_share_buckets, cluster_id.
+  - GLM provides stable interpretable sanity check for gating.
+- Training:
+  - Rolling window 18–36 months; targeted upsampling of cryo_allzero and single_channel_dominant slices in training/CV folds.
+  - CV stratified by cryo_allzero, single_dominant, spend_cluster.
+  - Shadow run: 14–28 days with gating active and canaries blocked from auto_accept.
+- Acceptance criteria:
+  - cryo_allzero_FP_rate ↓ ≥ 40–60% and cryo_allzero_FN_rate ↓ ≥ 40–60%
+  - single_channel_dominant_FP_rate ↓ ≥ 50% (reduce single‑channel driven FPs)
+  - Global ECE not worse by >0.5% absolute
+
+H. Handling heterogeneous slices (mixture modeling)
+- For cryo_allzero and single_channel_dominant, detect subclusters (K‑means or GMM on demographic + spend vector + top1_channel) and:
+  - Train cluster‑specific pooled priors μ_cluster, N_cluster.
+  - Use a gating network to predict cluster membership probability at scoring time and blend cluster priors accordingly.
+  - This prevents a single blended prior from averaging away opposite signals.
+
+I. Monitoring, metrics & alerts (batch‑focused)
+- Slice KPIs (near‑real time):
+  - cryo_allzero_FP_rate, cryo_allzero_FN_rate, cryo_allzero_error_rate_by_age_bucket
+  - single_channel_dominant_FP_rate, single_channel_dominant_FN_rate, implausible_spend_error_rate
+  - n==1_auto_accept_rate, n==1_fragile_auto_accept_rate, n==1_cryo_allzero_auto_accept_rate
+  - batch_frac_fragile
+  - cohort_contradiction_rate
+  - top1_share_distribution_by_cohort
+- Alerts:
+  - Any canary auto_accepted or auto_rejected → immediate page
+  - cryo_allzero_FP_rate or FN_rate increase > baseline + X% over 24h → page
+  - single_channel_dominant_FP_rate increase → page
+  - batch_frac_fragile ≥ threshold → hold auto_decisions & notify
+- Dashboards:
+  - Per‑record provenance for canaries and recent fragile auto‑decisions showing raw vs winsorized, per_feature_logits & caps, pooled_prior_snapshot, novelty_distance and cluster_id.
+
+J. CI unit tests & validation (cover cryo_allzero & fragile slices)
+- Unit tests:
+  - Correct all_zero_flag and cryo_allzero_flag computation with imputed vs true zeros.
+  - Correct detection of single_channel_dominant_flag and implausible_spend_flag.
+  - se_combined increases to se_floor for cryo_allzero and top1_dominant n==1 cases.
+  - Calibrator widens p10/p90 for simulated cryo_allzero infant records and Spa‑dominant records.
+  - Pooled_prior blending prevents tiny N slices from dominating.
+  - Per_feature & total logit caps enforced (including dominance dampening).
+  - batch_frac_fragile ≥ threshold disables auto_decisions.
+  - Canaries (0192_01, 0192_03, 0190_01) must not be auto_accepted or auto_rejected while gating active.
+- Regression tests:
+  - Global ECE, AUC, Brier degrade less than tolerances when gating enabled.
+
+K. Operational actions & timeline (0–72 hours)
+1) Immediate (0–6h)
+   - Deploy emergency gating: n==1 & fragile_flag → route to priority_audit; add 0192_01 & 0192_03 to canary list.
+   - Persist provenance fields and expose variance/SE components.
+2) Short‑term (6–24h)
+   - Implement new features (all_zero_flag, cryo_allzero_flag, single_channel_dominant_flag, implausible_spend_flag, top1_share) and retrain lightweight GLM_fallback on winsorized inputs.
+   - Implement batch_frac_fragile hold & cohort contradiction detection.
+   - Instrument dashboards & alerts for cryo_allzero and single_channel_dominant KPIs; start targeted label collection.
+   - Add data validation rule that flags implausible channel values > IMPLAUSIBLE_SPEND_THRESHOLD to data quality pipeline.
+3) Mid‑term (24–72h)
+   - Retrain heteroskedastic quantile calibrator and GLM_fallback with updated inputs and upweight schedule; run 14–28 day shadow run with gating active (canaries blocked).
+   - Implement cluster‑specific priors for cryo_allzero and single_channel_dominant; tune logit caps & κ values using shadow diagnostics.
+   - Tune gating thresholds to balance throughput vs safety.
+
+L. Per‑record provenance to log (required & extended)
+- Raw per_channel spends + imputation provenance: values + imputed_flags + method + source_date.
+- Cryo & demographic: CryoSleep, Age, Age_bucket, family_name, family_group_size, cabin_id, destination.
+- Transforms & flags: winsorized_spend[channel], winsorized_sum_spend, all_zero_flag, cryo_allzero_flag, top1_channel, top1_value_raw, top1_share_raw, single_channel_dominant_flag, implausible_spend_flag, is_winsorized_flag, per_channel_imputed_flags, imputed_count, top1_share, channel_entropy, novelty_distance, cluster_id.
+- Model internals: per_feature_logit_contributions (map), per_feature_logit_caps_triggered, pooled_prior_snapshot_id, μ_slice/μ_cluster, τ_slice_blend.
+- Variances: var_cryo_allzero, var_single_dom, var_implausible, var_cryo_age, var_imputation, var_novelty, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, quantile_width, gating_reasons, routing_decision, scorer_version, calibrator_version, provenance_hash.
+
+M. Initial hyperparameters (start values; sweepable)
+- SE floor for n==1 cryo_allzero = 0.50
+- SE floor for n==1 single_channel_dominant / implausible_spend = 0.60
+- N0_cryo_allzero = 700; N_min_cryo_allzero = 80
+- N0_single_dominant = 500; N_min_single_dominant = 60
+- κ_cryo_allzero = 0.35; κ_cryo_age = 0.25; κ_single_dom = 0.40; κ_implausible = 0.45; κ_imputation = 0.10; κ_novelty = 0.30
+- τ_high_slice = 0.95; A_high = 0.995
+- SE_accept_cryo = 0.12; SE_accept_single_dom = 0.10; δ_slice (fragile) = 0.05
+- BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+- QW_accept_slice = 0.12
+- DOMINANCE_TOP1_SHARE = 0.90; DOMINANCE_MIN_SPEND = 200; IMPLAUSIBLE_SPEND_THRESHOLD = 1000
+- CAP_PER_CHANNEL_LOGIT = 1.0; CAP_TOP1_SPEND_LOGIT = 1.6; α_dom = 0.6
+
+N. CI canaries & expected behavior
+- Canary 1: 0192_01 (cryo_allzero, Age=1, sum_spend=0): expected to be routed to priority_audit under emergency gate.
+- Canary 2: 0192_03 (Spa‑dominant, Spa=898, top1_share≈0.99): expected to be routed to priority_audit under emergency gate and to data_quality pipeline (implausible_spend_flag).
+- Existing canaries remain. Unit tests assert canaries are not auto_accepted or auto_rejected while gating active.
+
+O. Concise gating pseudocode (updated)
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag_v6)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD:
+      route all r in B -> priority_audit; continue
+  - for each record r in B:
+      compute fragile_flag_v6 (includes cryo_allzero, single_channel_dominant, implausible_spend, etc.)
+      if n_batch == 1 and fragile_flag_v6:
+         if (pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice):
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if implausible_spend_flag:
+         route r -> data_quality_review + priority_audit
+         continue
+      if cohort_id present and predictions conflict in sign within cohort:
+         route cohort -> priority_audit
+
+P. Specific diagnosis for Passenger 0192_03
+- Observations:
+  - sum_spend ≈ 908 (Spa dominates), top1_channel = Spa, top1_share_raw ≈ 898 / (898 + 10) ≈ 0.99 → single_channel_dominant_flag true under DOMINANCE_TOP1_SHARE = 0.90.
+  - Spa value (898) is near or above typical global upper bounds and triggers implausible_spend_flag if threshold set at 1000/(percentile rule) or close.
+- Likely model behavior:
+  - The model’s spend channel coefficients (especially Spa) produced a very large positive per_feature logit contribution that overwhelmed other signals and pooled priors; calibrator underestimated uncertainty for this rare dominant pattern; gating allowed the n==1 auto decision.
+- Handling under updated rules:
+  - Under the emergency gate, 0192_03 would have been routed to priority_audit and flagged for data_quality vetting (implausible_spend_flag). After retraining, the scorer would compute inflated SE, dampen Spa’s contribution (α_dom), and require GLM + ensemble corroboration before auto decision.
+
+Q. Why this will reduce batch errors (short)
+- The system now:
+  - Treats cryo_allzero and single_channel_dominant as first‑class, stratified fragile slices.
+  - Prevents single features from dominating decisions by capping logit contributions and applying dominance damping.
+  - Inflates uncertainty where data is sparse/heterogeneous and prevents brittle n==1 auto‑decisions unless corroborated.
+  - Uses cluster priors (mixture modeling) so multimodal label distributions are modeled explicitly rather than averaged away.
+  - Adds implausible‑value detection and data_quality routing for suspicious records.
+  - Together these steps reduce both FPs and FNs in fragile slices, and increase batch consistency.
+
+R. Tradeoffs & operational notes
+- Expect immediate increase in priority_audit throughput and data_quality tickets — allocate triage capacity.
+- Conservative gating reduces automatic throughput initially; shadow runs and tuning needed to recover safe throughput.
+- More logging increases storage costs; persist full provenance for canaries and maintain rolling audit window (e.g., 90 days).
+- Some global metrics (apparent AUC/ECE) may temporarily move; acceptance criteria for retrain must balance slice improvements vs global stability.
+
+S. Next steps / deliverables (recommended sequencing)
+- Option A (Immediate, 0–3h, recommended): Emergency gating patch (code + unit tests) implementing cryo_allzero and single_channel_dominant detection and canary tests for 0192_01 and 0192_03; deploy checklist and logging changes.
+- Option B (24–72h): Full retrain recipe: heteroskedastic quantile calibrator training script, GLM_fallback spec with cryo_allzero and single_channel_dominant interactions, mixture priors, upweight schedule, CV design, and shadow‑run dashboard spec.
+- Recommendation: Deploy Option A now to stop brittle n==1 auto‑decisions. Follow with Option B and a 14–28 day shadow run to tune thresholds and restore safe throughput.
+
+If you want, next I can:
+- produce the exact emergency gating code + unit tests + CI changes for Option A, or
+- produce the full retraining pipeline, calibrator + GLM_fallback code + sweep matrix and shadow‑run dashboard for Option B.
+
+Immediate one‑line corrective action (deploy now)
+- Route any n==1 record with cryo_allzero_flag OR single_channel_dominant_flag OR implausible_spend_flag to priority_audit; add 0192_01 and 0192_03 to canary list.
+
+Final note
+- This report merges learnings from the cryo_allzero brittle FN and the Spa‑dominated FP. The combined pattern is simple: rare/heterogeneous slices + dominating single features + under‑estimated uncertainty + permissive gating = brittle errors in small batches. The fix is a combination of feature, variance, pooled‑prior stratification, per‑feature caps, symmetric gating rules, and decisive data quality checks. Deploy gating immediately; retrain calibrator/GLM with upweighted fragile slices in shadow mode to recover safe automation.
+
+============================================================

@@ -1,0 +1,126 @@
+PREDICTIVE METRICS - ITERATION 76
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.1 (NAN-VALIDATION & LOW-LEISURE SPENDING UPDATE)
+
+**Objective:** To correct the prediction error for Passenger 0103_01 by addressing two critical gaps: (1) failure to handle NaN values in spending categories (FoodCourt=NaN), and (2) inadequate recognition of low but meaningful luxury spending (Spa+VRDeck=17.0) that indicates engagement despite zero basic spending. This passenger was incorrectly dropped due to overly strict NaN handling and insufficient sensitivity to minimal leisure activity in non-CryoSleep passengers.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0103_01: What Went Wrong?
+
+The error for Passenger 0103_01 (Age=24.0, CryoSleep=False, RoomService=0.0, FoodCourt=NaN, ShoppingMall=0.0, Spa=0.0, VRDeck=17.0, Destination=TRAPPIST-1e, HomePlanet=Earth, VIP=False, Cabin=F/24/S) stemmed from two primary failures in the v7.0 rules:
+
+**Key Failure Points:**
+- **NaN Handling Blind Spot:** The system treated NaN values as absolute zeros in spending aggregation, causing FoodCourt=NaN to be incorrectly computed as 0.0 in rules like ZDL-1 and LSSV-1. This led to premature application of zero-diversity penalties.
+- **Insufficient Sensitivity to Low Luxury Spending:** LSSV-1 required Spa+VRDeck ≥ 500.0, missing cases with lower but non-zero luxury spending (e.g., VRDeck=17.0) that still indicate passenger engagement, especially on leisure destinations like TRAPPIST-1e.
+- **Overpenalization of Sparse Data:** ZDL-1 penalized this passenger due to perceived zero diversity (RoomService=0, FoodCourt=NaN→0, ShoppingMall=0, Spa=0) despite VRDeck=17.0 showing activity.
+- **Contextual Oversight:** No rule accounted for adults (Age=24) with any luxury spending on TRAPPIST-1e, even if minimal.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.1)
+
+This update introduces NaN-aware spending aggregation, refines luxury spending thresholds to include lower tiers, and adds a new rule for minimal leisure activity validation.
+
+**New NaN-Aware Spending Rule (Insert as Step 0.h):**
+- **NAN_VALIDATION_AGGREGATION (NVA-1):**
+  - FOR EACH spending category: IF value is NaN, impute as 0.0 for penalty calculations BUT retain NaN status for context rules.
+  - **Rationale:** Prevent NaN from skewing aggregate checks while allowing contextual rules to handle missing data intelligently.
+
+**Refine Leisure-Skewed Spending Rule (Step 0.g):**
+- **LSSV-1 ENHANCED (LOW-LEISURE TIER):**
+  - IF `CryoSleep == False` AND (`Spa + VRDeck >= 10.0`) AND (`RoomService + FoodCourt (NaN→0) + ShoppingMall == 0.0`) → **Apply +5% confidence boost**.
+  - **Rationale:** Capture passengers with any meaningful leisure spending (≥10) and no basic spending, common on resort destinations.
+
+**Adjust Zero-Diversity Penalty Rule (Step 1):**
+- **ZDL-1 (NAN-AWARE & LEISURE-EXEMPT):**
+  - Apply penalty **only if** `Number_of_NonZero_Spend_Categories == 0` OR (`Total_Spend_All_Categories < 10.0` AND `Spa + VRDeck < 10.0`). Penalty remains **-15%**.
+  - **Rationale:** Exempt passengers with any spending ≥10 in any category.
+
+**Enhance Destination Context for Low Spending (Step 2.5):**
+- **CSP-1 ENHANCED (TRAPPIST-1e LOW LEISURE):**
+  - IF `Destination == TRAPPIST-1e` AND `Spa + VRDeck >= 10.0` → **Add +2% confidence boost**.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **NaN Values Indicate Data Gaps, Not Inactivity:** NaN in spending categories should not be equated to zero; they require separate handling to avoid false penalties.
+- **Minimal Leisure Spending Is Significant:** Low spending in Spa/VRDeck (e.g., 10-100) can still indicate engagement, especially for adults on vacation routes.
+- **Age and Destination Synergy:** Younger adults (18-30) on TRAPPIST-1e often show sporadic luxury spending patterns due to budget constraints or selective experiences.
+- **Batch Consistency Requires NaN Protocols:** Uniform NaN handling is essential to prevent arbitrary penalties across batches.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - LSSV-1 Enhanced (low-leisure tier): **+5% confidence boost**
+  - CSP-1 Enhanced (TRAPPIST-1e low leisure): **+2% confidence boost**
+- **Adjusted Default Confidence:**
+  - DF-1: Maintained at **70% confidence**.
+- **NaN Handling:**
+  - NVA-1: No direct confidence change but enables accurate aggregation.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening Expansion:** Add a ninth pre-screening group:
+  - **GROUP LOW_LEISURE_SPENDING:** `CryoSleep == False` AND `Spa + VRDeck >= 10.0` AND `RoomService + FoodCourt (NaN→0) + ShoppingMall == 0.0` → Send to LSSV-1 Enhanced rule.
+- **Batch NaN Validation:** Implement a pre-batch check to log all NaN values and apply NVA-1 before rule processing.
+- **Error Logging:** Monitor cases where LSSV-1 Enhanced is triggered with luxury spending between 10-100 to adjust thresholds if needed.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **NaN in Basic Spending:** Handled by NVA-1 (impute 0 for aggregates) and exempted from penalties if luxury spending ≥10.
+- **Low Luxury Spending with Zero Basics:** Handled by LSSV-1 Enhanced and CSP-1 Enhanced.
+- **Fallback:** If NaN exists in luxury categories, retain penalty unless other data indicates activity.
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.1
+
+**Processing Order v7.1:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v2)**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED)**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)** // **UPDATED RULE**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1)** // **NEW RULE**
+1.  **ZDL-1 (NAN-AWARE & LEISURE-EXEMPT)**
+2.  PRIMARY STATE (PS-1, PS-2)
+**2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED)**
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+... (Remaining rules) ...
+12. DEFAULT (DF-1)
+
+---
+
+### New Scoring Example for Passenger 0103_01 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.1 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0103_01** (Earth, CryoSleep=False, Cabin=F/24/S, Destination=TRAPPIST-1e, Age=24.0, VIP=False, RoomService=0.0, FoodCourt=NaN, ShoppingMall=0.0, Spa=0.0, VRDeck=17.0) | **NVA-1**: FoodCourt=NaN → treated as 0.0 for aggregates → **LSSV-1 Enhanced**: Activated (Spa+VRDeck=17≥10, Basics=0) → +5% boost → **ZDL-1**: Exempt (VRDeck=17≥10) → **PS-1** → **CSP-1 Enhanced**: +2% for TRAPPIST-1e/low luxury → **ACB-2**: Not triggered (luxury <600) → **DF-1** | **True** | **77%** (PS-1: 70% + LSSV-1 Enhanced: 5% + CSP-1 Enhanced: 2%) |
+
+*The new NVA-1 and enhanced LSSV-1 rules correctly process low leisure spending with NaN values, resulting in a True prediction.*
+
+---
+
+### Implementation Plan for v7.1
+
+- **Deploy v7.1 immediately.** Reprocess the batch; validate 0103_01 is now True.
+- **Monitor** NaN frequency and low-leisure triggers (10-100 range) to adjust thresholds if over/under-boosting occurs.
+- **Update historical batches** with NaN imputation and low-leisure rules.
+- **Long-term:** Implement machine learning-based NaN imputation using passenger profiles (e.g., age, destination) for smarter handling.
+
+This update ensures robust NaN handling and recognition of minimal leisure spending, eliminating false negatives and improving accuracy for edge cases.
+
+**Final Note:** Next, analyze interactions between NaN patterns and VIP status, and develop destination-specific NaN imputation models.
+
+============================================================

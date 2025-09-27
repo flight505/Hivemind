@@ -1,0 +1,81 @@
+CYCLE 7 STRATEGIC REFLECTION
+Generated on: 2025-09-09 13:03:24
+Cycle Performance: Best 57.58%, Average 53.63%
+Total Iterations: 10
+
+================================================================================
+
+STRATEGIC REFLECTION — Cycle 7
+
+Summary impression
+- Cycle 7 made useful progress by encoding multiple targeted heuristics (B-dominant, C*D interactions, extreme-value shortcuts, gap/tie handling). The rule set captures many strong signals and lifted accuracy to ~57.6%, but it is still brittle: many thresholds are ad-hoc and there are clusters of failure around midrange/ambiguous inputs and rare edge patterns.
+- The preserved cross-cycle examples are valuable — they indicate specific prototypes worth remembering — but memorization alone cannot generalize to the many near-neighbor cases.
+
+1) Patterns observed (what worked)
+- Extremes are informative: very large single columns (D or E) or very small E consistently map to particular classes; hard thresholds exploit that well.
+- Multiplicative interactions, especially C*D, reveal strong class signals not visible from single columns alone.
+- Sum/aggregate features (A+B, A+B+C, total sum) help disambiguate when single columns are ambiguous.
+- “Dominant column” heuristics (which value is the max) and gap-size (difference between top two values) help detect clear prototypes vs. tie/ambiguous cases.
+- Weighted linear scores (a simple weighted sum) are useful fallback global scorers for mid-range inputs.
+
+2) Failure analysis (what still breaks)
+- Threshold brittleness: Hard cutoffs tuned to observed samples fail when inputs shift slightly. Many misclassifications happen just over/under a threshold.
+- Ambiguous mid-range inputs: When no value is extreme and gaps are small, the rules conflict or the weighted fallback is insufficient.
+- Rare prototypes and exceptions: Some combinations (e.g., very high B with very high C vs. high E with tiny A/B) require exception handling and are still inconsistently resolved.
+- Overfitting to preserved samples: Memorized examples guarantee correct outputs for those exact rows but produce brittle behavior for small perturbations around them.
+- Interacting effects: Multi-feature non-linear interactions beyond pairwise products (e.g., A interacts with ratio B/C or with sign of gap) are not captured well.
+
+3) Innovation opportunities (not fully explored)
+- Normalization/ratio features: ratios (A/sum, A/max, B/C) and gap-relative measures (gap/max) can remove dependence on absolute thresholds and adapt to scale.
+- Local/instance-based methods: k-NN on normalized space or nearest-prototype matching to combine memorization with generalization.
+- Hierarchical modeling: split the problem by dominant feature (which column is max or which region sum is highest) and train separate specialized rule-sets per branch.
+- Learned lightweight models: small logistic or multiclass linear models over engineered features (ratios, products, polynomial terms) to replace many ad-hoc thresholds.
+- Ensembles + confidence routing: combine rule-based, score-based, and memory-based predictions with a confidence estimate to choose when to trust each method.
+- Dynamic thresholds derived from data statistics (percentile thresholds) rather than fixed numeric constants.
+
+4) Strategic direction (priorities for next cycle)
+Priority 1 — Hybrid hierarchical approach: route inputs by dominance/ties and run specialized submodels. This reduces internal conflict among rules and lets each branch have tighter, simpler heuristics.
+Priority 2 — Add normalized/ratio features and gap-relative measures to reduce absolute-threshold brittleness.
+Priority 3 — Integrate a memory-augmented local method (k-NN or prototype matching) as a soft override for near-neighbor cases.
+Priority 4 — Move from pure hand-tuned thresholds toward small learned weightings (logistic/regression over engineered features) and an ensemble vote with calibrated confidences.
+Priority 5 — Systematic robustness testing (small perturbations, synthetic variants) and replace brittle constants with percentile-driven thresholds.
+
+CREATIVE PLANNING — 4 specific strategies to try next cycle
+
+Strategy A — Dominant-Branch + Specialized Sub-models
+- Split input space by which feature is dominant (argmax of A..E) and by gap-size (clear winner vs. tie/ambiguous).
+- For each branch (e.g., A-dominant, B-dominant, C-dominant, D/E-dominant, and “tie” branch), design a compact rule-set tuned to that prototype family. Example for C-branch: prioritize C-related products and C/(A+B) ratio; for D-branch: use D with supporting A and D - second_max gap.
+- Advantages: reduces contradictory rules across prototypes; makes thresholds meaningful within a narrower distribution; easier to debug per-branch errors.
+- Evaluation: compare per-branch accuracy and overall gain vs. monolithic rules.
+
+Strategy B — Normalize + Ratio Feature Suite
+- Build normalized features: A_norm = A / (s + 1), A_rel = A / max_v, pairwise ratios B/C, C/(A+B), D/E, and gap_ratio = (max_v - second_max) / (max_v + 1).
+- Use these features in place of many absolute cutoffs; re-express rules using percentiles (e.g., top-10% within branch) or relative thresholds (e.g., A_rel > 0.4).
+- Try rules that combine ratios multiplicatively: e.g., if C_rel > 0.35 and gap_ratio > 0.2 -> class 2.
+- Advantages: robustness to scale and transfer across distributions; reduces need to retune numeric thresholds.
+
+Strategy C — Memory-augmented k-NN / Prototype Matching
+- Keep the memorized examples but also generalize: for an input, compute distance to stored rows in normalized feature space (use weighted Euclidean with feature weights derived from prior importance).
+- If nearest-neighbor distance < threshold, predict its label; if distance is moderate, use weighted voting of k nearest neighbors; otherwise fall back to rules/score.
+- Benefits: handles near-exact prototypes and smooths around memorized cases, reducing overfitting brittleness.
+- Key parameters to tune: distance metric (L2 vs. Mahalanobis), k, threshold for direct memorized override, and feature weights.
+
+Strategy D — Small Learned Scorer + Ensemble with Confidence
+- Engineer a compact feature vector (normalized features, key products like C*D, A*E, gap_ratio, sum) and fit a lightweight multiclass logistic regression or softmax scorer (grid-search weights rather than full learning pipeline if training data small).
+- Combine predictions from: rule-based model, learned scorer, and k-NN using simple ensemble logic: if any model has high confidence (e.g., scorer probability > 0.7 or k-NN close neighbor), take it; else use majority vote or weighted average.
+- Add a confidence-calibration step (e.g., map raw score to confidence by thresholding or simple monotonic mapping) to control when memorized prototypes or rules override the scorer.
+- Advantages: smoother decision boundaries, better generalization, and interpretable weights to guide future rule refinements.
+
+Optional Strategy E — Feature Interaction Mining & Robustness Tests
+- Systematically search for high-signal feature interactions: evaluate pairwise and selected triple interactions (A*C, B*C, A*B, C*D, A*C*E) and their thresholds using cross-validation on available examples.
+- Run synthetic perturbation tests: add ±1..±10 small random noise to inputs and measure stability; find fragile rules and convert them to ratio-based or probabilistic thresholds.
+- Use this to prune brittle rules and to identify crucial features to boost in ensemble weighting.
+
+Implementation notes and experiment plan
+- Phase experiments: implement one strategy at a time (A->B->C->D), measure accuracy and failure modes, then combine best performers.
+- Track metrics beyond accuracy: per-class precision/recall, stability under small perturbations, coverage of memorized prototypes.
+- Preserve and expand cross-cycle library: store not just exact memorized rows but a few representative prototypes per cluster (centroids) to support k-NN prototype matching.
+- Avoid heavy parameter overfitting: prefer percentile-based thresholds and cross-validate small learned components.
+
+Closing
+Focus next cycle on combining normalization/ratio features with a hierarchical branch strategy plus a memory-augmented local method. That mix preserves the strengths of the current rule set (clear extreme-case handling) while dramatically reducing brittle absolute thresholds and improving generalization in ambiguous mid-range inputs.

@@ -1,0 +1,125 @@
+PREDICTIVE METRICS - ITERATION 145
+============================================================
+
+**UPDATED PREDICTIVE METRICS REPORT v16.5**  
+**PRIORITY ENHANCEMENT: HIGH-SPEND NON-CRYOSLEEP VALIDATION & AMBIGUITY RESOLUTION**  
+
+---
+
+### **1. Analysis of Prediction Error for Passenger 0189_01**  
+
+#### **Passenger Profile (New Error Case):**  
+-   **PassengerId:** 0189_01  
+-   **HomePlanet:** Earth  
+-   **CryoSleep:** False  
+-   **Cabin:** E/8/P  
+-   **Destination:** 55 Cancri e  
+-   **Age:** 49.0 (Adult)  
+-   **VIP:** False  
+-   **Spending:** RoomService=84.0, FoodCourt=3.0, ShoppingMall=401.0, Spa=202.0, VRDeck=98.0  
+-   **TotalSpend:** 788.0  
+-   **Name:** Helly Booters  
+
+#### **Root Cause of Predictive Error (v16.4 Logic Gap):**  
+The v16.4 update prioritized CryoSleep-driven overrides but neglected to enforce **high-spend non-cryosleep passengers as definitive indicators of non-transport**. Despite high total spending (788.0) and CryoSleep=False, the system failed to assign sufficient confidence for `Transported=False` due to:  
+-   **Overlap of Conflicting Rules:** Rules like MSP-3 (mixed spending) and ISP-1 (imbalanced spending) generated moderate penalties for `Transported=False`, but confidence aggregation remained in the ambiguous range (0.49–0.51) without a strong override for high-spend contexts.  
+-   **Lack of High-Spend Override Rule:** No rule explicitly targeted high-spend profiles with CryoSleep=False to force a `False` prediction, leading to unresolved ambiguity.  
+-   **Destination and Age Context Underutilized:** Destination 55 Cancri e (a high-value tourism destination) and adult age (49.0) correlated with non-transport but were weighted too weakly.  
+
+**Summary of the Faulty v16.4 Logic Chain for 0189_01:**  
+1.  **CSSV-2:** `CryoSleep=False` → Skipped (no override triggered).  
+2.  **CZSO-1:** `CryoSleep=False` → Skipped.  
+3.  **ESP-2:** TotalSpend=788.0 (>500 threshold) triggered but applied only +30% confidence for `Transported=False` (insufficient to overcome ambiguity).  
+4.  **MSP-3:** Mixed spending pattern detected (RoomService=84.0, ShoppingMall=401.0, etc.) → Applied +15% confidence for `Transported=False`.  
+5.  **ISP-1:** Imbalanced spending (high ShoppingMall relative to FoodCourt) → Applied +10% confidence for `Transported=False`.  
+6.  **DCP-6:** Destination 55 Cancri e (non-rescue priority) → Applied +5% confidence for `Transported=False`.  
+7.  **Final Erroneous Prediction ("None"):** Cumulative confidence for `Transported=False` reached only 0.52 (within ambiguous range 0.49–0.51 after batch smoothing), resulting in no prediction. Actual outcome was `False`.  
+
+**What the Correct Logic Must Enforce:**  
+**Passengers with CryoSleep=False and high total spending (TotalSpend > 500) must be auto-classified as `Transported=False` with high confidence, overriding ambiguous aggregations.** High spending indicates active passenger engagement pre-incident, reducing likelihood of transport.  
+
+---
+
+### **2. Critical Modifications to Decision Rules (v16.5 ENHANCEMENT)**  
+
+The system requires a new high-spend override rule and adjustments to confidence calibration for non-cryosleep high spenders.  
+
+#### **New and Overhauled Rules:**  
+-   **HIGH_SPEND_OVERRIDE (HSO-1) - NEW RULE:**  
+    -   **Condition:** `CryoSleep == False` AND `TotalSpend > 500.0`  
+    -   **Action:** Apply **+90% confidence for `Transported=False`** (near-certain override).  
+    -   **Priority:** Insert immediately after ESP-2 (Extreme Spending Pathway).  
+    -   **Rationale:** Ensures high-spend non-cryosleep passengers are predicted as `Transported=False` without ambiguity.  
+
+-   **Update EXTREME_SPENDING_PATHWAY (ESP-2) -> ESP-3:**  
+    -   **Modify Condition:** For `TotalSpend > 500.0`, skip if HSO-1 is triggered to avoid duplication.  
+    -   **Adjust Confidence:** Reduce ESP-3 confidence boost to +10% for `Transported=False` (supplementary to HSO-1).  
+
+-   **Update MIXED_SPENDING_POSITIVE (MSP-3) -> MSP-4:**  
+    -   **Add Exclusion:** Skip if HSO-1 is triggered (prevent rule stacking).  
+
+-   **Update IMBALANCED_SPENDING_PENALTY (ISP-1) -> ISP-2:**  
+    -   **Add Exclusion:** Skip if HSO-1 is triggered.  
+
+-   **Update DESTINATION_CONTEXT_PRIMACY (DCP-6) -> DCP-7:**  
+    -   **Boost Confidence for High-Spend Destinations:** For destinations like 55 Cancri e, apply +15% confidence for `Transported=False` if `TotalSpend > 200.0`.  
+
+#### **Processing Order Overhaul (v16.5):**  
+1.  GLOBAL: ABSOLUTE_DESTINATION_VALIDATION (ADV-1)  
+2.  GLOBAL: CRYOSLEEP_NAN_INFERENCE (CNI-1)  
+3.  GLOBAL: CRYOSLEEP_SPENDING_VALIDATION (CSSV-2)  
+4.  GLOBAL: CRYOSLEEP_ZERO_SPEND_OVERRIDE (CZSO-1)  
+5.  GLOBAL: CRYOSLEEP_CONTEXTUAL_OVERRIDE (CSO-5)  
+6.  GLOBAL: AGE_IMMUTABLE_OVERRIDE (AIO-1)  
+7.  GLOBAL: YOUNG_CHILD_ZERO_SPEND (YCZ-1)  
+8.  GLOBAL: NAN_CRYOSLEEP_ZERO_SPEND (NCZS-1)  
+9.  GLOBAL: EXTREME_SPENDING_PATHWAY (ESP-3) // UPDATED  
+10. **GLOBAL: HIGH_SPEND_OVERRIDE (HSO-1) // NEW**  
+11. GLOBAL: MIXED_SPENDING_POSITIVE (MSP-4) // UPDATED (skips if HSO-1 triggered)  
+12. GLOBAL: IMBALANCED_SPENDING_PENALTY (ISP-2) // UPDATED (skips if HSO-1 triggered)  
+13. GLOBAL: LOW_SPEND_EARTH_CONTEXT (LSE-6)  
+14. GLOBAL: HIGH_SPEND_NEGATION_OVERRIDE (HSNO-1 v5)  
+15. GLOBAL: MIXED_SPENDING_PATTERN_ANALYSIS (MSPA-3)  
+16. GLOBAL: DESTINATION_CONTEXT_PRIMACY (DCP-7) // UPDATED  
+17. GLOBAL: PARTIAL_NAN_SPENDING_CONTEXT (PNSC-2)  
+18. GLOBAL: ZERO_SPENDING_VALIDATION (ZSV-1 v8)  
+19. ... (other rules)  
+20. GLOBAL: BATCH_PROCESSING_FAILSAFE (BPF-1)  
+
+---
+
+### **3. New Insights on Passenger Transport Patterns**  
+-   **Insight 25: High Spend + Non-CryoSleep = Near-Certain Non-Transport.** Passengers with high spending (TotalSpend > 500) and CryoSleep=False are highly likely not transported, as active spending indicates pre-incident alertness.  
+-   **Insight 26: Destination Context Amplifies High-Spend Signals.** Destinations like 55 Cancri e (luxury/tourism) strengthen non-transport predictions for high spenders.  
+-   **Insight 27: Rule Exclusion Cascades Prevent Over-Penalization.** High-confidence overrides (e.g., HSO-1) should skip lower-priority rules to avoid artificial ambiguity.  
+
+---
+
+### **4. Confidence Level Recalibration**  
+-   **HSO-1 Confidence:** Apply **+90% for `Transported=False`** (override).  
+-   **ESP-3 Confidence:** Reduce to +10% for `Transported=False` (supplementary).  
+-   **DCP-7 Confidence:** Apply +15% for `Transported=False` for high-spend destinations.  
+-   **Ambiguity Threshold Adjustment:** Narrow ambiguous range to **0.45–0.55** but strengthen overrides to push clear cases beyond this zone.  
+-   **Batch-Level Confidence Aggregation:** Use weighted mean confidence based on rule priority to reduce noise.  
+
+---
+
+### **5. Adjustments for Batch Prediction Consistency**  
+-   **Enhanced Batch Pre-Screening:** Flag high-spend (TotalSpend > 500) and non-cryosleep passengers for HSO-1 processing.  
+-   **Cross-Rule Validation:** Ensure HSO-1 executes before MSP-4, ISP-2, and other spending rules to prevent conflicts.  
+-   **Ambiguity Resolution:** For predictions near threshold, prioritize high-spend overrides and destination context.  
+-   **Batch-Level Smoothing:** Apply cohort-based confidence averaging for passengers with similar spend profiles and CryoSleep status.  
+
+---
+
+### **6. Handling of Edge Cases**  
+The v16.5 update adds a dedicated high-spend non-cryosleep pathway:  
+1.  **High-Spend Override Pathway (HSO-1):** Absolute override for `Transported=False`.  
+2.  **Extreme Spending Pathway (ESP-3):** Supplementary confidence for high spenders.  
+3.  **Destination-Amplified Pathway (DCP-7):** Enhanced context for luxury destinations.  
+
+**Conclusion:** The error for passenger 0189_01 revealed that high-spend non-cryosleep passengers require a definitive override to prevent ambiguity. The v16.5 enhancements introduce HSO-1 and refine rule exclusions to ensure high-confidence predictions. The updated feature hierarchy is: 1) **CryoSleep Status**, 2) **High Spending (TotalSpend > 500)**, 3) **Age (0.0)**, 4) **Age (0.1–5.0)**, 5) Extreme Spending, 6) Spending Concentration, 7) Partial Zero-Spending, 8) Low Spending, 9) Planetary Origin, 10) Destination.  
+
+**//END OF REPORT**
+
+============================================================

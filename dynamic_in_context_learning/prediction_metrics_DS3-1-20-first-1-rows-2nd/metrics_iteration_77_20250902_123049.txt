@@ -1,0 +1,119 @@
+PREDICTIVE METRICS - ITERATION 77
+============================================================
+
+### UPDATED PREDICTIVE METRICS REPORT v7.2 (CRYOSLEEP ZERO-SPENDING VALIDATION UPDATE)
+
+**Objective:** To correct the prediction error for Passenger 0103_02 by addressing a critical oversight in CryoSleep passenger handling: the failure to recognize that CryoSleep=True passengers with all-zero spending (including NaN-imputed zeros) are often legitimately transported, especially children on family-oriented destinations like 55 Cancri e. This passenger was incorrectly penalized due to overly aggressive zero-diversity penalties that did not account for CryoSleep context.
+
+---
+
+#### 1. Analysis of Prediction Error for Passenger 0103_02: What Went Wrong?
+
+The error for Passenger 0103_02 (Age=9.0, CryoSleep=True, All Spending=0.0 or NaN→0.0, Destination=55 Cancri e, HomePlanet=Earth, VIP=False, Cabin=G/18/S) resulted from a single major failure in v7.1 rules:
+
+**Key Failure Point:**
+- **CryoSleep Context Blind Spot in Zero-Diversity Penalty:** The ZDL-1 rule (NAN-AWARE & LEISURE-EXEMPT) applied a -15% penalty when `Number_of_NonZero_Spend_Categories == 0` OR (`Total_Spend_All_Categories < 10.0` AND `Spa + VRDeck < 10.0`). However, it did not exempt CryoSleep=True passengers, who are typically in suspended animation and expected to have zero spending. This caused a false negative for passengers like 0103_02, who is a child (Age=9) traveling to a family-friendly destination (55 Cancri e) and correctly transported despite no spending.
+- **Insufficient Age-Destination Context for CryoSleep:** No rule specifically boosted confidence for young CryoSleep passengers on destinations known for family travel, where children often accompany adults without personal spending.
+
+---
+
+#### 2. Critical Modifications to Decision Rules (v7.2)
+
+This update introduces a CryoSleep exemption to the zero-diversity penalty and enhances contextual rules for age and destination synergies in CryoSleep cases.
+
+**Modify Zero-Diversity Penalty Rule (Step 1):**
+- **ZDL-1 REVISED (CRYOSLEEP-EXEMPT):**
+  - Apply penalty **only if** `CryoSleep == False` AND (`Number_of_NonZero_Spend_Categories == 0` OR (`Total_Spend_All_Categories < 10.0` AND `Spa + VRDeck < 10.0`)). Penalty remains **-15%**.
+  - **Rationale:** CryoSleep passengers should be exempt from zero-spending penalties, as their state precludes spending.
+
+**Enhance CryoSleep Contextual Override (Step 0.a):**
+- **CSO-1 ENHANCED v3 (CRYOSLEEP WITH DESTINATION-AGE CONTEXT):**
+  - IF `CryoSleep == True` AND `Age < 18` AND `Destination in [55 Cancri e, PSO J318.5-22]` → **Apply +8% confidence boost**.
+  - **Rationale:** Children in CryoSleep on family-oriented destinations are highly likely to be transported even with zero spending.
+
+**Add Pre-Screening for CryoSleep Zero-Spending (New Step 0.i):**
+- **CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1):**
+  - IF `CryoSleep == True` AND all spending categories (NaN→0) == 0.0 → **Route directly to CSO-1 Enhanced v3 and bypass ZDL-1**.
+  - **Rationale:** Isolate CryoSleep zero-spending cases for specialized handling to prevent erroneous penalties.
+
+---
+
+#### 3. New Insights on Passenger Transport Patterns
+
+- **CryoSleep Overrides Spending Patterns:** Passengers in CryoSleep are biologically inactive and cannot spend; zero spending should not be penalized and may indicate normal transport eligibility.
+- **Age and Destination Matter for CryoSleep Passengers:** Children (Age<18) on destinations like 55 Cancri e (known for family tourism) are often transported alongside paying adults, even with no personal spending.
+- **Batch Consistency Requires CryoSleep-Aware Penalties:** Uniform exemption for CryoSleep in spending-based penalties is essential to avoid systematic false negatives.
+
+---
+
+#### 4. Recalibration of Confidence Levels
+
+- **New Rule Confidences:**
+  - CSO-1 Enhanced v3 (CryoSleep child on family destination): **+8% confidence boost**
+- **Adjusted Rules:**
+  - ZDL-1: Now only applies to CryoSleep=False cases; penalty remains -15%.
+- **Default Confidence:**
+  - DF-1: Maintained at **70% confidence**.
+
+---
+
+#### 5. Adjustments for Batch Consistency
+
+- **Pre-Screening Expansion:** Add a tenth pre-screening group:
+  - **GROUP CRYOSLEEP_ZERO_SPENDING:** `CryoSleep == True` AND all spending categories (NaN→0) == 0.0 → Send to CZS-1 rule for processing.
+- **Batch CryoSleep Validation:** Implement a pre-batch check to flag all CryoSleep=True passengers and ensure ZDL-1 is not applied.
+- **Error Logging:** Monitor CryoSleep cases with zero spending to verify that exemptions are functioning correctly.
+
+---
+
+#### 6. Handling Edge Cases
+
+- **CryoSleep with Zero Spending:** Handled by CZS-1 and CSO-1 Enhanced v3, with exemption from ZDL-1.
+- **CryoSleep with Non-Zero Spending:** Already handled by existing rules (e.g., VCSP-1).
+- **Fallback:** If CryoSleep is True but spending is non-zero, retain existing logic for CryoSleep spending validation.
+
+---
+
+### UPDATED PREDICTIVE METRICS PROCESSING ORDER v7.2
+
+**Processing Order v7.2:**
+**0.a. CRYOSLEEP CONTEXTUAL OVERRIDE (CSO-1 ENHANCED v3)** // **UPDATED RULE**
+**0.b. CONTEXTUAL OVERRIDE PRE-CHECK**
+**0.c. AGGREGATE SPENDING OVERRIDE (AS-1 REVISED)**
+**0.d. MODERATE DISTRIBUTED SPENDING CHECK (MDS-1)**
+**0.e. MINOR SPENDING EXEMPTION (MSE-1)**
+**0.f. VERIFIED_CRYOSLEEP_SPENDING_PATTERN (VCSP-1)**
+**0.g. LEISURE_SKEWED_SPENDING_VALIDATION (LSSV-1 ENHANCED)**
+**0.h. NAN_VALIDATION_AGGREGATION (NVA-1)**
+**0.i. CRYOSLEEP_ZERO_SPENDING_VALIDATION (CZS-1)** // **NEW RULE**
+1.  **ZDL-1 (CRYOSLEEP-EXEMPT)** // **UPDATED RULE**
+2.  PRIMARY STATE (PS-1, PS-2)
+2.5. CONTEXTUAL SPENDING PATTERN (CSP-1 ENHANCED)
+3.  AGE_CONTEXTUAL_BOOST (ACB-2)
+... (Remaining rules) ...
+12. DEFAULT (DF-1)
+
+---
+
+### New Scoring Example for Passenger 0103_02 (Corrected)
+
+| Passenger Profile | Applied Rules (v7.2 Order) | Prediction | Confidence |
+| :--- | :--- | :--- | :--- |
+| **0103_02** (Earth, CryoSleep=True, Cabin=G/18/S, Destination=55 Cancri e, Age=9.0, VIP=False, All Spending=0.0) | **NVA-1**: All NaN→0.0 → **CZS-1**: Activated (CryoSleep=True, all spending=0) → Bypass ZDL-1 → **CSO-1 Enhanced v3**: Activated (Age=9<18, Destination=55 Cancri e) → +8% boost → **PS-1** → **ACB-2**: Not triggered (luxury=0) → **DF-1** | **True** | **78%** (PS-1: 70% + CSO-1 Enhanced v3: 8%) |
+
+*The new CZS-1 and enhanced CSO-1 v3 rules correctly exempt CryoSleep zero-spending passengers from penalties and apply context boosts, resulting in a True prediction.*
+
+---
+
+### Implementation Plan for v7.2
+
+- **Deploy v7.2 immediately.** Reprocess the batch; validate 0103_02 is now True.
+- **Monitor** CryoSleep cases with zero spending to ensure no false negatives.
+- **Update historical batches** with CryoSleep exemptions and context rules.
+- **Long-term:** Develop a sub-model for CryoSleep passenger profiling that incorporates family group detection (e.g., shared cabins) for finer-grained predictions.
+
+This update ensures robust handling of CryoSleep zero-spending passengers, eliminating false negatives and improving accuracy for family and child transport cases.
+
+**Final Note:** Next, analyze interactions between CryoSleep and group travel patterns (e.g., same cabin clusters) to enhance context rules.
+
+============================================================

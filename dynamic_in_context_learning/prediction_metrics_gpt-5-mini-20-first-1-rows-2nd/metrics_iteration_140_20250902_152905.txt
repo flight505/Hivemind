@@ -1,0 +1,299 @@
+PREDICTIVE METRICS - ITERATION 140
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+- What happened (short):
+  - Two brittle failure modes surfaced in a 1‑record batch context:
+    1) False negative: Passenger 0179_03 (Age=3, all channel spends = 0). Model predicted Transported=False but actual=True. Root causes: over‑reliance on spend = 0 signal, missing/under‑weighted age×all_zero interaction and family/cabin priors, calibrator under‑estimated uncertainty for a rare small‑age × all_zero slice, and the decision system allowed n==1 auto‑decisions for a fragile slice.
+    2) False positive: Passenger 0181_01 (Age=20, Spa=299, VRDeck=92, other spends low). Model predicted True but actual False. Root causes: single‑channel dominance (top1_share ≈ 0.76) produced an outsized positive logit; per‑feature logit caps and winsorization were insufficient for moderate but highly‑dominant spends; missing cohort/family priors and calibrator under‑estimation for “high dominance” slices; n==1 auto‑decision allowed a brittle positive.
+  - Net pattern: system is brittle at both extremes — extreme high/imbalanced spends (dominant single‑channel) generate overconfident positives; all‑zero + very young generate overconfident negatives. Calibrator and variance model did not inflate uncertainty appropriately for these fragile slices; gating rules treated n==1 uniformly and allowed unsafe auto‑decisions.
+
+- Immediate priority (0–6h):
+  - Emergency gating: block auto‑decisions for n==1 records that match the expanded fragile definition (include: all_zero & Age ≤ AGE_INFANT_THRESHOLD; top1_share ≥ TOP1_DOMINANCE_THRESHOLD & top1_spend ≥ TOP1_SPEND_GATE; sum_spend ≥ SUM_SPEND_HIGH; any per_channel_imputed_flag; missingness_count ≥ 2). Route to priority_audit/canary.
+  - Add 0179_03 and 0181_01 (and previous canaries) to canary list and route them to priority_audit.
+  - Persist raw inputs, winsorized transforms, per‑feature logits, cohort/family prior snapshots and imputation provenance for canaries.
+  - Expose per‑component variance and se in scorer outputs to debug calibrator/uncertainty quickly.
+  - Require GLM_fallback or ensemble corroboration for auto‑decisions on records with fragile flags in n==1 batches.
+
+Concise answers to the six required questions (batch accuracy focus)
+1) What specific patterns caused these errors?
+- Two fragile slices:
+  - very young + all_zero (Age ≤ ~5 × all_zero_flag) → model learned global negative spend correlation and under‑weighted positive cohort/age interactions;
+  - single‑channel dominance (top1_share high) with moderate absolute spend → model allowed a dominant channel to overpower other signals and cohort priors, producing overconfident positive logits.
+  - Calibration/variance model treated both slices as lower‑uncertainty than appropriate; decision system allowed n==1 auto‑decisions without special handling.
+
+2) How should decision rules be modified to prevent recurrence?
+- Treat n==1 records with fragile flags as requiring corroboration (pooled prior strength, GLM_fallback agreement, ensemble agreement, and low se_combined) or route to audit. Expand fragile definition to include top1_share_high AND top1_spend ≥ threshold, all_zero_age_under5, top1_outlier, multi_high_spend, high_total_spend, and any per_channel_imputed_flag. Add batch_frac_fragile gating for batches.
+
+3) What new insights about transport patterns?
+- Absence of spend is not uniformly negative — it behaves differently for infants/toddlers vs adults. Likewise, concentrated spend (one dominant channel) often has different predictive semantics than broad multi‑channel spend; dominance can be noisy and less reliable than diversified spend signals. Family/cohort priors strongly modulate both cases.
+
+4) How should confidence levels be recalibrated?
+- Use heteroskedastic, slice‑aware calibration and produce p10/p50/p90 + sd. Inflate variance for:
+  - Age_under5 × all_zero
+  - top1_share_high or top1_outlier slices
+  - small‑N slices and n==1 batches
+  - imputed fields and high novelty/distance slices
+- Enforce higher se_floor for these fragile slices (e.g., 0.40–0.60 for n==1 fragile cases).
+
+5) What adjustments for batch consistency?
+- Consider cohort/group (Cabin / family_name) as decision units — conflicting predictions within cohort should hold the cohort. Add batch_frac_fragile gating and persist provenance across scorer/calibrator/gate.
+
+6) How can metrics be improved to handle edge cases?
+- Introduce explicit slice KPIs: age_under5_FN_rate, all_zero_FN_rate, top1_share_FP_rate, dominance_FP_rate, n==1_fragile_auto_accept_rate, cohort_contradiction_rate. Expand pooled priors to Age_bucket × all_zero_flag and top1_channel × top1_share_bucket.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Feature engineering updates (v→v+1)
+- Persist raw inputs (value + imputed_flag + method + source_date): RoomService, FoodCourt, ShoppingMall, Spa, VRDeck, Age, Cabin, Name, HomePlanet, CryoSleep, VIP.
+- New / persisted flags and derived features:
+  - sum_spend (raw & log1p) and winsorized_sum_spend.
+  - winsorized_spend[channel], is_winsorized_channel_flag.
+  - top1_channel, top1_spend, top1_share = top1_spend / max(sum_spend, ε).
+  - top1_dominance_flag = top1_share ≥ TOP1_DOMINANCE_THRESHOLD (sweepable).
+  - all_zero_flag = (sum_spend == 0).
+  - age_bucket: infant (0–1), toddler (1–4), early_child (5–11), teen (12–17), adult (18+).
+  - infant_flag / child_under5_flag = Age ≤ AGE_INFANT_THRESHOLD (start 5).
+  - family_name (last name parsing), family_group_size (historic), cabin_group_size (historic).
+  - cohort_transport_rate per family_name, per cabin_id, per cabin_group_size_bucket.
+  - age_x_allzero interaction.
+  - top1_share_bucket (e.g., <0.2, 0.2–0.4, 0.4–0.6, 0.6–0.8, ≥0.8).
+  - num_high_spend_channels, multi_high_flag.
+  - outlier_score (Mahalanobis / LOF / isolation forest) relative to spend cluster centroids.
+  - per_channel_imputed_flags, missingness_count.
+  - dominance_sign_consistency_score = correlation of top1_channel with other cohort members’ top1_channel.
+- Transform changes:
+  - Winsorize raw spends then log1p; use saturating transforms for sum_spend and top1_spend.
+  - Compute top1_share after winsorization to avoid artifacts.
+- Why this helps:
+  - top1_share + dominance flags let the system recognize “one channel dominates” and treat it differently than high broad spend.
+
+B. Pooled priors — expanded stratification + slice direction
+- Stratify priors by: Age_bucket × all_zero_flag, CryoSleep × all_zero_flag, sum_spend_bucket, top1_channel × top1_share_bucket, family_group_size_bucket, HomePlanet.
+- Introduce prior buckets for: top1_share_high (0.6–0.8) and top1_share_extreme (≥0.8).
+- Pseudo‑counts (initial, sweepable):
+  - N0_child = 800; N0_top1_share = 1200; N0_top1 = 1000; N0_multi_high = 400; N0_cryo_all_zero = 300.
+- Blend:
+  - τ_slice = N_slice/(N_slice + N0_slice); μ_blend = τ_slice*μ_slice + (1−τ_slice)*μ_global.
+- Persist pooled_prior_snapshot_id in outputs.
+
+C. Per‑feature logit caps, winsorization & directionality handling
+- Winsorize spends (GLOBAL_SPEND_UPPER) then compute transforms.
+- Apply per‑feature and total logit clamps to avoid single feature domination.
+  - Example caps (start values; sweepable):
+    - CAP_PER_FEATURE_LOGIT(spend) = 1.2
+    - CAP_TOP1_SPEND_LOGIT = 1.5
+    - CAP_TOP1_SHARE_LOGIT = 1.0
+    - CAP_SUM_SPEND_LOGIT = 2.0
+    - CAP_TOTAL_SPEND_LOGIT = 2.0
+- Special handling for all_zero_flag:
+  - Explicit learnable coefficient for age_x_allzero interaction; allow positive or negative contributions up to capped amount (e.g., ±1.2).
+- Special handling for dominance:
+  - If top1_dominance_flag is true, downweight top1_spend effect mildly and upweight family/cohort priors and novelty features; do not let top1_spend alone exceed CAP_TOP1_SPEND_LOGIT.
+- Rationale:
+  - Limits extreme influence of a single channel; leaves room for cohort/age signals to change final decision.
+
+D. Variance / SE model (add age/all_zero & dominance terms)
+- Additional variance components:
+  - var_age_small = κ_age_small * indicator(age_bucket in {infant,toddler}) / sqrt(max(N_slice_age_bucket,1))
+  - var_all_zero = κ_all_zero * all_zero_flag
+  - var_age_allzero_interaction = κ_age_allzero * age_x_allzero
+  - var_top1_share = κ_top1_share * max(0, top1_share − 0.5)  (only kicks in for moderate+ dominance)
+  - var_top1_outlier = κ_top1 * indicator(top1_spend ≥ TOP1_SPEND_OUTLIER)
+  - var_total_spend, var_multi_spend, var_outlier_detection, var_imputation = as before
+- Combine:
+  - var_combined = var_base + var_age_small + var_all_zero + var_age_allzero_interaction + var_top1_share + other var terms
+  - se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- Starting κ (conservative; sweepable):
+  - κ_age_small = 0.25; κ_all_zero = 0.20; κ_age_allzero = 0.30
+  - κ_top1 = 0.28; κ_top1_share = 0.22; κ_multi = 0.18; κ_total = 0.12; κ_novel = 0.14; κ_miss = 0.06
+- SE floors:
+  - n==1 & fragile (all_zero+age_under5 OR top1_dominance OR top1_outlier OR high_total_spend): se_floor = 0.40–0.60 (start 0.45)
+  - stable slices: se_floor = 0.06–0.10
+
+E. Decision‑gating (pattern‑aware + batch/cohort aware)
+- Fragile_flag_v4 =
+  - cryo_all_zero_flag OR
+  - top1_outlier_flag OR
+  - high_total_spend_flag OR
+  - multi_high_flag OR
+  - (all_zero_flag AND age_under5) OR
+  - top1_dominance_flag (top1_share ≥ TOP1_DOMINANCE_THRESHOLD AND top1_spend ≥ TOP1_SPEND_GATE) OR
+  - any per_channel_imputed_flag OR missingness_count ≥ 2 OR
+  - dominance_sign_consistency_score < DOMINANCE_CONSISTENCY_THRESHOLD.
+- Batch/cohort checks:
+  - batch_frac_fragile = (#fragile_records_in_batch)/batch_size.
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 0.05): hold auto‑decisions for batch; route to priority_audit.
+  - If cohort_id or family_name present and inconsistent predictions within cohort: route whole cohort → priority_audit.
+- n==1 gating for fragile_flag:
+  - If fragile_flag and n_batch==1, require ALL:
+    - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice
+    - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice)
+    - ensemble_agreement ≥ A_high
+    - se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice
+  - Otherwise route → priority_audit.
+- Example initial thresholds (sweepable):
+  - AGE_INFANT_THRESHOLD = 5
+  - TOP1_DOMINANCE_THRESHOLD = 0.6
+  - TOP1_SPEND_GATE = 250
+  - SUM_SPEND_HIGH = 500
+  - MULTI_HIGH_THRESHOLD = 2
+  - BATCH_FRAGILE_THRESHOLD = 0.05
+  - N_min_child = 120; N0_child = 800
+  - Z_high_slice = 0.95; A_high = 0.995
+  - SE_accept_child_slice = 0.10; se_floor_n1_child = 0.45
+
+F. Calibrator & GLM_fallback retrain plan (age/all_zero & top1_dominance focused)
+- Calibrator:
+  - Use heteroskedastic calibrator with quantile heads (p10/p50/p90) + variance net. Inputs must include age_bucket, all_zero_flag, age_x_allzero, top1_channel, top1_spend, top1_share, family_group_size, cohort_transport_rate, per_channel_imputed_flags, outlier_score and novelty_distance.
+  - Loss: quantile pinball + ECE penalty + Brier; strongly upweight fragile slices:
+    - age_under5×all_zero ×12, top1_dominance ×12, top1_outlier ×10, multi_high ×10.
+- GLM_fallback:
+  - ElasticNet logistic with explicit interactions:
+    - age_bucket × all_zero, age_bucket × family_group_size, family_group_transport_rate, top1_channel × top1_share, top1_spend × Age_bucket, top1_spend × top1_share.
+  - GLM_fallback_agrees if |p_model − p_glm| ≤ δ; initial δ=0.05 for fragile slices.
+- Training:
+  - Rolling window 18–36 months; targeted upsampling of age_under5×all_zero and top1_dominance slices in training and CV folds.
+  - Shadow run: 14–28 days with gating active and canaries blocked from auto‑accept.
+- Acceptance criteria:
+  - age_under5_all_zero_FN_rate ↓ ≥ 40–60%
+  - top1_dominance_FP_rate ↓ ≥ 40%
+  - cohort contradiction rate ↓ ≥ 50%
+  - global ECE not worse by >0.5% abs
+
+G. Monitoring, metrics & alerts (batch‑focused)
+- Per‑slice KPIs (near‑real time):
+  - age_under5_FN_rate (by family/cabin buckets)
+  - all_zero_FN_rate
+  - top1_share_FP_rate (and by top1_channel)
+  - top1_dominance_FP_rate
+  - multi_high_FP_rate
+  - n==1_auto_accept_rate, n==1_fragile_auto_accept_rate
+  - cohort_contradiction_rate
+- Batch KPIs:
+  - Batch_auto_decision_rate, Batch_frac_fragile, Batch_provenance_consistency_rate
+- Alerts:
+  - Any canary auto‑accepted → immediate ML/Ops page.
+  - age_under5_FN_rate increase > baseline + X% over 24h → page.
+  - top1_dominance_FP_rate increase > baseline + X% over 24h → page.
+  - batch_frac_fragile ≥ threshold → automatically hold auto‑decisions & notify.
+  - cohort contradiction autocase → page.
+- Dashboards:
+  - Per‑record provenance view for canaries and recent fragile auto‑decisions including winsorized vs raw, per_feature_logits, pooled_prior_snapshot.
+
+H. CI unit tests & validation (cover age_under5_all_zero, top1_dominance, top1_outlier, multi_high, cryo_all_zero)
+- Unit tests:
+  - Correct computation of top1_share, top1_dominance_flag, all_zero_flag, age_bucket, age_x_allzero across scorer/calibrator/gate.
+  - se_combined increases for age_under5_all_zero & high top1_share & high_total_spend & novelty_flag.
+  - Calibrator widens p10/p90 for age_under5_all_zero and top1_dominance records.
+  - Pooled_prior blending respects large N0_top1_share and prevents tiny N slices from dominating.
+  - Per_feature & total logit caps enforced (simulate artificially large spends).
+  - batch_frac_fragile ≥ threshold disables auto‑decisions.
+  - cohort contradiction detection holds cohort.
+  - Canaries (0179_03, 0181_01, 0178_01, 0174_01, 0172_01, 0171_01, 0170_01) must not be auto‑accepted during gating tests.
+- Regression tests:
+  - Global ECE, AUC, Brier degrade less than tolerance when gating enabled.
+  - Integration tests validate end‑to‑end persistence of imputation provenance and per_feature_logit contributions.
+
+I. Operational actions (0–72 hours) — precise timeline
+1) Immediate (0–6h)
+   - Deploy emergency gating patch: block auto‑decisions for any n==1 record matching:
+       - (all_zero_flag AND Age ≤ 5) OR
+       - (top1_spend ≥ TOP1_SPEND_GATE AND top1_share ≥ TOP1_DOMINANCE_THRESHOLD) OR
+       - sum_spend ≥ SUM_SPEND_HIGH OR
+       - num_high_spend_channels ≥ 2 OR
+       - any per_channel_imputed_flag OR missingness_count ≥ 2
+     Route these to priority_audit. Add 0179_03 and 0181_01 (and previous canaries) to canary list.
+   - Persist provenance fields: raw per‑channel spends, winsorized_spends, per‑feature logit contributions, pooled_prior_snapshot_id, cohort_id, family_group_size, top1_share, dominance_score, cap_trigger_flags.
+   - Expose variance/SE components in scoring output: var_age_small, var_all_zero, var_top1_share, var_top1_outlier, var_combined, se_combined.
+2) Short‑term (6–24h)
+   - Implement new features in scorer (top1_share, top1_dominance_flag, age_x_allzero, family_name aggregates) and retrain lightweight GLM_fallback on winsorized inputs.
+   - Implement batch‑level hold if batch_frac_fragile ≥ 5% and cohort contradiction detection.
+   - Instrument dashboards & alerts for top1_share_FP_rate, age_under5_FN_rate and all_zero_FN_rate.
+   - Start targeted label collection for recent age_under5_all_zero and top1_dominance records (active labeling queue).
+3) Mid‑term (24–72h)
+   - Retrain calibrator & GLM_fallback with updated inputs and upweight schedule; run 14–28 day shadow‑run with gating active.
+   - Publish pooled‑prior snapshots for age_x_allzero slices & top1_share slices.
+   - Run CI/regression tests; tune winsorization cap, top1 thresholds & se_kappa values based on shadow diagnostics.
+
+J. Per‑record provenance to log (required & extended)
+- Raw per‑channel and imputation provenance: RoomService, FoodCourt, ShoppingMall, Spa, VRDeck (value + imputed_flag + imputation_method + source_date).
+- Age & name: Age, Age_bucket, family_name, family_group_size, cabin_id, cabin_group_size.
+- Transforms & flags: winsorized_spend[channel], winsorized_sum_spend, log1p_transforms, is_winsorized_flag, all_zero_flag, age_x_allzero, top1_channel, top1_spend, top1_share, top1_share_bucket, top1_dominance_flag.
+- Aggregates & dominance: sum_spend, top1_channel, top1_spend, top1_share, top1_outlier_flag, dominance_sign_consistency_score.
+- Novelty & anomaly: outlier_score, novelty_distance_norm, spend_cluster_id.
+- Model internals: per_feature_logit_contributions (map), per_feature_logit_caps_triggered, pooled_prior_snapshot_id, μ_slice, τ_slice_blend.
+- Variances: var_age_small, var_all_zero, var_top1_share, var_top1_outlier, var_multi_spend, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, p_final_sd, quantile_width, gating_reasons, routing_decision, scorer_version, calibrator_version, provenance_hash.
+
+K. Initial hyperparameters (start values; sweepable)
+- AGE_INFANT_THRESHOLD = 5
+- TOP1_DOMINANCE_THRESHOLD = 0.6
+- TOP1_SPEND_GATE = 250
+- CHANNEL_HIGH_THRESHOLD = 100
+- MULTI_HIGH_THRESHOLD = 2
+- SUM_SPEND_HIGH = 500
+- TOP1_SPEND_OUTLIER_THRESHOLD = 1000 (but top1_dominance uses lower gate)
+- GLOBAL_SPEND_UPPER = 2000
+- CAP_PER_FEATURE_LOGIT (spend baseline) = 1.2
+- CAP_TOP1_SPEND_LOGIT = 1.5
+- CAP_TOP1_SHARE_LOGIT = 1.0
+- CAP_SUM_SPEND_LOGIT = 2.0; CAP_TOTAL_SPEND_LOGIT = 2.0
+- BATCH_FRAGILE_THRESHOLD = 0.05 (5%)
+- N0_child = 800; N0_top1_share = 1200; N0_top1 = 1000; N0_multi_high = 400; N0_cryo_all_zero = 300
+- N_min_child = 120; N_min_top1 = 200
+- Z_high_slice = 0.95; A_high = 0.995
+- SE_accept_child_slice = 0.10; se_floor_n1_child = 0.45
+- κ_age_small = 0.25; κ_all_zero = 0.20; κ_age_allzero = 0.30; κ_top1 = 0.28; κ_top1_share = 0.22; κ_multi = 0.18
+
+L. CI canaries & expected behavior
+- 0179_03 (Age=3, all_zero)
+  - Expected: route -> priority_audit during emergency gating; after calibrator/GLM changes it may be auto‑decided only if pooled_prior + GLM + ensemble agree and se_combined tight.
+- 0181_01 (Spa dominant: Spa=299, VRDeck=92)
+  - Expected: route -> priority_audit in emergency gating (matches top1_dominance_flag). After retrain, model should avoid overconfident positive due to dominance; GLM_fallback/agreement required.
+- 0178_01 (RoomService extreme outlier)
+  - Expected: remains canary and be audited.
+- Unit tests assert cohorts held and all canaries audited under gating.
+
+M. Concise gating pseudocode (updated)
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD:
+      route all r in B -> priority_audit; continue
+  - for each record r in B:
+      fragile_flag = cryo_all_zero_flag OR top1_outlier_flag OR high_total_spend_flag OR multi_high_flag OR (all_zero_flag AND Age ≤ AGE_INFANT_THRESHOLD) OR (top1_spend ≥ TOP1_SPEND_GATE AND top1_share ≥ TOP1_DOMINANCE_THRESHOLD) OR any per_channel_imputed_flag OR missingness_count ≥ 2 OR dominance_sign_consistency_score < 0.7
+      if n_batch == 1 and fragile_flag:
+         if (pooled_prior_tau ≥ Z_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice):
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if cohort_id or family_name present and exists conflicting sign predictions:
+         route all cohort members -> priority_audit
+
+N. Why this will reduce batch errors (short)
+- Address both brittle extremes:
+  - Prevent overconfident positives from dominant/imbalanced spends by introducing top1_share features, per‑feature logit caps, dominance variance inflation, stronger pooled priors for top1_share buckets, and gating for top1_dominance in n==1.
+  - Prevent overconfident negatives for rare small‑age all_zero records by explicit age_x_allzero features, cohort/family priors, variance inflation for small slices, and gating for n==1 fragile records.
+- Calibrator, variance model and GLM fallback provide corroborating evidence before any n==1 auto decision. Canaries and slice KPIs surface regressions quickly.
+
+O. Tradeoffs & operational notes
+- More records will be routed for human review initially — prepare prioritized triage and labeling capacity.
+- Winsorization & stronger priors reduce extreme FPs but may dampen true positives in tails; mitigate via shadow runs and targeted labeling.
+- Additional logging increases storage costs — tune retention to clinical needs; persist canary provenance longer.
+
+P. Next steps / offers
+- Option A (0–3h, recommended immediate): I will produce the emergency gating patch (code + unit tests) implementing the updated fragile definition (includes top1_dominance) and CI canary tests including 0179_03 and 0181_01, plus a deploy checklist to enact stopgap protections now.
+- Option B (24–72h): I will produce the full retrain recipe: calibrator training script (heteroskedastic quantile heads), GLM_fallback spec with interactions (age_x_allzero, top1_share interactions, family priors), upweight schedule, CV fold design, hyperparameter sweep matrix, shadow‑run dashboard spec and acceptance metrics.
+- Which do you want first? If you want the stopgap deployed immediately I will deliver the gating patch, unit tests, and deploy checklist now.
+
+Immediate one‑line corrective action (deploy now)
+- Deploy emergency gating: route any n==1 record with (all_zero_flag AND Age ≤ 5) OR (top1_spend ≥ 250 AND top1_share ≥ 0.6) OR sum_spend ≥ 500 OR num_high_spend_channels ≥ 2 OR any per_channel_imputed_flag OR missingness_count ≥ 2 to priority_audit; add 0179_03 and 0181_01 (plus existing canaries) to the canary list.
+
+If you want, I will:
+- produce the exact gating code + unit tests and CI changes (Option A), or
+- deliver the full retraining pipeline, calibrator + GLM_fallback code + sweep matrix and shadow‑run dashboard (Option B).
+
+Which should I prepare and deliver first?
+
+============================================================

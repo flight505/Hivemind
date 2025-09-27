@@ -1,0 +1,296 @@
+PREDICTIVE METRICS - ITERATION 167
+============================================================
+
+Executive summary — immediate takeaways & top priorities (0–72h)
+
+- What happened (short)
+  - New FN in n==1 batch: Passenger 0210_01 (Age 24, CryoSleep == True, ShoppingMall == NaN, all other channel spends == 0, HomePlanet == NaN). Model predicted False but actual True.
+  - This complements recent failures (e.g., 0207_01 FP, 0200_01 FN, 0205_01 FP). All failures share the same systemic issues: heterogeneous behavior inside “all_zero / cryo”‑like slices, fragile handling of missingness / imputation, and under‑estimated uncertainty for singleton (n==1) records that allowed overconfident auto decisions.
+- Root cause (short)
+  - Heterogeneity: “all_zero” and “cryo_allzero” slices contain multiple subpopulations (by age, family/cohort, cabin, missingness signature) with opposite label tendencies. A single global all_zero/CryoSleep weight cannot represent these opposing clusters → both FNs and FPs arise.
+  - Missingness + imputation artifacts: records with critical NaNs (HomePlanet, channel NaNs) are being imputed in a way that collapses them into all_zero-like signals without preserving provenance; this collapses distinct cases and hides novelty.
+  - Calibrator and gating are too permissive for n==1: SE/quantile widths are underestimated for fragile signatures (missingness, all_zero, single_channel_dominant), so the system trusted a single model score to auto‑decide.
+- Immediate risk
+  - Any n==1 record with (cryo_allzero_flag OR missing_critical_demographic_flag OR all_zero_missing_cryo_flag OR single_channel_dominant_flag OR implausible_spend_flag OR high_missing_channel_count OR novelty_high) is high risk for an overconfident wrong auto decision.
+- Immediate action (deploy now)
+  - Emergency gating hotfix: route any n==1 with fragile flags (see Flag list below) to priority_audit. Add 0210_01 and 0207_01 to canaries and block them from auto decisions until mitigations are deployed.
+  - Persist raw inputs & imputation provenance for canaries and recent fragiles.
+
+Concise answers to the six operational questions (batch accuracy focus)
+
+1) Which specific patterns caused the error?
+   - Missingness collapse: 0210_01 had NaNs in HomePlanet and ShoppingMall; imputation/winsorization likely collapsed it into an “all_zero-like” profile while suppressing novelty signals. The model’s slice priors and learned weights favored non‑transport for that collapsed signature, producing a false negative.
+   - Heterogeneity in cryo_allzero: the same slice produces both FNs and FPs across different subclusters — a mixture problem, not a single directional bias.
+   - Calibrator under‑estimation of uncertainty for singleton records with missing critical fields allowed an auto decision without corroboration.
+
+2) How should decision rules be modified?
+   - Expand fragile gating to include missing_critical_demographic_flag (HomePlanet or Destination NaN), missing_channel_count ≥ 1, and pre‑imputation all_zero signatures.
+   - For n==1 fragile records require ALL of:
+     - pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice (slice support),
+     - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice),
+     - ensemble_agreement ≥ A_high,
+     - calibrator p90−p10 ≤ QW_accept_slice AND se_combined ≤ SE_accept_slice.
+     - Otherwise route to priority_audit.
+   - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD, hold entire batch.
+
+3) New transport‑pattern insights?
+   - Zero spend is not monolithic: it interacts strongly with CryoSleep, Age_bucket, family/cohort, cabin_deck, and missingness signature (which channel(s) are NaN). Missing critical demographics (HomePlanet/Destination) or channel NaNs indicate increased label variance/novelty.
+   - Imputed zeros vs raw zeros differ: pre‑imputation flags are essential; many errors arise from treating imputed NaNs as zeros.
+   - Single_channel_dominant records must be stratified by channel type and age/cohort before trusting dominance as predictive.
+
+4) How should confidence be recalibrated?
+   - Deploy a heteroskedastic quantile calibrator that includes fragility flags and missingness signature as inputs; output p10/p50/p90 and se_estimate.
+   - Add slice‑specific variance components and SE floors for fragile n==1 contexts (raise SE for cryo_allzero, missing_homeplanet, single_channel_dominant).
+   - Use quantile width (p90−p10) and se_combined as gating signals.
+
+5) Adjustments for batch consistency?
+   - Compute batch_frac_fragile and if above threshold hold the batch.
+   - Enforce cohort consistency (if multiple cohort members present and predictions disagree in sign, route cohort to audit).
+   - Apply stricter gating for n==1 fragiles to avoid per‑batch noise from singleton decisions.
+
+6) How to improve metrics for edge cases?
+   - Pre‑imputation flags (cryo_allzero, missing_homeplanet, missing_channel_count, single_channel_dominant).
+   - Mixture priors / cluster‑specific priors for heterogeneous slices and upweight fragile slices in calibrator/GLM training.
+   - Per‑feature logit caps and dominance dampening to limit single feature influence.
+   - Unit tests and canaries (include 0210_01 and 0207_01) and a 14–28 day shadow run focused on fragiles.
+
+Complete updated predictive metrics report — actionable components (optimized for batch prediction accuracy)
+
+A. Immediate emergency actions (0–6h)
+- Emergency gating hotfix:
+  - If n_batch == 1 AND (cryo_allzero_flag OR all_zero_infant_flag OR all_zero_missing_cryo_flag OR missing_homeplanet_flag OR missing_destination_flag OR single_channel_dominant_flag OR implausible_spend_flag OR novelty_high_flag OR missing_channel_count ≥ 1) → block auto decision, route to priority_audit.
+- Canary additions (block auto decisions while gating active): 0192_01, 0192_03, 0193_03, 0196_01, 0198_01, 0200_01, 0205_01, 0207_01, 0210_01.
+- Persist provenance immediately for canaries and fragiles: raw per_channel spends (with NaNs preserved), per_channel_imputed_flags, CryoSleep raw & missing flag, imputation_method, per_feature_logit_contributions, pooled_prior_snapshot_id, calibrator p10/p50/p90, variance components, gating_reason.
+- Apply SE floors for n==1 fragiles:
+  - n==1 & cryo_allzero OR missing_homeplanet OR missing_destination OR missing_channel_count ≥1: se_floor = 0.60
+  - n==1 & all_zero_infant: se_floor = 0.65
+- Require GLM_fallback + ensemble corroboration before any auto decision for fragile slices.
+
+B. Flag & feature definitions (compute pre‑imputation where applicable)
+- all_zero_flag: sum_raw_spend == 0 AND per_channel_nonzero_count == 0 (count NaN as missing, not zero).
+- missing_homeplanet_flag: HomePlanet is NaN.
+- missing_destination_flag: Destination is NaN.
+- missing_channel_count: count of raw channel NaNs (ShoppingMall, FoodCourt, Spa, VRDeck, RoomService).
+- all_zero_missing_cryo_flag: all_zero_flag AND CryoSleep is NaN.
+- all_zero_infant_flag: all_zero_flag AND Age ≤ INFANT_AGE_THRESHOLD.
+- cryo_allzero_flag: CryoSleep == True AND all_zero_flag.
+- top1_channel, top1_value_raw, top1_share_raw = top1_value_raw / (sum_raw + ε).
+- single_channel_dominant_flag: top1_share_raw ≥ DOMINANCE_TOP1_SHARE (0.90) AND top1_value_raw ≥ DOMINANCE_MIN_SPEND (200).
+- implausible_spend_flag: any channel_raw > IMPLAUSIBLE_SPEND_THRESHOLD (1000 OR > 3×99.99th percentile).
+- per_channel_imputed_flags, imputed_count.
+- missingness_signature: bitmask or hash of which channels and demographics are missing (preserve raw NaN pattern).
+- family_group indicators, cabin_deck, channel_entropy, novelty_distance, cluster_id, contradiction_flag.
+
+C. Feature engineering updates (v→v+1)
+- Persist raw inputs and imputation provenance; compute flags pre‑imputation.
+- New features: missing_homeplanet_flag, missing_destination_flag, missing_channel_count, missingness_signature, cryo_allzero_flag, all_zero_flag (pre‑imputation), single_channel_dominant_flag, top1_share_raw, channel_entropy, novelty_distance, cluster_id, contradiction_score.
+- Winsorize spends at GLOBAL_SPEND_UPPER (99.5th percentile or absolute cap e.g., 1000), then log1p transform.
+- Pre‑compute winsorization but keep raw channels as separate provenance fields.
+
+D. Pooled priors & mixture modeling (to represent heterogeneity)
+- Stratify pooled priors on combinations that matter:
+  - all_zero × CryoSleep_state × age_bucket × missingness_signature
+  - missing_homeplanet × all_zero × age_bucket
+  - single_channel_dominant × top1_channel × age_bucket
+  - implausible_spend slice
+- Detect subclusters inside cryo_allzero / all_zero / missingness signatures using GMM/KMeans on (demographics, raw_spend_vector, missingness_signature, family_size). Compute μ_cluster and N_cluster; at scoring time blend by cluster membership probability.
+- Pseudo‑counts (start values; sweepable):
+  - N0_all_zero = 900
+  - N0_all_zero_missing_cryo = 800
+  - N0_cryo_allzero = 700
+  - N0_single_dominant = 500
+  - N0_missing_homeplanet = 700
+- Blend formula: τ_slice = N_slice/(N_slice + N0_slice); μ_blend = τ_slice * μ_slice + (1−τ_slice)*μ_global.
+- Persist pooled_prior_snapshot_id per run.
+
+E. Per‑feature logit caps, winsorization & dominance dampening
+- Caps:
+  - CAP_PER_CHANNEL_LOGIT = 1.0
+  - CAP_TOP1_SPEND_LOGIT = 1.4
+  - CAP_ALL_ZERO_FEATURE_LOGIT = 1.0
+- Dominance dampening:
+  - if single_channel_dominant_flag then top channel value := α_dom * top channel (α_dom start 0.6) before computing logit contribution.
+- For implausible_spend_flag: downweight per_feature logits (×0.5) and increase variance term.
+- Enforce per_feature_logit = sign(l) * min(abs(l), cap) and log per_feature_caps_triggered.
+
+F. Variance / SE model enhancements (add missingness terms)
+- Add variance components κ (start values; sweepable):
+  - κ_all_zero = 0.40
+  - κ_all_zero_infant = 0.55
+  - κ_all_zero_missing_cryo = 0.55
+  - κ_cryo_allzero = 0.50
+  - κ_single_dom = 0.45
+  - κ_implausible = 0.45
+  - κ_imputation = 0.10
+  - κ_missing_cryo = 0.30
+  - κ_missing_homeplanet = 0.45
+  - κ_missing_channels = 0.40
+  - κ_novelty = 0.30
+- var_combined = var_base + Σ(indicator*κ_component)
+- se_combined = sqrt(max(var_combined, se_floor(context)^2))
+- Set higher se_floor for n==1 + missing_homeplanet or missing_channel_count ≥1 (0.60–0.65).
+
+G. Decision‑gating (pattern‑aware + batch/cohort aware)
+- fragile_flag_v2 = cryo_allzero_flag OR all_zero_infant_flag OR all_zero_missing_cryo_flag OR missing_homeplanet_flag OR missing_destination_flag OR single_channel_dominant_flag OR implausible_spend_flag OR (imputed_count ≥ 2) OR (missing_channel_count ≥ 1) OR (novelty_distance ≥ NOVELTY_THRESHOLD)
+- batch_frac_fragile = #fragile_records_in_batch / batch_size
+  - If batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD (start 5%) → route whole batch to priority_audit.
+- n==1 fragile gating (must pass ALL to auto accept/reject):
+  - pooled_prior_tau ≥ τ_high_slice (0.95) AND N_slice ≥ N_min_slice
+  - GLM_fallback_agrees (|p_model − p_glm| ≤ δ_slice)
+  - ensemble_agreement ≥ A_high
+  - se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice
+  - Otherwise route to priority_audit
+- For missing_homeplanet_flag or missing_destination_flag: require data_quality_check + priority_audit.
+- Cohort consistency: if cohort_id present and predictions within cohort conflict in sign → route cohort → priority_audit.
+
+H. Calibrator & GLM_fallback retrain plan (fragile slices focused)
+- Calibrator:
+  - Heteroskedastic quantile calibrator producing p10/p50/p90 + variance head.
+  - Inputs: raw_model_logit, per_feature_logit_contributions, fragility flags, missingness_signature, age_bucket, family_group_size, winsorized_sum_spend, channel_entropy, per_channel_imputed_flags, novelty_distance, cluster_id, top1_share.
+  - Loss = quantile pinball (p10/p90) + ECE penalty + Brier; strongly upweight fragile slices (×8–12).
+- GLM_fallback:
+  - ElasticNet logistic on winsorized log1p features with explicit interactions: all_zero×CryoSleep, all_zero×missing_homeplanet, missing_homeplanet×age_bucket, single_dom×top_channel, cabin_deck×family_size.
+  - GLM acts as concordance check and interpretable fallback for gating.
+- Training:
+  - Rolling window 18–36 months; upsample/weight fragile slices and rare missingness signatures.
+  - CV stratified by fragile slices and cohort_id where possible.
+  - Shadow run: 14–28 days with gating active.
+- Acceptance criteria:
+  - cryo_allzero slice FN/FPR ↓ by 40–70% (slice-level improvement)
+  - single_channel_dominant FP_rate ↓ ≥ 50% (slice-level)
+  - Missing_homeplanet FN_rate ↓ by ≥ 50% on held‑out validation
+  - Global ECE not worsened by >0.5% absolute
+
+I. Handling heterogeneous slices (mixture modeling)
+- For cryo_allzero, all_zero and missingness_signature slices, detect subclusters with GMM/KMeans on demographics + raw spends + missingness_signature + family_size. Build μ_cluster, N_cluster; compute blended prior by cluster membership probability to avoid averaging opposing signals.
+- At scoring time compute posterior predictive probability as weighted sum of cluster posteriors (using membership probability).
+
+J. Monitoring, metrics & alerts (batch‑focused)
+- Real‑time slice KPIs:
+  - cryo_allzero_FN_rate & FP_rate (split by age_bucket, deck, missingness_signature)
+  - missing_homeplanet_FN_rate & FP_rate by missingness_signature
+  - single_channel_dominant_FP_rate, single_channel_dominant_FN_rate
+  - n==1_auto_accept_rate, n==1_fragile_auto_accept_rate
+  - batch_frac_fragile, cohort_contradiction_rate
+  - missing_cryo_prevalence_by_batch
+- Alerts:
+  - Any canary auto_accepted/rejected → immediate page
+  - cryo_allzero or missing_homeplanet FN/FP rise > baseline + X% over 24h → page
+  - batch_frac_fragile ≥ threshold → hold auto_decisions & notify
+- Dashboards:
+  - Per‑record provenance for canaries and recent fragile auto‑decisions: raw vs winsorized, per_feature_logits & caps, pooled_prior_snapshot, novelty_distance, cluster_id, missingness_summary.
+
+K. CI unit tests & validation (cover fragile slices)
+- Unit tests:
+  - Pre‑imputation flags: cryo_allzero_flag, all_zero_flag, missing_homeplanet_flag, single_channel_dominant_flag computed correctly.
+  - se_combined reaches se_floor for n==1 cryo_allzero, missing_homeplanet, and single_channel_dominant cases.
+  - Calibrator widens p10/p90 for simulated missingness and high‑dominance records.
+  - Pooled_prior blending logic prevents tiny N slices from dominating.
+  - Per_feature logit caps & dominance dampening enforced.
+  - batch_frac_fragile ≥ threshold disables auto_decisions for a batch.
+  - Canaries (including 0210_01 and 0207_01) must not be auto_accepted/rejected while gating is active.
+- Regression tests:
+  - Global ECE, AUC, Brier degrade less than tolerances when gating enabled.
+
+L. Operational actions & timeline (0–72h)
+1) Immediate (0–6h):
+   - Deploy emergency gating (expanded fragile set) and block canaries (include 0210_01, 0207_01).
+   - Start persisting provenance for canaries; expose variance components and calibrator outputs.
+2) Short‑term (6–24h):
+   - Implement feature flags and lightweight GLM_fallback; implement batch_frac_fragile and cohort contradiction detection.
+   - Instrument dashboards & alerts; begin manual review/label collection for fragiles.
+   - Add data validation rule for implausible spends and missingness spikes.
+3) Mid‑term (24–72h):
+   - Retrain heteroskedastic quantile calibrator and GLM_fallback with upweighted fragile slices; run 14–28 day shadow run with gating active.
+   - Implement cluster‑specific priors; tune caps, κ and α_dom using shadow diagnostics.
+   - Tune gating thresholds to balance throughput and safety.
+
+M. Per‑record provenance to log (required minimum)
+- Raw per_channel spends (with NaNs preserved) + per_channel_imputed_flags + imputation_method + source_date.
+- CryoSleep raw (including NaN) + missing_cryo_flag, HomePlanet raw + missing_homeplanet_flag, Destination raw + missing_destination_flag, Age, Age_bucket, family_name, family_group_size, cabin_deck, destination.
+- Transforms & flags: winsorized_spend[channel], winsorized_sum_spend, all_zero_flag, all_zero_missing_cryo_flag, all_zero_infant_flag, cryo_allzero_flag, missingness_signature, top1_channel, top1_value_raw, top1_share_raw, single_channel_dominant_flag, implausible_spend_flag, channel_entropy, novelty_distance, cluster_id, missingness_summary.
+- Model internals: per_feature_logit_contributions, per_feature_logit_caps_triggered, pooled_prior_snapshot_id, μ_slice/μ_cluster, τ_slice_blend.
+- Variances: var_components, var_combined, se_combined.
+- Decision meta: GLM_fallback_probs, GLM_fallback_agreement_flag, ensemble_probs, ensemble_agreement, p10/p50/p90, quantile_width, gating_reasons, routing_decision, scorer_version.
+
+N. Initial hyperparameters (start values; sweepable)
+- INFANT_AGE_THRESHOLD = 1.0
+- SE floors n==1: cryo_allzero = 0.60; single_dom = 0.60; all_zero_missing_cryo = 0.60; all_zero_infant = 0.65; missing_homeplanet = 0.60; missing_channel_count ≥1 = 0.60
+- N0_all_zero = 900; N_min_all_zero = 100
+- N0_all_zero_missing_cryo = 800; N_min_all_zero_missing_cryo = 80
+- N0_cryo_allzero = 700; N_min_cryo_allzero = 80
+- N0_single_dominant = 500; N_min_single_dominant = 60
+- N0_missing_homeplanet = 700; N_min_missing_homeplanet = 80
+- κ_all_zero = 0.40; κ_all_zero_infant = 0.55; κ_all_zero_missing_cryo = 0.55; κ_cryo_allzero = 0.50; κ_single_dom = 0.45; κ_implausible = 0.45; κ_imputation = 0.10; κ_missing_cryo = 0.30; κ_missing_homeplanet = 0.45; κ_missing_channels = 0.40; κ_novelty = 0.30
+- τ_high_slice = 0.95; A_high = 0.995
+- SE_accept_all_zero = 0.60; SE_accept_single_dom = 0.60; δ_slice (fragile) = 0.05
+- BATCH_FRAGILE_THRESHOLD = 0.05
+- QW_accept_slice = 0.12
+- DOMINANCE_TOP1_SHARE = 0.90; DOMINANCE_MIN_SPEND = 200; IMPLAUSIBLE_SPEND_THRESHOLD = 1000
+- CAP_PER_CHANNEL_LOGIT = 1.0; CAP_TOP1_SPEND_LOGIT = 1.4; α_dom = 0.6
+
+O. CI canaries & expected behavior
+- Canary list: 0192_01 (cryo_allzero), 0192_03 (spa‑dominant), 0193_03 (all_zero_infant), 0196_01 (multi high spends), 0198_01 (all_zero + missing Cryo), 0200_01 (cryo_allzero FN case), 0205_01 (VRDeck single-channel dominant FP), 0207_01 (cryo_allzero FP), 0210_01 (missing_homeplanet + channel NaN FN).
+- Expected route: priority_audit while gating is active.
+- CI asserts canaries are not auto_accepted/rejected.
+
+P. Gating pseudocode (pattern‑aware, batch focused)
+- For each batch B:
+  - batch_frac_fragile = count(r in B where fragile_flag_v2)/|B|
+  - if batch_frac_fragile ≥ BATCH_FRAGILE_THRESHOLD:
+      route all r in B -> priority_audit; continue
+  - for each record r in B:
+      compute pre‑imputation flags (all_zero_flag, missing_homeplanet_flag, missing_channel_count, CryoSleep raw)
+      compute top1_channel, top1_value_raw, top1_share_raw
+      compute fragile_flag_v2 (includes missing_homeplanet, cryo_allzero, single_channel_dominant)
+      if n_batch == 1 and fragile_flag_v2:
+         if (pooled_prior_tau ≥ τ_high_slice AND N_slice ≥ N_min_slice AND GLM_fallback_agrees AND ensemble_agreement ≥ A_high AND se_combined ≤ SE_accept_slice AND (p90 − p10) ≤ QW_accept_slice):
+             allow auto_decision
+         else:
+             route r -> priority_audit
+         continue
+      if missing_homeplanet_flag OR missing_destination_flag:
+         route r -> data_quality_review + priority_audit
+         continue
+      if implausible_spend_flag:
+         route r -> data_quality_review + priority_audit
+         continue
+      if cohort_id present and cohort predictions conflict in sign:
+         route cohort -> priority_audit
+
+Q. Specific diagnosis for Passenger 0210_01 (detailed)
+- Observation:
+  - Raw spends: RoomService 0, FoodCourt 0, Spa 0, VRDeck 0, ShoppingMall NaN (missing). sum_raw_spend treated as 0 after naive imputation. CryoSleep True. Age 24.0. HomePlanet NaN. n_batch == 1.
+- Likely scoring mechanics that produced FN:
+  1) Preprocessing imputed raw NaNs to zeros (or masked them in a way that preserved all_zero_flag), collapsing a high‑novelty missingness signature into the global all_zero slice.
+  2) The model’s pooled prior or learned weights for the collapsed slice favored non‑transport for this demographic/missingness combination, pushing the score low.
+  3) Calibrator returned a narrow p90−p10 and low se for this singleton (because missingness features weren’t encoded strongly), permitting auto decision.
+  4) No cluster‑specific prior for missing_homeplanet or missingness_signature existed to push the posterior toward uncertainty or toward the cluster that historically transported.
+- Immediate mitigation: 0210_01 will be routed to priority_audit by emergency gating until calibrator/mixture priors and missingness handling are updated. Persist raw inputs and imputation provenance to allow swift error analysis.
+
+R. Why these changes will reduce batch errors (short)
+- Pre‑imputation flags and missingness_signature preserve distinction between truly zero patterns and imputed/missing patterns so the model won’t collapse heterogeneous cases into one misleading slice.
+- Mixture priors represent opposing subpopulations inside cryo_allzero / missingness slices so you avoid both FNs and FPs from a single global weight.
+- Dominance dampening and per_feature logit caps prevent single noisy features or imputed artifacts from producing overconfident outcomes.
+- Heteroskedastic calibrator + SE floors + GLM fallback prevent overconfident n==1 auto decisions.
+
+S. Tradeoffs & operational notes
+- Expect a short‑term increase in priority_audit volume and reduced auto throughput. Provision triage resources immediately.
+- More provenance logging increases storage and audit latency; implement retention and compression.
+- Global metrics (AUC/ECE) may shift slightly during shadow runs; prioritise fragile slice error reduction initially.
+- Tune thresholds conservatively during initial deployment; iterate using shadow run diagnostics.
+
+T. Next steps / recommended sequencing
+- Option A (Immediate, 0–3h): Deploy emergency gating + unit tests + canary block (low risk). I can produce runnable gating code + unit tests and CI patch now.
+- Option B (24–72h): Implement feature updates + GLM_fallback + heteroskedastic calibrator + mixture priors + shadow run + dashboards. I can produce pipeline spec, retrain plan, sweep matrix, and dashboard spec.
+
+One‑line immediate action (deploy now)
+- Route any n==1 record with cryo_allzero_flag OR all_zero_infant_flag OR all_zero_missing_cryo_flag OR missing_homeplanet_flag OR missing_destination_flag OR single_channel_dominant_flag OR implausible_spend_flag OR novelty_high_flag OR missing_channel_count ≥1 to priority_audit; add 0192_01, 0192_03, 0193_03, 0196_01, 0198_01, 0200_01, 0205_01, 0207_01, 0210_01 to the canary list.
+
+Would you like me to:
+- Produce the emergency gating implementation now (runnable code + unit tests + CI patch) so canaries and n==1 fragiles are immediately blocked, or
+- Produce the full retraining pipeline specification (heteroskedastic quantile calibrator + GLM_fallback + mixture priors), sweep matrix, and shadow‑run dashboard spec for the 24–72h plan?
+
+If you want the hotfix I will produce the gating code and unit tests immediately (recommended).
+
+============================================================
